@@ -4,13 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtGui import QIcon, QImage
+from PyQt5.QtGui import QIcon
 from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtWidgets import QToolBar, QPushButton, QToolButton
+from PyQt5.QtWidgets import QToolBar, QPushButton
 
-from .constants import TOOLBAR_CANVAS_MIN_HEIGHT, TOOLBAR_CANVAS_MIN_WIDTH, UI_FONT_FAMILY
+from .constants import TOOLBAR_CANVAS_MIN_HEIGHT, TOOLBAR_CANVAS_MIN_WIDTH
 from .styles import MAIN_TOOLBAR_CANVAS_BUTTON_STYLE
-from .main_window_layout import _ensure_display_menu
 
 _MOLECULE_ICON_PATH = Path(__file__).resolve().parent.parent / "Pentacene_acsv.svg"
 
@@ -66,6 +65,8 @@ def create_main_toolbar(viewer):
         toolbar = QToolBar("Main toolbar", viewer)
     except Exception:
         return None
+    toolbar.setMovable(False)
+    toolbar.setFloatable(False)
     toolbar.setIconSize(QtCore.QSize(20, 20))
 
     def _icon(name):
@@ -74,6 +75,57 @@ def create_main_toolbar(viewer):
 
     viewer.toolbar_open_act = toolbar.addAction(_icon("folder-open"), "Open folder")
     viewer.toolbar_open_act.triggered.connect(viewer.open_folder_dialog)
+    viewer.toolbar_load_session_act = QtWidgets.QAction(_icon("document-open"), "Load Session", viewer)
+    viewer.toolbar_load_session_act.setToolTip("Restore a saved SXM viewer session")
+    viewer.toolbar_load_session_act.triggered.connect(viewer.on_load_session)
+    viewer.toolbar_load_session_btn = QtWidgets.QToolButton(toolbar)
+    viewer.toolbar_load_session_btn.setDefaultAction(viewer.toolbar_load_session_act)
+    viewer.toolbar_load_session_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+    viewer.toolbar_load_session_menu = QtWidgets.QMenu(viewer.toolbar_load_session_btn)
+    viewer.toolbar_load_session_btn.setMenu(viewer.toolbar_load_session_menu)
+    toolbar.addWidget(viewer.toolbar_load_session_btn)
+    try:
+        viewer._refresh_recent_session_dirs_menu()
+    except Exception:
+        pass
+    viewer.toolbar_save_session_act = toolbar.addAction(_icon("document-save"), "Save Session")
+    viewer.toolbar_save_session_act.setToolTip("Save the current SXM viewer session (Ctrl+S)")
+    viewer.toolbar_save_session_act.setShortcut(QtGui.QKeySequence("Ctrl+S"))
+    viewer.toolbar_save_session_act.triggered.connect(viewer.on_save_session)
+    viewer.toolbar_collection_btn = QtWidgets.QToolButton(toolbar)
+    viewer.toolbar_collection_btn.setText("Collections")
+    viewer.toolbar_collection_btn.setToolTip("Save selected preview/pop-up/crop results into curated cross-folder collections")
+    viewer.toolbar_collection_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+    viewer.toolbar_collection_menu = QtWidgets.QMenu(viewer.toolbar_collection_btn)
+    viewer.toolbar_collection_current_path_act = viewer.toolbar_collection_menu.addAction("Current collection: none")
+    viewer.toolbar_collection_current_path_act.setEnabled(False)
+    viewer.toolbar_collection_menu.addAction("Choose Current Collection...", viewer.on_choose_current_collection)
+    viewer.toolbar_collection_clear_target_act = viewer.toolbar_collection_menu.addAction("Clear Current Collection Target", viewer.on_clear_current_collection)
+    viewer.toolbar_collection_menu.addSeparator()
+    viewer.toolbar_collection_menu.addAction("Open Collection...", viewer.on_open_collection)
+    viewer.toolbar_collection_menu.addAction("Show Collection Tray", viewer.on_show_collection_tray)
+    viewer.toolbar_collection_menu.addAction("Add Current Preview...", viewer.on_add_current_preview_to_collection)
+    viewer.toolbar_collection_menu.addAction("Add Active Pop-up...", viewer.on_add_active_popup_to_collection)
+    viewer.toolbar_collection_menu.addAction("Add All Open Pop-ups...", viewer.on_add_all_popups_to_collection)
+    viewer.toolbar_collection_menu.addAction("Add Selected Crop History...", viewer.on_add_selected_crops_to_collection)
+    viewer.toolbar_collection_menu.addSeparator()
+    viewer.toolbar_collection_menu.addAction("What Is a Collection?", viewer.on_collection_help)
+    viewer.toolbar_collection_btn.setMenu(viewer.toolbar_collection_menu)
+    toolbar.addWidget(viewer.toolbar_collection_btn)
+    try:
+        viewer._refresh_collection_ui()
+    except Exception:
+        pass
+    viewer.toolbar_popups_raise_act = QtWidgets.QAction("Pop-ups", viewer)
+    viewer.toolbar_popups_raise_act.triggered.connect(viewer.on_recall_popouts)
+    viewer.toolbar_popups_btn = QtWidgets.QToolButton(toolbar)
+    viewer.toolbar_popups_btn.setDefaultAction(viewer.toolbar_popups_raise_act)
+    viewer.toolbar_popups_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+    viewer.toolbar_popups_menu = QtWidgets.QMenu(viewer.toolbar_popups_btn)
+    viewer.toolbar_popups_menu.aboutToShow.connect(viewer._rebuild_popup_menu)
+    viewer.toolbar_popups_btn.setMenu(viewer.toolbar_popups_menu)
+    viewer.toolbar_popups_btn.setEnabled(False)
+    toolbar.addWidget(viewer.toolbar_popups_btn)
     toolbar.addSeparator()
 
     viewer.toolbar_canvas_btn = QPushButton("Open Canvas")
@@ -92,10 +144,137 @@ def create_main_toolbar(viewer):
     viewer.toolbar_export_xyz_act.triggered.connect(viewer.on_export_xyz_files)
 
     toolbar.addSeparator()
-    viewer.toolbar_adjust_act = toolbar.addAction(_icon("transform-crop"), "Adjust image")
-    viewer.toolbar_adjust_act.triggered.connect(viewer.on_adjust_image)
-    viewer.toolbar_spectro_browser_act = toolbar.addAction(_icon("view-list"), "Spectro browser")
+    viewer.toolbar_image_btn = QtWidgets.QToolButton(toolbar)
+    viewer.toolbar_image_btn.setText("Image")
+    viewer.toolbar_image_btn.setToolTip("Histogram, contrast, and crop/rotate actions for the current preview")
+    viewer.toolbar_image_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+    viewer.toolbar_image_menu = QtWidgets.QMenu(viewer.toolbar_image_btn)
+    viewer.toolbar_histogram_act = viewer.toolbar_image_menu.addAction("Histogram...")
+    viewer.toolbar_histogram_act.setToolTip("Show histogram and adjust display range")
+    viewer.toolbar_histogram_act.triggered.connect(lambda: viewer._open_histogram_dialog(viewer.preview_canvas))
+    viewer.toolbar_histogram_auto_act = viewer.toolbar_image_menu.addAction("Auto contrast (1-99%)")
+    viewer.toolbar_histogram_auto_act.triggered.connect(lambda: viewer._auto_contrast(viewer.preview_canvas))
+    viewer.toolbar_histogram_reset_act = viewer.toolbar_image_menu.addAction("Reset range")
+    viewer.toolbar_histogram_reset_act.triggered.connect(lambda: viewer._reset_contrast(viewer.preview_canvas))
+    viewer.toolbar_image_menu.addSeparator()
+    viewer.toolbar_crop_rotate_act = viewer.toolbar_image_menu.addAction("Crop/Rotate...")
+    viewer.toolbar_crop_rotate_act.setToolTip("Open crop, rotate, flip, clipping, gamma, and colormap controls")
+    viewer.toolbar_crop_rotate_act.triggered.connect(viewer.on_adjust_image)
+    viewer.toolbar_image_btn.setMenu(viewer.toolbar_image_menu)
+    toolbar.addWidget(viewer.toolbar_image_btn)
+
+    try:
+        from . import main_window_layout
+
+        viewer.toolbar_display_btn.setText("Display")
+        viewer.toolbar_display_btn.setToolTip("Preview and overlay display options")
+        viewer.toolbar_display_btn.setMenu(main_window_layout._ensure_display_menu(viewer))
+        toolbar.addWidget(viewer.toolbar_display_btn)
+
+        viewer.toolbar_tools_btn = QtWidgets.QToolButton(toolbar)
+        viewer.toolbar_tools_btn.setText("Tools")
+        viewer.toolbar_tools_btn.setToolTip("Preview tools, docking, and recovery options")
+        viewer.toolbar_tools_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        viewer.toolbar_tools_btn.setMenu(main_window_layout._ensure_tools_menu(viewer))
+
+        def _sync_tools_menu():
+            detached = bool(getattr(viewer, "preview_detached", False))
+            locked = bool(getattr(viewer, "preview_locked", False))
+            detach_act = getattr(viewer, "tools_preview_detach_act", None)
+            lock_act = getattr(viewer, "tools_preview_lock_act", None)
+            if detach_act is not None:
+                detach_act.setText("Dock preview" if detached else "Float preview")
+                detach_act.setToolTip(
+                    "Dock the floating preview back into the main window"
+                    if detached
+                    else "Detach the preview pane into its own floating window"
+                )
+                detach_act.setEnabled(not locked)
+            if lock_act is not None:
+                lock_act.blockSignals(True)
+                lock_act.setChecked(locked)
+                lock_act.blockSignals(False)
+
+        viewer.toolbar_tools_menu = viewer.toolbar_tools_btn.menu()
+        viewer.toolbar_tools_menu.aboutToShow.connect(_sync_tools_menu)
+        _sync_tools_menu()
+        toolbar.addWidget(viewer.toolbar_tools_btn)
+
+        if getattr(viewer, "toolbar_dark_btn", None) is not None:
+            toolbar.addWidget(viewer.toolbar_dark_btn)
+    except Exception:
+        pass
+
+    viewer.toolbar_spectro_browser_act = QtWidgets.QAction(_icon("view-list"), "Spectroscopy", viewer)
+    viewer.toolbar_spectro_browser_act.setToolTip("Open the spectroscopy browser. Use the dropdown for spectroscopy display controls.")
     viewer.toolbar_spectro_browser_act.triggered.connect(lambda: viewer.open_spectro_browser())
+    viewer.toolbar_spectro_btn = QtWidgets.QToolButton(toolbar)
+    viewer.toolbar_spectro_btn.setDefaultAction(viewer.toolbar_spectro_browser_act)
+    viewer.toolbar_spectro_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+    viewer.toolbar_spectro_menu = QtWidgets.QMenu(viewer.toolbar_spectro_btn)
+    viewer.toolbar_spectro_menu.setToolTipsVisible(True)
+    viewer.toolbar_spectro_menu.addAction("Open browser", lambda: viewer.open_spectro_browser())
+    viewer.toolbar_spectro_menu.addSeparator()
+    viewer.toolbar_spectro_repeat_share_act = viewer.toolbar_spectro_menu.addAction("Share across repeat scans")
+    viewer.toolbar_spectro_repeat_share_act.setCheckable(True)
+    viewer.toolbar_spectro_repeat_share_act.setChecked(getattr(viewer, "spectro_share_overlapping_repeats", False))
+    repeat_tip = (
+        "When enabled, spectros whose coordinates fall inside several near-identical overlapping image scans "
+        "are shown on all of those repeat scans instead of being split to only the nearest image in time."
+    )
+    viewer.toolbar_spectro_repeat_share_act.setToolTip(repeat_tip)
+    viewer.toolbar_spectro_repeat_share_act.setStatusTip(repeat_tip)
+    viewer.toolbar_spectro_repeat_share_act.setWhatsThis(repeat_tip)
+    viewer.toolbar_spectro_repeat_share_act.toggled.connect(viewer.on_spectro_share_overlapping_repeats_toggled)
+    viewer.toolbar_spectro_markers_act = viewer.toolbar_spectro_menu.addAction("Thumbnail markers")
+    viewer.toolbar_spectro_markers_act.setCheckable(True)
+    viewer.toolbar_spectro_markers_act.setChecked(getattr(viewer, "show_spectra", True))
+    viewer.toolbar_spectro_markers_act.setToolTip("Show clickable spectroscopy point markers on image thumbnails")
+    viewer.toolbar_spectro_markers_act.toggled.connect(viewer.on_show_spectra_toggled)
+    viewer.toolbar_spectro_preview_act = viewer.toolbar_spectro_menu.addAction("Preview markers")
+    viewer.toolbar_spectro_preview_act.setCheckable(True)
+    viewer.toolbar_spectro_preview_act.setChecked(getattr(viewer, "show_preview_spectra", getattr(viewer, "show_spectra", True)))
+    viewer.toolbar_spectro_preview_act.setToolTip("Show spectroscopy point markers on the main preview")
+    viewer.toolbar_spectro_preview_act.toggled.connect(viewer.on_show_preview_spectra_toggled)
+    viewer.toolbar_spectro_miniatures_act = viewer.toolbar_spectro_menu.addAction("Thumbnail miniatures")
+    viewer.toolbar_spectro_miniatures_act.setCheckable(True)
+    viewer.toolbar_spectro_miniatures_act.setChecked(getattr(viewer, "show_spectro_miniatures", False))
+    viewer.toolbar_spectro_miniatures_act.setToolTip("Show spectroscopy miniatures as separate thumbnail cards in the main grid")
+    viewer.toolbar_spectro_miniatures_act.toggled.connect(viewer.on_show_spectro_miniatures_toggled)
+    viewer.toolbar_spectro_menu.addSeparator()
+    viewer.toolbar_spectro_matrix_markers_act = viewer.toolbar_spectro_menu.addAction("Matrix markers")
+    viewer.toolbar_spectro_matrix_markers_act.setCheckable(True)
+    viewer.toolbar_spectro_matrix_markers_act.setChecked(getattr(viewer, "show_matrix_markers", True))
+    viewer.toolbar_spectro_matrix_markers_act.toggled.connect(viewer.on_show_matrix_markers_toggled)
+    viewer.toolbar_spectro_single_markers_act = viewer.toolbar_spectro_menu.addAction("Single markers")
+    viewer.toolbar_spectro_single_markers_act.setCheckable(True)
+    viewer.toolbar_spectro_single_markers_act.setChecked(getattr(viewer, "show_single_markers", True))
+    viewer.toolbar_spectro_single_markers_act.toggled.connect(viewer.on_show_single_markers_toggled)
+    viewer.toolbar_spectro_compact_markers_act = viewer.toolbar_spectro_menu.addAction("Compact markers")
+    viewer.toolbar_spectro_compact_markers_act.setCheckable(True)
+    viewer.toolbar_spectro_compact_markers_act.setChecked(getattr(viewer, "compact_markers", True))
+    viewer.toolbar_spectro_compact_markers_act.toggled.connect(viewer.on_compact_markers_toggled)
+    viewer.toolbar_spectro_menu.addSeparator()
+    viewer.toolbar_spectro_menu.addAction("Clear selection", viewer.on_clear_spec_selection)
+    viewer.toolbar_spectro_highlight_act = viewer.toolbar_spectro_menu.addAction("Spectro highlight glow")
+    viewer.toolbar_spectro_highlight_act.setCheckable(True)
+    viewer.toolbar_spectro_highlight_act.setChecked(getattr(viewer, "spectro_highlight_glow", True))
+    viewer.toolbar_spectro_highlight_act.toggled.connect(viewer.on_toggle_highlight_glow)
+    marker_menu = viewer.toolbar_spectro_menu.addMenu("Marker style")
+    if hasattr(viewer, "_populate_marker_style_menu"):
+        viewer._populate_marker_style_menu(marker_menu)
+    viewer.toolbar_spectro_menu.addSeparator()
+    viewer.toolbar_spectro_grid_as_matrix_act = viewer.toolbar_spectro_menu.addAction("NxN singles as matrix")
+    viewer.toolbar_spectro_grid_as_matrix_act.setCheckable(True)
+    viewer.toolbar_spectro_grid_as_matrix_act.setChecked(getattr(viewer, "spectro_single_grid_as_matrix", False))
+    viewer.toolbar_spectro_grid_as_matrix_act.toggled.connect(viewer.on_spectro_grid_as_matrix_toggled)
+    viewer.toolbar_spectro_force_single_act = viewer.toolbar_spectro_menu.addAction("Force single mode")
+    viewer.toolbar_spectro_force_single_act.setCheckable(True)
+    viewer.toolbar_spectro_force_single_act.setChecked(getattr(viewer, "spectro_force_single_mode", False))
+    viewer.toolbar_spectro_force_single_act.toggled.connect(viewer.on_spectro_force_single_toggled)
+    viewer.toolbar_spectro_btn.setMenu(viewer.toolbar_spectro_menu)
+    toolbar.addWidget(viewer.toolbar_spectro_btn)
+    toolbar.addSeparator()
     viewer.toolbar_shortcuts_act = toolbar.addAction(_icon("help-about"), "Shortcuts")
     viewer.toolbar_shortcuts_act.triggered.connect(viewer._on_show_shortcuts_requested)
 
@@ -103,88 +282,19 @@ def create_main_toolbar(viewer):
     viewer.toolbar_layout_act = toolbar.addAction("Layout: Columns")
     viewer.toolbar_layout_act.setToolTip("Toggle between Columns and Stack layouts")
     viewer.toolbar_layout_act.triggered.connect(viewer._on_toggle_layout_mode)
-    viewer.toolbar_display_btn = QToolButton()
-    viewer.toolbar_display_btn.setText("Display Options")
-    viewer.toolbar_display_btn.setPopupMode(QToolButton.InstantPopup)
-    viewer.toolbar_display_btn.setToolTip("Display options and marker overlays")
-    viewer.toolbar_display_btn.setMenu(_ensure_display_menu(viewer))
-    toolbar.addWidget(viewer.toolbar_display_btn)
-    
-    # Create a clickable label with the molecule image instead of a button with icon
-    viewer.toolbar_load_mol_btn = QtWidgets.QLabel()
-    viewer.toolbar_load_mol_btn.setMinimumHeight(TOOLBAR_CANVAS_MIN_HEIGHT)
-    viewer.toolbar_load_mol_btn.setMinimumWidth(TOOLBAR_CANVAS_MIN_WIDTH)
-    viewer.toolbar_load_mol_btn.setAlignment(QtCore.Qt.AlignCenter)
-    viewer.toolbar_load_mol_btn.setToolTip("Overlay a molecular structure (XYZ, PDB, MOL)")
-    viewer.toolbar_load_mol_btn.setCursor(QtCore.Qt.PointingHandCursor)
-    
-    # Load and render the molecule directly to a pixmap at button size
-    icon_size = QtCore.QSize(TOOLBAR_CANVAS_MIN_WIDTH - 10, TOOLBAR_CANVAS_MIN_HEIGHT - 6)
-    viewer._molecule_pixmap_size = icon_size
-    pixmap = _load_molecule_pixmap(icon_size, QtGui.QColor("#1d1d1d"))
-    if not pixmap.isNull():
-        viewer.toolbar_load_mol_btn.setPixmap(pixmap)
-    else:
-        viewer.toolbar_load_mol_btn.setText("Load Molecule")
-
-    if hasattr(viewer, "_apply_molecule_button_theme"):
-        viewer._apply_molecule_button_theme()
-
-    # Make it clickable
-    viewer.toolbar_load_mol_btn.mousePressEvent = lambda event: viewer.on_load_molecule()
-    toolbar.addWidget(viewer.toolbar_load_mol_btn)
-
-    # Add a visible Dark Mode toggle button next to layout
-    # Visible dark-mode toggle with ON/OFF text
-    viewer.toolbar_dark_btn = QPushButton("dark mode: ON" if viewer.dark_mode else "dark mode: OFF")
-    viewer.toolbar_dark_btn.setCheckable(True)
-    viewer.toolbar_dark_btn.setChecked(viewer.dark_mode)
-    viewer.toolbar_dark_btn.setToolTip("Toggle dark mode")
-    viewer.toolbar_dark_btn.setMinimumWidth(100)
-    try:
-        viewer.toolbar_dark_btn.setStyleSheet(MAIN_TOOLBAR_CANVAS_BUTTON_STYLE)
-    except Exception:
-        pass
-    # Use toggled so the checked state is passed through correctly
-    viewer.toolbar_dark_btn.toggled.connect(viewer.on_dark_mode_toggled)
-    toolbar.addWidget(viewer.toolbar_dark_btn)
-
-    # Add small colormap controls next to dark-mode toggle for quick access
-    try:
-        # store labels on viewer so we can update their palette on dark/light toggles
-        viewer.thumb_cmap_label = QtWidgets.QLabel("Thumb cmap:")
-        viewer.thumb_cmap_label.setFont(QtGui.QFont(UI_FONT_FAMILY, 9))
-        viewer.thumb_cmap_label.setStyleSheet("padding-left:8px; padding-right:4px;" + (" color: #e6e6e6;" if getattr(viewer, 'dark_mode', False) else ""))
-        toolbar.addWidget(viewer.thumb_cmap_label)
-        # Use the same combobox instance so selections stay in sync
-        # apply dark styling to combos if viewer currently uses dark mode
-        try:
-            if getattr(viewer, 'dark_mode', False):
-                combo_style = "QComboBox { background-color: #1f1f1f; border: 1px solid #444444; color: #f0f0f0; padding: 4px; }"
-            else:
-                combo_style = ""
-            viewer.thumb_cmap_combo.setStyleSheet(combo_style)
-            viewer.thumb_cmap_combo.setMinimumWidth(120)
-            toolbar.addWidget(viewer.thumb_cmap_combo)
-
-            viewer.preview_cmap_label = QtWidgets.QLabel("Preview cmap:")
-            viewer.preview_cmap_label.setFont(QtGui.QFont(UI_FONT_FAMILY, 9))
-            viewer.preview_cmap_label.setStyleSheet("padding-left:8px; padding-right:4px;" + (" color: #e6e6e6;" if getattr(viewer, 'dark_mode', False) else ""))
-            toolbar.addWidget(viewer.preview_cmap_label)
-            viewer.preview_cmap_combo.setStyleSheet(combo_style)
-            viewer.preview_cmap_combo.setMinimumWidth(120)
-            toolbar.addWidget(viewer.preview_cmap_combo)
-        except Exception:
-            # If combos aren't available at toolbar creation time, ignore and they'll appear where created
-            pass
-    except Exception:
-        # outer try failed (toolbar creation at import time); ignore - combos will be laid out later
-        pass
 
     update_toolbar_actions(viewer, False)
     return toolbar
 
 def update_toolbar_actions(viewer, enabled: bool):
-    for act in (viewer.toolbar_export_png_act, viewer.toolbar_export_xyz_act, viewer.toolbar_adjust_act):
+    for act in (viewer.toolbar_export_png_act, viewer.toolbar_export_xyz_act):
         if act is not None:
             act.setEnabled(bool(enabled))
+    btn = getattr(viewer, "preview_adjust_btn", None)
+    if btn is not None:
+        btn.setEnabled(bool(enabled))
+    for widget in (
+        getattr(viewer, "toolbar_image_btn", None),
+    ):
+        if widget is not None:
+            widget.setEnabled(bool(enabled))

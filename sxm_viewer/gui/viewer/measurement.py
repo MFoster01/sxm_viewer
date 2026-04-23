@@ -152,6 +152,36 @@ def _on_exit_profile_mode(viewer):
     viewer._disable_profile_mode()
 
 
+def _on_profile_dialog_closed(viewer):
+    dlg = getattr(viewer, '_profile_dialog', None)
+    remember_cb = getattr(viewer, "_remember_closed_main_profile_dialog", None)
+    if callable(remember_cb):
+        try:
+            remember_cb(dlg)
+        except Exception:
+            pass
+    canvas = getattr(viewer, 'preview_canvas', None)
+    if canvas is not None:
+        try:
+            if hasattr(canvas, 'deactivate_profile_tool'):
+                canvas.deactivate_profile_tool(clear_active=True, clear_saved=True)
+            else:
+                canvas.enable_profile(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(canvas, 'set_profile_highlight_callback'):
+                canvas.set_profile_highlight_callback(None)
+        except Exception:
+            pass
+    viewer._pending_profile_enable = False
+    try:
+        viewer.measure_profile_btn.setText('Measure profile')
+    except Exception:
+        pass
+    viewer._profile_dialog = None
+
+
 def _on_clear_profile_measurement(viewer):
     canvas = getattr(viewer, 'preview_canvas', None)
     if canvas is None:
@@ -281,6 +311,22 @@ def _on_profile_updated(viewer, active_profile, saved_profiles):
                 except Exception:
                     pass
             marker_update_cb = _marker_update
+        style_update_cb = None
+        if canvas is not None and hasattr(canvas, 'set_profile_style'):
+            def _style_update(profile_key, **changes):
+                try:
+                    return canvas.set_profile_style(profile_key, **changes)
+                except Exception:
+                    return False
+            style_update_cb = _style_update
+        palette_cb = None
+        if canvas is not None and hasattr(canvas, 'apply_profile_palette'):
+            def _palette_update(name):
+                try:
+                    return canvas.apply_profile_palette(name)
+                except Exception:
+                    return False
+            palette_cb = _palette_update
         if not hasattr(viewer, '_profile_dialog') or viewer._profile_dialog is None:
             dark_pref = bool(getattr(viewer, 'dark_mode', False))
             viewer._profile_dialog = ProfileDialog(active_profile, saved_profiles, parent=viewer, unit=ref_unit, y_label=y_label,
@@ -291,7 +337,11 @@ def _on_profile_updated(viewer, active_profile, saved_profiles):
                                                   marker_update_callback=marker_update_cb,
                                                   marker_select_callback=marker_select_cb,
                                                   add_overlay_callback=add_overlay_cb,
+                                                  style_update_callback=style_update_cb,
+                                                  palette_callback=palette_cb,
                                                   dark_mode=dark_pref)
+            if hasattr(viewer._profile_dialog, "detach_as_workspace_window"):
+                viewer._profile_dialog.detach_as_workspace_window()
             if hasattr(viewer._profile_dialog, 'set_preserve_profiles_callback'):
                 viewer._profile_dialog.set_preserve_profiles_callback(
                     _set_preserve, enabled=getattr(viewer, 'preserve_profiles_on_channel_change', True)
@@ -300,6 +350,7 @@ def _on_profile_updated(viewer, active_profile, saved_profiles):
                 viewer._profile_dialog.move(viewer._next_popup_pos(offset=30))
             except Exception:
                 pass
+            viewer._profile_dialog.finished.connect(lambda _=None: _on_profile_dialog_closed(viewer))
             viewer._profile_dialog.show()
         else:
             if hasattr(viewer._profile_dialog, 'set_label_scale_callback'):
@@ -310,6 +361,10 @@ def _on_profile_updated(viewer, active_profile, saved_profiles):
                 viewer._profile_dialog.set_marker_select_callback(marker_select_cb)
             if hasattr(viewer._profile_dialog, 'set_add_overlay_callback'):
                 viewer._profile_dialog.set_add_overlay_callback(add_overlay_cb)
+            if hasattr(viewer._profile_dialog, 'set_style_update_callback'):
+                viewer._profile_dialog.set_style_update_callback(style_update_cb)
+            if hasattr(viewer._profile_dialog, 'set_palette_callback'):
+                viewer._profile_dialog.set_palette_callback(palette_cb)
             if hasattr(viewer._profile_dialog, 'set_preserve_profiles_callback'):
                 viewer._profile_dialog.set_preserve_profiles_callback(
                     _set_preserve, enabled=getattr(viewer, 'preserve_profiles_on_channel_change', True)
@@ -367,6 +422,14 @@ def _on_show_profile_window(viewer):
         pass
     dlg = getattr(viewer, '_profile_dialog', None)
     if dlg is not None:
+        canvas = getattr(viewer, 'preview_canvas', None)
+        if canvas is not None and hasattr(canvas, 'export_profile_datasets'):
+            try:
+                active, saved = canvas.export_profile_datasets()
+                if active or saved:
+                    viewer._on_profile_updated(active, saved)
+            except Exception:
+                pass
         try:
             log_status("Profile dialog already exists; showing.")
         except Exception:
@@ -378,6 +441,19 @@ def _on_show_profile_window(viewer):
         except Exception:
             pass
         return
+    canvas = getattr(viewer, 'preview_canvas', None)
+    if canvas is not None and hasattr(canvas, 'export_profile_datasets'):
+        try:
+            active, saved = canvas.export_profile_datasets()
+            if active or saved:
+                try:
+                    log_status("Rebuilding profile dialog from current canvas datasets.")
+                except Exception:
+                    pass
+                viewer._on_profile_updated(active, saved)
+                return
+        except Exception:
+            pass
     payload = getattr(viewer, '_last_profile_payload', None)
     if payload and (payload[0] or payload[1]):
         try:
@@ -386,15 +462,6 @@ def _on_show_profile_window(viewer):
             pass
         viewer._on_profile_updated(payload[0], payload[1])
     else:
-        canvas = getattr(viewer, 'preview_canvas', None)
-        if canvas is not None and hasattr(canvas, 'export_profile_datasets'):
-            try:
-                active, saved = canvas.export_profile_datasets()
-                if active or saved:
-                    viewer._on_profile_updated(active, saved)
-                    return
-            except Exception:
-                pass
         try:
             log_status("No profile data available for dialog.")
         except Exception:
@@ -415,9 +482,10 @@ def _on_show_profile_window(viewer):
             ref_unit = None
         try:
             viewer._profile_dialog = ProfileDialog(None, [], parent=viewer, unit=ref_unit, y_label=y_label)
+            if hasattr(viewer._profile_dialog, "detach_as_workspace_window"):
+                viewer._profile_dialog.detach_as_workspace_window()
             viewer._profile_dialog.move(viewer._next_popup_pos(offset=30))
             viewer._profile_dialog.show()
-            canvas = getattr(viewer, 'preview_canvas', None)
             if canvas is not None and hasattr(viewer._profile_dialog, 'set_context_source'):
                 viewer._profile_dialog.set_context_source(
                     canvas,
@@ -438,6 +506,57 @@ def _on_canvas_overlay_highlight(viewer, idx):
             dlg.select_overlay(idx)
         except Exception:
             pass
+
+
+def export_profile_dialog_state(viewer):
+    """Capture open state and geometry for the main Profile measurement window."""
+    dlg = getattr(viewer, "_profile_dialog", None)
+    if dlg is None:
+        return None
+    try:
+        if not dlg.isVisible():
+            return None
+    except Exception:
+        pass
+    state = {"open": True}
+    try:
+        geo = dlg.geometry()
+        state["geometry"] = [int(geo.x()), int(geo.y()), int(geo.width()), int(geo.height())]
+    except Exception:
+        pass
+    try:
+        state["window_state"] = int(dlg.windowState())
+    except Exception:
+        pass
+    return state
+
+
+def restore_profile_dialog_state(viewer, state):
+    """Restore the main Profile measurement window from session state."""
+    if not isinstance(state, dict) or not bool(state.get("open")):
+        return None
+    _on_show_profile_window(viewer)
+    dlg = getattr(viewer, "_profile_dialog", None)
+    if dlg is None:
+        return None
+    geom = state.get("geometry")
+    if geom and len(geom) == 4:
+        try:
+            x, y, w, h = [int(v) for v in geom]
+            dlg.setGeometry(x, y, w, h)
+        except Exception:
+            pass
+    window_state = state.get("window_state")
+    if window_state is not None:
+        try:
+            dlg.setWindowState(QtCore.Qt.WindowStates(int(window_state)))
+        except Exception:
+            pass
+    try:
+        dlg.show()
+    except Exception:
+        pass
+    return dlg
 __all__ = [
     "_on_start_profile",
     "_on_start_angle",
@@ -449,6 +568,8 @@ __all__ = [
     "_on_angle_updated",
     "_on_show_profile_window",
     "_on_canvas_overlay_highlight",
+    "export_profile_dialog_state",
+    "restore_profile_dialog_state",
 ]
 
 

@@ -16,7 +16,12 @@ class ThumbnailController:
     def handle_thumbnail_clicked(self, header_path_str, channel_idx):
         """Display the clicked thumbnail in preview and record selection."""
         viewer = self.viewer
-        viewer.show_file_channel(header_path_str, channel_idx)
+        use_local_cmap = False
+        try:
+            use_local_cmap = bool((getattr(viewer, "per_file_channel_cmap", {}) or {}).get((str(header_path_str), int(channel_idx))))
+        except Exception:
+            use_local_cmap = False
+        viewer.show_file_channel(header_path_str, channel_idx, use_local_cmap=use_local_cmap)
         key = str(header_path_str)
         viewer.selected_file_for_thumbs = key
         viewer._refresh_thumb_selection_styles()
@@ -27,7 +32,16 @@ class ThumbnailController:
         """Double-click thumbnail -> preview + popup."""
         viewer = self.viewer
         try:
-            self.handle_thumbnail_clicked(header_path_str, channel_idx)
+            current_preview = getattr(viewer, "last_preview", None)
+            current_views = getattr(getattr(viewer, "preview_canvas", None), "views", None)
+            needs_refresh = not (
+                current_preview
+                and str(current_preview[0]) == str(header_path_str)
+                and int(current_preview[1]) == int(channel_idx)
+                and current_views
+            )
+            if needs_refresh:
+                self.handle_thumbnail_clicked(header_path_str, channel_idx)
         except Exception:
             pass
         try:

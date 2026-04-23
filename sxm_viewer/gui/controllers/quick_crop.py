@@ -10,7 +10,7 @@ from ...config import save_config
 
 
 class QuickCropController:
-    """Encapsulates quick-crop UI/state coordination for the main window."""
+    """Encapsulates crop-template UI/state coordination for the main window."""
 
     def __init__(self, viewer):
         self.viewer = viewer
@@ -40,8 +40,20 @@ class QuickCropController:
             try:
                 btn.blockSignals(True)
                 btn.setChecked(enabled)
-                btn.setText("Quick crop: On" if enabled else "Quick crop: Off")
+                btn.setText("Crop template: On" if enabled else "Crop template: Off")
                 btn.blockSignals(False)
+            except Exception:
+                pass
+        edit_btn = getattr(viewer, "quick_crop_edit_btn", None)
+        if edit_btn is not None:
+            try:
+                edit_btn.setEnabled(enabled)
+            except Exception:
+                pass
+        detail_widget = getattr(viewer, 'quick_crop_detail_widget', None)
+        if detail_widget is not None:
+            try:
+                detail_widget.setVisible(enabled)
             except Exception:
                 pass
         canvases = [getattr(viewer, 'preview_canvas', None)] + list(getattr(viewer, '_popup_canvases', []))
@@ -52,26 +64,117 @@ class QuickCropController:
                 canv.enable_fixed_crop_quick_mode(enabled)
             except Exception:
                 continue
+        if not enabled:
+            self.set_edit_mode(False)
         if enabled:
             self.apply_template_from_controls()
         self.update_hint()
 
     # ------------------------------------------------------------------
+    def set_edit_mode(self, enabled: bool):
+        viewer = self.viewer
+        enabled = bool(enabled)
+        if enabled and not bool(getattr(viewer, "quick_crop_mode", False)):
+            self.set_mode(True)
+        btn = getattr(viewer, "quick_crop_edit_btn", None)
+        if btn is not None:
+            try:
+                btn.blockSignals(True)
+                btn.setChecked(enabled)
+                btn.setEnabled(bool(getattr(viewer, "quick_crop_mode", False)))
+                btn.blockSignals(False)
+            except Exception:
+                pass
+        canvas = getattr(viewer, "preview_canvas", None)
+        if canvas is not None:
+            try:
+                canvas.enable_fixed_crop_transform_mode(enabled)
+            except Exception:
+                pass
+            if enabled:
+                try:
+                    canvas.show_fixed_crop_template(True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    canvas.show_fixed_crop_template(bool(getattr(viewer, "show_crop_template_overlay", False)))
+                except Exception:
+                    pass
+        self.update_hint()
+
+    # ------------------------------------------------------------------
+    def _aspect_mode(self):
+        viewer = self.viewer
+        combo = getattr(viewer, "quick_crop_aspect_combo", None)
+        if combo is None:
+            mode = getattr(viewer, "quick_crop_aspect_mode", "free")
+        else:
+            mode = combo.currentData() or combo.currentText() or getattr(viewer, "quick_crop_aspect_mode", "free")
+        mode = str(mode or "free").strip().lower()
+        if mode not in {"free", "keep", "square"}:
+            mode = "free"
+        viewer.quick_crop_aspect_mode = mode
+        return mode
+
+    # ------------------------------------------------------------------
+    def on_aspect_mode_changed(self):
+        mode = self._aspect_mode()
+        viewer = self.viewer
+        if mode == "square":
+            height_spin = getattr(viewer, "quick_crop_real_height_spin", None)
+            width_spin = getattr(viewer, "quick_crop_real_width_spin", None)
+            if width_spin is not None and height_spin is not None:
+                height_spin.blockSignals(True)
+                height_spin.setValue(width_spin.value())
+                height_spin.blockSignals(False)
+        self.on_real_spin_changed()
+
+    # ------------------------------------------------------------------
     def update_hint(self):
         viewer = self.viewer
         label = getattr(viewer, 'quick_crop_hint_lbl', None)
+        edit_btn = getattr(viewer, "quick_crop_edit_btn", None)
+        edit_active = bool(getattr(getattr(viewer, "preview_canvas", None), "_fixed_crop_transform_mode", False))
+        aspect_mode = self._aspect_mode()
+        aspect_label = {
+            "free": "Free",
+            "keep": "Keep ratio",
+            "square": "Square",
+        }.get(aspect_mode, "Free")
+        if edit_active and not bool(getattr(viewer, "quick_crop_mode", False)):
+            self.set_mode(True)
+            return
+        if edit_btn is not None:
+            try:
+                edit_btn.blockSignals(True)
+                edit_btn.setChecked(edit_active)
+                edit_btn.setEnabled(bool(getattr(viewer, "quick_crop_mode", False)))
+                edit_btn.blockSignals(False)
+            except Exception:
+                pass
         if label is None:
             return
-        overlay_state = "visible" if getattr(viewer, 'show_crop_history_overlay', False) else "hidden"
         if viewer.quick_crop_mode:
-            text = (
-                "Shift+drag to size, click to spawn crops. "
-                "Ctrl+Z undo, Ctrl+Shift+W close latest pop-out. "
-                f"History overlay is {overlay_state}. "
-                "Ctrl+Shift+R reapplies the current real-size template, Ctrl+Shift+H toggles history overlay, Ctrl+Shift+T toggles template overlay."
-            )
+            selected = len(self.cleanup_selected_sequences())
+            popups = len(self._tracked_popups())
+            if edit_active:
+                text = (
+                    f"Edit frame active. Drag handles to move or resize; Ctrl+drag a move handle to rotate. "
+                    f"Aspect: {aspect_label}. Selected: {selected}  Pop-outs: {popups}"
+                )
+            else:
+                drag_hint = "Shift+drag manual crop; Ctrl+Shift+drag forces square."
+                if aspect_mode == "square":
+                    drag_hint = "Shift+drag manual crops stay square; Ctrl+Shift+drag also forces square."
+                elif aspect_mode == "keep":
+                    drag_hint = "Shift+drag manual crop is freeform; template size edits keep the current ratio."
+                text = (
+                    f"Crop template on. Click preview to apply. Aspect: {aspect_label}. "
+                    f"{drag_hint} Selected: {selected}  Pop-outs: {popups}"
+                )
         else:
-            text = "Quick crop mode is off. Press Ctrl+Shift+C to toggle."
+            text = "Press Ctrl+Shift+C to enable crop-template mode."
         label.setText(text)
 
     # ------------------------------------------------------------------
@@ -98,6 +201,16 @@ class QuickCropController:
             height_spin.blockSignals(False)
         if real_width > 0 and real_height > 0:
             viewer._quick_crop_aspect = real_width / max(0.001, real_height)
+        aspect_combo = getattr(viewer, "quick_crop_aspect_combo", None)
+        canvas = getattr(viewer, "preview_canvas", None)
+        template = getattr(canvas, "_fixed_crop_template", {}) or {}
+        if aspect_combo is not None and bool(template.get("square", False)):
+            idx = aspect_combo.findData("square")
+            if idx >= 0 and aspect_combo.currentIndex() != idx:
+                aspect_combo.blockSignals(True)
+                aspect_combo.setCurrentIndex(idx)
+                aspect_combo.blockSignals(False)
+                viewer.quick_crop_aspect_mode = "square"
         unit_lbl = getattr(viewer, 'quick_crop_real_unit_lbl', None)
         if unit_lbl is not None:
             unit_lbl.setText(real_unit or "nm")
@@ -108,9 +221,7 @@ class QuickCropController:
             except Exception:
                 px_dims = ()
             if len(px_dims) == 2 and px_dims[0] and px_dims[1]:
-                info_lbl.setText(
-                    f"W: {real_width:.3f} {real_unit} ({px_dims[0]} px)  |  H: {real_height:.3f} {real_unit} ({px_dims[1]} px)"
-                )
+                info_lbl.setText(f"{int(px_dims[0])} x {int(px_dims[1])} px")
             else:
                 info_lbl.setText("")
 
@@ -121,8 +232,8 @@ class QuickCropController:
         height_spin = getattr(viewer, 'quick_crop_real_height_spin', None)
         if width_spin is None or height_spin is None:
             return
-        lock_cb = getattr(viewer, 'quick_crop_lock_aspect_cb', None)
-        if lock_cb is not None and lock_cb.isChecked():
+        mode = self._aspect_mode()
+        if mode == "keep":
             aspect = viewer._quick_crop_aspect or 1.0
             if sender is width_spin:
                 new_w = width_spin.value()
@@ -136,8 +247,7 @@ class QuickCropController:
                 width_spin.blockSignals(True)
                 width_spin.setValue(new_w)
                 width_spin.blockSignals(False)
-        square_cb = getattr(viewer, 'quick_crop_square_cb', None)
-        if square_cb is not None and square_cb.isChecked():
+        if mode == "square":
             val = width_spin.value()
             height_spin.blockSignals(True)
             height_spin.setValue(val)
@@ -151,10 +261,8 @@ class QuickCropController:
         height_spin = getattr(viewer, 'quick_crop_real_height_spin', None)
         if width_spin is None or height_spin is None:
             return
-        square = False
-        square_cb = getattr(viewer, 'quick_crop_square_cb', None)
-        if square_cb is not None:
-            square = bool(square_cb.isChecked())
+        mode = self._aspect_mode()
+        square = mode == "square"
         real_w = width_spin.value()
         real_h = height_spin.value()
         success = False
@@ -333,6 +441,8 @@ class QuickCropController:
             seq = entry.get("sequence")
             if seq is not None:
                 self.close_popup(seq)
+            return True
+        return False
 
     def clear_history(self):
         self.viewer.preview_canvas.clear_fixed_crop_history()
@@ -393,6 +503,11 @@ class QuickCropController:
                     size_text = f"{px_width} × {px_height} px"
                 else:
                     size_text = "Unknown size"
+            show_cb = QtWidgets.QCheckBox()
+            show_cb.setChecked(bool(entry.get("visible", True)))
+            show_cb.setToolTip("Show or hide this crop outline on the image")
+            show_cb.toggled.connect(lambda checked, s=seq: self.set_history_entry_visible(s, checked))
+            entry_layout.addWidget(show_cb)
             label_widget = QtWidgets.QLabel(f"#{seq} - {size_text}")
             label_widget.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             entry_layout.addWidget(label_widget)
@@ -443,16 +558,18 @@ class QuickCropController:
             entry_layout.addWidget(remove_btn)
             layout.addWidget(frame)
         layout.addStretch(1)
-        viewer.crop_history_panel.setVisible(bool(entries) or getattr(viewer, 'show_crop_history_overlay', False))
-        viewer.quick_crop_undo_btn.setEnabled(bool(entries))
-        viewer.quick_crop_clear_btn.setEnabled(bool(entries))
-        viewer.quick_crop_close_btn.setEnabled(bool(self.popup_stack))
-        export_btn = getattr(viewer, 'quick_crop_export_btn', None)
-        if export_btn is not None:
-            export_btn.setEnabled(bool(selected_seqs))
-        tile_btn = getattr(viewer, 'quick_crop_tile_btn', None)
-        if tile_btn is not None:
-            self.update_popup_actions()
+        viewer.crop_history_panel.setVisible(bool(entries))
+        for act_name, enabled in (
+            ("quick_crop_undo_act", bool(entries)),
+            ("quick_crop_clear_act", bool(entries)),
+            ("quick_crop_close_act", bool(self.popup_stack)),
+            ("quick_crop_export_act", bool(selected_seqs)),
+        ):
+            act = getattr(viewer, act_name, None)
+            if act is not None:
+                act.setEnabled(enabled)
+        self.update_popup_actions()
+        self.update_hint()
 
     # ------------------------------------------------------------------
     def cleanup_selected_sequences(self):
@@ -462,6 +579,23 @@ class QuickCropController:
         if selected != self.selected_sequences:
             self.selected_sequences = selected
         return selected
+
+    def set_history_entry_visible(self, seq, visible):
+        if seq is None:
+            return
+        viewer = self.viewer
+        canvases = [getattr(viewer, 'preview_canvas', None)] + list(getattr(viewer, '_popup_canvases', []))
+        for canv in canvases:
+            if canv is None:
+                continue
+            try:
+                canv.set_fixed_crop_history_entry_visible(seq, visible)
+            except Exception:
+                continue
+        entry = self.get_history_entry(seq)
+        if entry is not None:
+            entry["visible"] = bool(visible)
+        self.refresh_history_panel()
 
     def _has_popup_for_seq(self, seq):
         if seq is None:
@@ -475,22 +609,25 @@ class QuickCropController:
 
     def update_popup_actions(self):
         viewer = self.viewer
-        tile_btn = getattr(viewer, 'quick_crop_tile_btn', None)
-        if tile_btn is None:
+        tile_act = getattr(viewer, 'quick_crop_tile_act', None)
+        minimize_act = getattr(viewer, 'quick_crop_minimize_act', None)
+        refresh_ui = getattr(viewer, '_refresh_popup_ui', None)
+        if tile_act is None and minimize_act is None and not callable(refresh_ui):
             return
-        alive = []
-        cleaned = []
-        for dlg in list(getattr(viewer, '_popup_refs', [])):
-            if dlg is None:
-                continue
+        alive = self._tracked_popups()
+        if tile_act is not None:
+            tile_act.setEnabled(bool(alive))
+        if minimize_act is not None:
+            minimize_act.setEnabled(bool(alive))
+        if callable(refresh_ui):
             try:
-                if dlg.isVisible():
-                    alive.append(dlg)
-                cleaned.append(dlg)
-            except RuntimeError:
-                continue
-        viewer._popup_refs = cleaned
-        tile_btn.setEnabled(bool(alive))
+                refresh_ui(popups=alive)
+            except Exception:
+                pass
+        self.update_hint()
+
+    def tracked_popups(self):
+        return list(self._tracked_popups())
 
     def _crop_color_for_seq(self, seq: int):
         palette = [
@@ -502,9 +639,83 @@ class QuickCropController:
         except Exception:
             return palette[0]
 
-    def arrange_popups(self):
+    def _tracked_popups(self):
         viewer = self.viewer
-        popups = [dlg for dlg in getattr(viewer, '_popup_refs', []) if dlg and dlg.isVisible()]
+        alive = []
+        cleaned = []
+        seen = set()
+        candidates = None
+        used_iter_windows = False
+        iter_windows = getattr(viewer, "_iter_workspace_windows", None)
+        if callable(iter_windows):
+            try:
+                candidates = list(iter_windows(include_canvas=False))
+                used_iter_windows = True
+            except Exception:
+                candidates = None
+        if candidates is None:
+            candidates = list(getattr(viewer, '_popup_refs', []))
+        for dlg in candidates:
+            if dlg is None:
+                continue
+            if dlg is viewer:
+                continue
+            ident = id(dlg)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            try:
+                if dlg.isVisible() or dlg.isMinimized():
+                    alive.append(dlg)
+                cleaned.append(dlg)
+            except RuntimeError:
+                continue
+        if not used_iter_windows:
+            viewer._popup_refs = cleaned
+        return alive
+
+    def _bump_popup_stack(self, popups):
+        if not popups:
+            return
+        for dlg in popups:
+            try:
+                dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+                dlg.show()
+                dlg.raise_()
+            except Exception:
+                continue
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            try:
+                app.processEvents()
+            except Exception:
+                pass
+        for dlg in popups:
+            try:
+                dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, False)
+                dlg.show()
+                dlg.raise_()
+            except Exception:
+                continue
+
+    def focus_popup(self, dlg):
+        if dlg is None:
+            return False
+        try:
+            state = dlg.windowState()
+            if state & QtCore.Qt.WindowMinimized:
+                dlg.showNormal()
+            else:
+                dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            return False
+        self._bump_popup_stack([dlg])
+        return True
+
+    def arrange_popups(self):
+        popups = self._tracked_popups()
         if not popups:
             return
         screen = QtWidgets.QApplication.primaryScreen()
@@ -517,9 +728,59 @@ class QuickCropController:
             row, col = divmod(idx, cols)
             x = geom.left() + col * tile_w
             y = geom.top() + row * tile_h
-            dlg.setGeometry(x + 10, y + 10, tile_w - 20, tile_h - 20)
-            dlg.raise_()
-            dlg.activateWindow()
+            try:
+                if dlg.isMinimized() or (dlg.windowState() & QtCore.Qt.WindowMaximized):
+                    dlg.showNormal()
+                dlg.setGeometry(x + 10, y + 10, tile_w - 20, tile_h - 20)
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                continue
+        self._bump_popup_stack(popups)
+
+    def minimize_popups(self):
+        popups = self._tracked_popups()
+        if not popups:
+            return
+        for dlg in popups:
+            try:
+                dlg.showMinimized()
+            except Exception:
+                continue
+
+    def raise_popups(self):
+        popups = self._tracked_popups()
+        if not popups:
+            return []
+        for dlg in popups:
+            try:
+                if dlg.isMinimized() or (dlg.windowState() & QtCore.Qt.WindowMinimized):
+                    dlg.showNormal()
+                else:
+                    dlg.show()
+                dlg.raise_()
+            except Exception:
+                continue
+        self._bump_popup_stack(popups)
+        try:
+            popups[-1].activateWindow()
+        except Exception:
+            pass
+        return popups
+
+    def restore_popups(self):
+        self.raise_popups()
+
+    def close_tracked_popups(self):
+        popups = list(self._tracked_popups())
+        if not popups:
+            return
+        for dlg in popups:
+            try:
+                dlg.close()
+            except Exception:
+                continue
+        self.update_popup_actions()
 
     # ------------------------------------------------------------------
     def export_selected_crops(self):

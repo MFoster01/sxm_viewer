@@ -1,6 +1,7 @@
 """Detail canvases and spectroscopy dialogs."""
 from __future__ import annotations
 
+import copy
 import io
 import itertools
 import json
@@ -19,6 +20,7 @@ from matplotlib.widgets import RectangleSelector
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.transforms import Affine2D
 import matplotlib
 from matplotlib.collections import LineCollection
 import matplotlib.patheffects as PathEffects
@@ -30,8 +32,14 @@ from .molecular_overlay import (
     get_atom_color,
     get_atom_radius,
     available_atom_palettes,
+    normalize_molecule_render_style,
 )
-from ..thumbnail_render import sample_array_value, array_to_qimage
+from ..plot_typography import add_font_menu_action, normalize_font_family, apply_text_style
+from ..palettes import DEFAULT_COLOR_CYCLE, get_color_cycle
+from ..profile_links import register_profile_canvas, notify_profile_source_changed
+from ..ppt_bridge import powerpoint_support_status, send_pixmap_to_ppt
+from ..thumbnail_render import _interp_index, sample_array_value, array_to_qimage, _colormap_icon
+from ..system_open import add_source_file_menu
 
 try:
     from scipy import ndimage
@@ -61,9 +69,12 @@ except Exception:  # pragma: no cover - optional dependency
     _HAS_CV2 = False
 
 _FIXED_CROP_HISTORY_LIMIT = 96
+_UNDO_HISTORY_LIMIT = 24
 
 class MultiPreviewCanvas(FigureCanvas):
     _RECENT_MOLECULES = []
+    _DRAG_VIEW_SNAPSHOTS = {}
+    _DRAG_VIEW_SNAPSHOT_LIMIT = 32
 
     def __init__(self, parent=None, figsize=(6,6)):
         self.fig = Figure(figsize=figsize)
@@ -88,7 +99,10 @@ class MultiPreviewCanvas(FigureCanvas):
         self._resize_settle_timer.setSingleShot(True)
         self._resize_settle_timer.setInterval(140)
         self._resize_settle_timer.timeout.connect(self._finalize_after_resize)
+        self._render_suspended = False
+        self._render_pending = False
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self._overlay_shortcuts = []
         self.views = []
         self._ax_view_map = {}
         self._relative_axes_override = None
@@ -98,6 +112,7 @@ class MultiPreviewCanvas(FigureCanvas):
         self._views_callback = None
         self._drag_candidate = None  # (view, QPoint start, QImage cache)
         self._crop_callback = None  # callable(view_dict) -> None
+        self._virtual_copy_callback = None
         self._crop_start = None
         self._crop_rect = None
         self._crop_ax = None
@@ -111,6 +126,8 @@ class MultiPreviewCanvas(FigureCanvas):
         self._fixed_crop_template_visible = False
         self._fixed_crop_history_visible = False
         self._fixed_crop_quick_mode = False
+        self._fixed_crop_transform_mode = False
+        self._fixed_crop_template_drag = None
         self._fixed_crop_history = []
         self._fixed_crop_sequence = 1
         self._fixed_crop_template_unit = "nm"
@@ -118,12 +135,34 @@ class MultiPreviewCanvas(FigureCanvas):
         self._fixed_crop_template_manual_dims = None
         self._fixed_crop_history_highlight_seq = None
         self._fixed_crop_history_highlight_artists = {}
+        self._fixed_crop_drag_last_ts = 0.0
+        self._fixed_crop_drag_throttle_ms = 12.0
+        self._fixed_crop_overlay_artists = {}
+        self._fixed_crop_cursor_mode = None
         self._double_click_callback = None  # callable(view_dict) -> None
         self._filter_menu_callback = None  # callable(menu, view, canvas)
         self._histogram_dialog_callback = None
+        self._histogram_auto_callback = None
+        self._histogram_reset_callback = None
+        self._display_relative_zero_menu_callback = None
+        self._display_relative_zero_menu_state_callback = None
+        self._display_relative_zero_menu_tooltip = ""
+        self._apply_popup_style_callback = None
+        self._apply_popup_style_label = "Apply this style to all pop-ups"
+        self._apply_popup_style_tooltip = ""
+        self._collection_menu_callback = None
+        self._collection_help_callback = None
+        self._compare_menu_callback = None
+        self._compare_menu_state_callback = None
         self._stp_export_callback = None
         self._arrange_windows_callback = None
+        self._minimize_windows_callback = None
+        self._restore_windows_callback = None
+        self._close_windows_callback = None
         self._value_callback = None
+        self._undo_history = []
+        self._undo_restore_in_progress = False
+        self._undo_suspend_depth = 0
         self._value_cid = self.mpl_connect('motion_notify_event', self._on_motion_value)
         self.mpl_connect('motion_notify_event', self._on_molecule_motion)
         self.mpl_connect('button_release_event', self._on_molecule_release)
@@ -151,18 +190,26 @@ class MultiPreviewCanvas(FigureCanvas):
         self._profile_state_syncing = False
         self._profile_state_deferred = False
         self._profile_user_enabled = False
+        self._profile_quick_transient = False
+        self._profile_move_only = False
         self._profile_update_timer = QtCore.QTimer(self)
         self._profile_update_timer.setSingleShot(True)
         self._profile_update_timer.setInterval(50)
         self._profile_update_timer.timeout.connect(self._flush_profile_updates)
         self._saved_profiles = []
-        self._profile_color_cycle = itertools.cycle([
-            '#000000', '#e6194B', '#4363d8', '#3cb44b',
-            '#911eb4', '#f58231', '#a9a9a9'
-        ])
+        self._profile_live_source_id = f"canvas-{id(self):x}"
+        self._profile_saved_profile_seq = 1
+        self._profile_palette_name = DEFAULT_COLOR_CYCLE
+        self._profile_palette_colors = get_color_cycle(self._profile_palette_name)
+        self._profile_color_cycle = itertools.cycle(self._profile_palette_colors)
         self._line_drag_origin = None
+        self._saved_profile_drag = None
         self._active_profile_color = '#fbc02d'
         self._active_profile_lw = 2.0
+        self._active_profile_line_style = "-"
+        self._active_profile_marker_style = "o"
+        self._active_profile_marker_size = 7.0
+        self._active_profile_original_id = None
         self._highlighted_overlay = None
         self._cids = []
         self._base_click_cid = self.mpl_connect('button_press_event', self._on_base_click)
@@ -172,7 +219,12 @@ class MultiPreviewCanvas(FigureCanvas):
         self._profile_highlight_cb = None
         self._profile_label_scale = 1.0
         self._profile_label_mode = "length"
+        self._measurement_shortcuts_enabled = True
         self._view_font_scale = 1.0
+        self._font_family = normalize_font_family(matplotlib.rcParams.get("font.family", [None])[0], "sans-serif")
+        self._plot_font_bold = bool(getattr(parent, "_plot_font_bold", False))
+        self._plot_font_italic = bool(getattr(parent, "_plot_font_italic", False))
+        self._plot_font_underline = bool(getattr(parent, "_plot_font_underline", False))
         self._colorbar_orientation = 'vertical'
         self._show_ticks = True
         self._show_colorbar = True
@@ -181,6 +233,8 @@ class MultiPreviewCanvas(FigureCanvas):
         self._show_profile_overlays = True
         self._show_angle_overlays = True
         self._show_shortcut_hint = True
+        self._show_image_size_overlay = False
+        self._shortcut_hint_artist = None
         self._fit_to_canvas = False
         self._frame_fill_mode = False
         self._frame_fill_prev_state = None
@@ -222,8 +276,9 @@ class MultiPreviewCanvas(FigureCanvas):
         self._scale_bar_settings = {
             'text_color': None,
             'bar_color': None,
-            'font_family': 'sans-serif'
+            'font_family': self._font_family
         }
+        self._font_change_callback = None
         # Outline extraction state
         self.outline_mode = False  # if True, Alt+drag will outline blobs
         self._outline_start = None
@@ -237,6 +292,7 @@ class MultiPreviewCanvas(FigureCanvas):
         self._outline_order = []  # global order for undo [(key, idx)]
         # Molecular overlay state
         self.molecules = []
+        self._active_molecule_idx = None
         self._molecule_drag_idx = None
         self._molecule_drag_start = None
         self._molecule_drag_start_px = None
@@ -247,6 +303,14 @@ class MultiPreviewCanvas(FigureCanvas):
         self._molecule_artists = []
         self._molecule_history = []
         self._molecule_drag_snapshot = False
+        self._show_molecule_gizmo = False
+        self._molecule_gizmo_until = 0.0
+        self._molecule_gizmo_axes = None
+        self._molecule_gizmo_artists = {}
+        self._molecule_gizmo_drag = None
+        self._molecule_gizmo_timer = QtCore.QTimer(self)
+        self._molecule_gizmo_timer.setSingleShot(True)
+        self._molecule_gizmo_timer.timeout.connect(self._on_molecule_gizmo_timeout)
         self._show_molecule_shadow = True
         self.show_molecules = True
         self.mpl_connect('scroll_event', self._on_scroll_zoom)
@@ -262,6 +326,7 @@ class MultiPreviewCanvas(FigureCanvas):
         self._pan_active = False
         self._pan_ax = None
         self._pan_start = None
+        self._install_overlay_shortcuts()
         self._pan_start_lim = None
         self._pan_last_ts = 0.0
         self._pan_throttle_ms = 16
@@ -269,23 +334,60 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def set_show_title(self, show: bool):
         """Toggle rendering of title/date overlays in views."""
-        self._show_title = bool(show)
+        show = bool(show)
+        if show == self._show_title:
+            return
+        self.push_undo_state("show_title")
+        self._show_title = show
         self._redraw()
         self._notify_views_callback()
 
     def set_show_acquisition_overlay(self, show: bool):
         """Toggle acquisition metadata HUD in the top-right image corner."""
-        self._show_acquisition_overlay = bool(show)
+        show = bool(show)
+        if show == self._show_acquisition_overlay:
+            return
+        self.push_undo_state("acquisition_overlay")
+        self._show_acquisition_overlay = show
         self._redraw()
+        self._notify_views_callback()
 
     def set_show_molecules(self, show: bool):
         """Toggle rendering of molecular overlays in views."""
-        self.show_molecules = bool(show)
+        show = bool(show)
+        if show == self.show_molecules:
+            return
+        self.push_undo_state("show_molecules")
+        self.show_molecules = show
         self._redraw()
+        self._notify_views_callback()
+
+    def set_show_molecule_gizmo(self, show: bool):
+        """Toggle the molecule orientation gizmo."""
+        show = bool(show)
+        if show == bool(getattr(self, "_show_molecule_gizmo", False)):
+            return
+        self.push_undo_state("show_molecule_gizmo")
+        self._show_molecule_gizmo = show
+        if show:
+            self._wake_molecule_gizmo(1800, redraw=False)
+        else:
+            self._molecule_gizmo_until = 0.0
+            try:
+                self._molecule_gizmo_timer.stop()
+            except Exception:
+                pass
+        self._redraw()
+        self._notify_views_callback()
 
     def set_profile_tool_enabled(self, enabled: bool):
         enabled = bool(enabled)
+        if enabled == bool(getattr(self, "_profile_user_enabled", self.profile_enabled)):
+            return
+        self.push_undo_state("profile_tool")
         self._profile_user_enabled = enabled
+        if enabled:
+            self._profile_move_only = False
         self.enable_profile(enabled)
         if enabled:
             try:
@@ -293,15 +395,62 @@ class MultiPreviewCanvas(FigureCanvas):
             except Exception:
                 pass
 
+    def deactivate_profile_tool(self, *, clear_active: bool = True, clear_saved: bool = False):
+        """Disable profile interaction while optionally preserving saved overlays."""
+        self._profile_user_enabled = False
+        self._profile_quick_transient = False
+        self._profile_move_only = False
+        if self.profile_enabled:
+            try:
+                self._disconnect_profile_events()
+            except Exception:
+                pass
+        self.profile_enabled = False
+        if clear_active:
+            try:
+                self._clear_profile_artists()
+            except Exception:
+                pass
+            self.profile_pts = None
+            self._active_profile_original_color = None
+            self._profile_marker_positions = None
+            self._profile_marker_domain = None
+            try:
+                self._clear_profile_hud()
+            except Exception:
+                pass
+        if clear_saved:
+            try:
+                self._clear_saved_profile_artists(notify=False)
+            except Exception:
+                pass
+        try:
+            self._emit_profile_state()
+        except Exception:
+            pass
+        self.draw_idle()
+
     def set_angle_tool_enabled(self, enabled: bool):
         self.enable_angle(bool(enabled))
 
+    def set_measurement_shortcuts_enabled(self, enabled: bool):
+        """Enable or disable Ctrl-based quick profile/angle shortcuts for this canvas."""
+        self._measurement_shortcuts_enabled = bool(enabled)
+
     def clear_measurement_overlays(self):
         try:
-            self.clear_angle_measurement()
+            self.push_undo_state("clear_measurements")
+            self._clear_angle_artists()
             self._clear_profile_artists()
             self._clear_saved_profile_artists(notify=False)
             self.profile_pts = None
+            if self.angle_enabled:
+                self._undo_suspend_depth += 1
+                try:
+                    self._ensure_angle_frames()
+                finally:
+                    self._undo_suspend_depth = max(0, self._undo_suspend_depth - 1)
+                self._emit_angle()
             self._emit_profile_state()
             self.draw_idle()
         except Exception:
@@ -309,32 +458,38 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def apply_display_preset(self, preset: str):
         preset = (preset or "").strip().lower()
+        if preset not in {"focus", "analysis", "publication"}:
+            return
+        self.push_undo_state(f"preset:{preset}")
         if preset == "focus":
             self._show_ticks = False
             self._show_colorbar = False
             self._show_title = False
-            self.set_show_profile_overlays(False)
-            self.set_show_angle_overlays(False)
+            self._show_profile_overlays = False
+            self._show_angle_overlays = False
         elif preset == "analysis":
             self._show_ticks = True
             self._show_colorbar = True
             self._show_title = True
-            self.set_show_profile_overlays(True)
-            self.set_show_angle_overlays(True)
-        elif preset == "publication":
+            self._show_profile_overlays = True
+            self._show_angle_overlays = True
+        else:
             self._show_ticks = False
             self._show_colorbar = True
             self._show_title = True
-            self.set_show_profile_overlays(False)
-            self.set_show_angle_overlays(False)
-        else:
-            return
+            self._show_profile_overlays = False
+            self._show_angle_overlays = False
+        self._apply_profile_visibility()
+        self._apply_angle_visibility()
         self._redraw()
         self._notify_views_callback()
 
     def set_fit_to_canvas(self, enabled: bool):
         """If enabled, stretch view axes to fill the available canvas area."""
-        self._fit_to_canvas = bool(enabled)
+        enabled = bool(enabled)
+        if enabled == self._fit_to_canvas:
+            return
+        self._fit_to_canvas = enabled
         self._redraw()
 
     def set_frame_fill_mode(self, enabled: bool):
@@ -342,6 +497,7 @@ class MultiPreviewCanvas(FigureCanvas):
         enabled = bool(enabled)
         if enabled == self._frame_fill_mode:
             return
+        self.push_undo_state("frame_fill")
         if enabled:
             self._frame_fill_prev_state = {
                 "show_ticks": bool(self._show_ticks),
@@ -364,13 +520,38 @@ class MultiPreviewCanvas(FigureCanvas):
             self._frame_fill_prev_state = None
         self._frame_fill_mode = enabled
         self._redraw()
+        self._notify_views_callback()
 
     def draw(self):
+        if getattr(self, "_render_suspended", False):
+            self._render_pending = True
+            return
         try:
             super().draw()
+            self._render_pending = False
         except np.linalg.LinAlgError:
             # Ignore transient singular transforms during layout updates.
             return
+
+    def draw_idle(self):
+        if getattr(self, "_render_suspended", False):
+            self._render_pending = True
+            return
+        try:
+            super().draw_idle()
+        except np.linalg.LinAlgError:
+            return
+
+    def set_render_suspended(self, suspended: bool):
+        suspended = bool(suspended)
+        previously = bool(getattr(self, "_render_suspended", False))
+        self._render_suspended = suspended
+        if previously and not suspended and getattr(self, "_render_pending", False):
+            self._render_pending = False
+            try:
+                super().draw()
+            except np.linalg.LinAlgError:
+                return
 
     def set_compact_size_hints(self, enabled: bool = True):
         self._compact_size_hints = bool(enabled)
@@ -432,6 +613,7 @@ class MultiPreviewCanvas(FigureCanvas):
             layout = "grid"
         if layout == self._view_layout:
             return
+        self.push_undo_state("view_layout")
         self._view_layout = layout
         self._redraw()
         self._notify_views_callback()
@@ -444,6 +626,7 @@ class MultiPreviewCanvas(FigureCanvas):
             new_val = bool(value)
         if self._relative_axes_override == new_val:
             return
+        self.push_undo_state("relative_axes")
         self._relative_axes_override = new_val
         self.suspend_zoom_restore()
         self._redraw()
@@ -481,6 +664,10 @@ class MultiPreviewCanvas(FigureCanvas):
         """Register a callback to receive cropped views created via drag-crop."""
         self._crop_callback = cb
 
+    def set_virtual_copy_callback(self, cb):
+        """Register a callback that can promote a view into a virtual thumbnail copy."""
+        self._virtual_copy_callback = cb
+
     def set_double_click_callback(self, cb):
         """Register a callback to pop out the clicked view on double-click."""
         self._double_click_callback = cb
@@ -493,6 +680,37 @@ class MultiPreviewCanvas(FigureCanvas):
         """Register callback to open the histogram dialog for this canvas."""
         self._histogram_dialog_callback = cb
 
+    def set_histogram_auto_callback(self, cb):
+        """Register callback that applies automatic contrast to the active view."""
+        self._histogram_auto_callback = cb
+
+    def set_histogram_reset_callback(self, cb):
+        """Register callback that resets contrast to the full data range."""
+        self._histogram_reset_callback = cb
+
+    def set_display_relative_zero_menu_callback(self, cb, state_cb=None, tooltip=None):
+        """Register an optional popup-local menu action for relative-zero display."""
+        self._display_relative_zero_menu_callback = cb
+        self._display_relative_zero_menu_state_callback = state_cb
+        self._display_relative_zero_menu_tooltip = str(tooltip or "")
+
+    def set_apply_popup_style_callback(self, cb, label=None, tooltip=None):
+        """Register an optional action that applies this popup style to peer popups."""
+        self._apply_popup_style_callback = cb
+        if label:
+            self._apply_popup_style_label = str(label)
+        self._apply_popup_style_tooltip = str(tooltip or "")
+
+    def set_collection_menu_callback(self, cb, help_cb=None):
+        """Register collection-menu handlers used to save curated views into cross-folder collections."""
+        self._collection_menu_callback = cb
+        self._collection_help_callback = help_cb
+
+    def set_compare_menu_callback(self, cb, state_cb=None):
+        """Register compare-menu handlers used to populate A/B view comparisons from right-clicks."""
+        self._compare_menu_callback = cb
+        self._compare_menu_state_callback = state_cb
+
     def set_stp_export_callback(self, cb):
         """Register callback for WSxM STP export requests."""
         self._stp_export_callback = cb
@@ -501,21 +719,148 @@ class MultiPreviewCanvas(FigureCanvas):
         """Register callback invoked when the user requests window tiling."""
         self._arrange_windows_callback = cb
 
+    def set_window_minimize_callback(self, cb):
+        """Register callback invoked when the user requests minimizing pop-out windows."""
+        self._minimize_windows_callback = cb
+
+    def set_window_restore_callback(self, cb):
+        """Register callback invoked when the user requests recalling pop-out windows."""
+        self._restore_windows_callback = cb
+
+    def set_window_close_callback(self, cb):
+        """Register callback invoked when the user requests closing all pop-out windows."""
+        self._close_windows_callback = cb
+
+    def set_plot_font_family_callback(self, cb):
+        """Register a callback used when the user picks a new plot font."""
+        self._font_change_callback = cb
+
+    def set_plot_font_family(self, family: str):
+        """Apply a shared font family to the canvas and its scale bar."""
+        self.set_plot_typography(family=family)
+
+    def _plot_style_state(self):
+        return {
+            "bold": bool(getattr(self, "_plot_font_bold", False)),
+            "italic": bool(getattr(self, "_plot_font_italic", False)),
+            "underline": bool(getattr(self, "_plot_font_underline", False)),
+        }
+
+    def set_plot_typography(self, *, family=None, bold=None, italic=None, underline=None):
+        """Apply shared typography settings to the preview canvas."""
+        changes = {
+            "bold": bold,
+            "italic": italic,
+            "underline": underline,
+        }
+        if family is not None:
+            family = normalize_font_family(family, "sans-serif")
+            self._font_family = family
+            self._scale_bar_settings["font_family"] = family
+        for key, attr in (("bold", "_plot_font_bold"), ("italic", "_plot_font_italic"), ("underline", "_plot_font_underline")):
+            value = changes.get(key)
+            if value is not None:
+                setattr(self, attr, bool(value))
+        self._redraw()
+
+    def _apply_plot_font_family_choice(self, family: str):
+        """Route a font choice through the owner first, then fall back locally."""
+        family = normalize_font_family(family, "sans-serif")
+        if callable(self._font_change_callback):
+            try:
+                self._font_change_callback(family)
+                return
+            except Exception:
+                pass
+        self.set_plot_font_family(family)
+
     def set_show_profile_overlays(self, show: bool):
-        self._show_profile_overlays = bool(show)
+        show = bool(show)
+        if show == self._show_profile_overlays:
+            return
+        self.push_undo_state("show_profile_overlays")
+        self._show_profile_overlays = show
         self._apply_profile_visibility()
         self.draw_idle()
         self._notify_views_callback()
 
     def set_show_angle_overlays(self, show: bool):
-        self._show_angle_overlays = bool(show)
-        self._update_angle_artists()
+        show = bool(show)
+        if show == self._show_angle_overlays:
+            return
+        self.push_undo_state("show_angle_overlays")
+        self._show_angle_overlays = show
+        self._apply_angle_visibility()
+        self.draw_idle()
         self._notify_views_callback()
 
     def set_show_shortcut_hint(self, show: bool):
-        self._show_shortcut_hint = bool(show)
+        show = bool(show)
+        if show == self._show_shortcut_hint:
+            return
+        self.push_undo_state("show_shortcut_hint")
+        self._show_shortcut_hint = show
+        if not self._show_shortcut_hint:
+            self._clear_shortcut_hint_artist()
         self._redraw()
         self._notify_views_callback()
+
+    def _install_overlay_shortcuts(self):
+        """Bind overlay toggles at the window level so they work from toolbars too."""
+        if self._overlay_shortcuts:
+            return
+        try:
+            shortcuts = [
+                ("Ctrl+1", lambda: self.set_show_profile_overlays(not self._show_profile_overlays)),
+                ("Ctrl+2", lambda: self.set_show_angle_overlays(not self._show_angle_overlays)),
+                ("Ctrl+3", lambda: self.set_show_molecules(not self.show_molecules)),
+                ("Ctrl+4", lambda: self.enable_scale_bar(not self.scale_bar_enabled)),
+                ("Ctrl+5", lambda: self.set_show_acquisition_overlay(not self._show_acquisition_overlay)),
+                ("Ctrl+H", lambda: self.set_show_shortcut_hint(not self._show_shortcut_hint)),
+                ("Ctrl+E", lambda: self.enable_fixed_crop_transform_mode(not self._fixed_crop_transform_mode)),
+                (QtCore.Qt.Key_Return, self._on_apply_fixed_crop_shortcut),
+                (QtCore.Qt.Key_Enter, self._on_apply_fixed_crop_shortcut),
+                (QtCore.Qt.Key_Escape, self._on_cancel_fixed_crop_shortcut),
+            ]
+            for seq, handler in shortcuts:
+                shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(seq), self)
+                shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+                shortcut.activated.connect(handler)
+                self._overlay_shortcuts.append(shortcut)
+        except Exception:
+            self._overlay_shortcuts = []
+
+    def _on_apply_fixed_crop_shortcut(self):
+        if not self._fixed_crop_template_visible:
+            return
+        view, ax = self._fixed_crop_target_view()
+        if view is None or ax is None:
+            return
+        self._apply_fixed_crop_template(view, ax)
+
+    def _on_cancel_fixed_crop_shortcut(self):
+        if not self._fixed_crop_transform_mode:
+            return
+        self.enable_fixed_crop_transform_mode(False)
+
+    def _clear_shortcut_hint_artist(self):
+        art = getattr(self, "_shortcut_hint_artist", None)
+        if art is None:
+            return
+        try:
+            art.remove()
+        except Exception:
+            pass
+        self._shortcut_hint_artist = None
+
+    def _shortcut_hint_hit(self, event):
+        art = getattr(self, "_shortcut_hint_artist", None)
+        if art is None or event is None:
+            return False
+        try:
+            return bool(art.contains(event)[0])
+        except Exception:
+            return False
 
     def export_molecule_state(self):
         return [mol.to_dict() for mol in (self.molecules or [])]
@@ -573,6 +918,294 @@ class MultiPreviewCanvas(FigureCanvas):
             self._set_active_angle_frame_index(int(state.get("active_idx", 0)))
             self._ensure_angle_frames()
             self._update_angle_artists()
+
+    def _clone_undo_value(self, value):
+        if isinstance(value, np.ndarray):
+            return np.array(value, copy=True)
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+    def _clone_undo_view(self, view):
+        if not isinstance(view, dict):
+            return self._clone_undo_value(view)
+        cloned = {}
+        for key, value in view.items():
+            cloned[key] = self._clone_undo_value(value)
+        return cloned
+
+    def export_outline_state(self):
+        groups = []
+        for key, entries in (self._outlines or {}).items():
+            try:
+                file_path, extent = key
+            except Exception:
+                file_path, extent = None, ()
+            exported_entries = []
+            for entry in entries or []:
+                if isinstance(entry, dict):
+                    pts = entry.get("pts")
+                    color = entry.get("color", self._outline_default_color)
+                    lw = entry.get("lw", self._outline_default_lw)
+                    ls = entry.get("ls", self._outline_default_ls)
+                else:
+                    pts = entry
+                    color = self._outline_default_color
+                    lw = self._outline_default_lw
+                    ls = self._outline_default_ls
+                try:
+                    pts_arr = np.asarray(pts, dtype=float)
+                except Exception:
+                    continue
+                if pts_arr.ndim != 2 or pts_arr.shape[0] < 2:
+                    continue
+                exported_entries.append(
+                    {
+                        "pts": pts_arr.tolist(),
+                        "color": color,
+                        "lw": float(lw),
+                        "ls": self._clone_undo_value(ls),
+                    }
+                )
+            if exported_entries:
+                groups.append(
+                    {
+                        "file_path": file_path,
+                        "extent": list(extent or ()),
+                        "entries": exported_entries,
+                    }
+                )
+        order = []
+        for key, idx in self._outline_order or []:
+            try:
+                file_path, extent = key
+                idx_int = int(idx)
+            except Exception:
+                continue
+            order.append(
+                {
+                    "file_path": file_path,
+                    "extent": list(extent or ()),
+                    "index": idx_int,
+                }
+            )
+        return {
+            "groups": groups,
+            "order": order,
+            "threshold": float(self._outline_threshold),
+        }
+
+    def import_outline_state(self, state):
+        self._outlines = {}
+        self._outline_order = []
+        if not isinstance(state, dict):
+            return
+        try:
+            self._outline_threshold = max(0.05, min(0.99, float(state.get("threshold", self._outline_threshold))))
+        except Exception:
+            pass
+        for group in state.get("groups", []) or []:
+            key = (
+                group.get("file_path"),
+                tuple(group.get("extent") or ()),
+            )
+            entries = []
+            for entry in group.get("entries", []) or []:
+                try:
+                    pts_arr = np.asarray(entry.get("pts"), dtype=float)
+                except Exception:
+                    continue
+                if pts_arr.ndim != 2 or pts_arr.shape[0] < 2:
+                    continue
+                entries.append(
+                    {
+                        "pts": pts_arr,
+                        "color": entry.get("color", self._outline_default_color),
+                        "lw": float(entry.get("lw", self._outline_default_lw)),
+                        "ls": self._clone_undo_value(entry.get("ls", self._outline_default_ls)),
+                    }
+                )
+            if entries:
+                self._outlines[key] = entries
+        order = []
+        for item in state.get("order", []) or []:
+            key = (
+                item.get("file_path"),
+                tuple(item.get("extent") or ()),
+            )
+            try:
+                idx = int(item.get("index", -1))
+            except Exception:
+                continue
+            outlines = self._outlines.get(key)
+            if outlines and 0 <= idx < len(outlines):
+                order.append((key, idx))
+        if not order:
+            for key, entries in self._outlines.items():
+                order.extend((key, idx) for idx in range(len(entries)))
+        self._outline_order = order
+
+    def export_canvas_undo_state(self):
+        return {
+            "views": [self._clone_undo_view(v) for v in (self.views or [])],
+            "profile_state": self._clone_undo_value(self.export_profile_state()),
+            "profile_user_enabled": bool(getattr(self, "_profile_user_enabled", self.profile_enabled)),
+            "active_profile_color": self._active_profile_color,
+            "active_profile_lw": float(self._active_profile_lw),
+            "active_profile_line_style": self._active_profile_line_style,
+            "active_profile_marker_style": self._active_profile_marker_style,
+            "active_profile_marker_size": float(self._active_profile_marker_size),
+            "active_profile_original_color": self._active_profile_original_color,
+            "profile_label_mode": self._profile_label_mode,
+            "angle_state": self._clone_undo_value(self.export_angle_state()),
+            "angle_enabled": bool(self.angle_enabled),
+            "molecule_state": self._clone_undo_value(self.export_molecule_state()),
+            "outline_state": self._clone_undo_value(self.export_outline_state()),
+            "show_title": bool(self._show_title),
+            "show_acquisition_overlay": bool(self._show_acquisition_overlay),
+            "show_molecules": bool(self.show_molecules),
+            "show_profile_overlays": bool(self._show_profile_overlays),
+            "show_angle_overlays": bool(self._show_angle_overlays),
+            "show_shortcut_hint": bool(self._show_shortcut_hint),
+            "show_molecule_gizmo": bool(self._show_molecule_gizmo),
+            "show_ticks": bool(self._show_ticks),
+            "show_colorbar": bool(self._show_colorbar),
+            "scale_bar_enabled": bool(self.scale_bar_enabled),
+            "colorbar_orientation": self._colorbar_orientation,
+            "view_layout": self._view_layout,
+            "frame_fill_mode": bool(self._frame_fill_mode),
+            "frame_fill_prev_state": self._clone_undo_value(self._frame_fill_prev_state),
+            "fit_to_canvas": bool(self._fit_to_canvas),
+            "relative_axes_override": self._clone_undo_value(self._relative_axes_override),
+        }
+
+    def push_undo_state(self, label=None):
+        if self._undo_restore_in_progress or self._undo_suspend_depth > 0:
+            return False
+        try:
+            state = self.export_canvas_undo_state()
+        except Exception:
+            return False
+        if label is not None:
+            state["_label"] = str(label)
+        self._undo_history.append(state)
+        if len(self._undo_history) > _UNDO_HISTORY_LIMIT:
+            self._undo_history.pop(0)
+        return True
+
+    def handle_undo_request(self):
+        if self.undo_last_action():
+            return True
+        if self._undo_last_profile_snapshot():
+            return True
+        if self._undo_last_outline():
+            return True
+        return bool(self.undo_last_molecule_change())
+
+    def undo_last_action(self):
+        if not self._undo_history:
+            return False
+        state = self._undo_history.pop()
+        if not isinstance(state, dict):
+            return False
+        self._undo_restore_in_progress = True
+        self._undo_suspend_depth += 1
+        try:
+            try:
+                self.enable_profile(False)
+            except Exception:
+                pass
+            try:
+                self.enable_angle(False)
+            except Exception:
+                pass
+
+            self._show_title = bool(state.get("show_title", self._show_title))
+            self._show_acquisition_overlay = bool(state.get("show_acquisition_overlay", self._show_acquisition_overlay))
+            self.show_molecules = bool(state.get("show_molecules", self.show_molecules))
+            self._show_profile_overlays = bool(state.get("show_profile_overlays", self._show_profile_overlays))
+            self._show_angle_overlays = bool(state.get("show_angle_overlays", self._show_angle_overlays))
+            self._show_shortcut_hint = bool(state.get("show_shortcut_hint", self._show_shortcut_hint))
+            self._show_molecule_gizmo = bool(state.get("show_molecule_gizmo", self._show_molecule_gizmo))
+            if not self._show_shortcut_hint:
+                self._clear_shortcut_hint_artist()
+            self._show_ticks = bool(state.get("show_ticks", self._show_ticks))
+            self._show_colorbar = bool(state.get("show_colorbar", self._show_colorbar))
+            self._colorbar_orientation = str(state.get("colorbar_orientation", self._colorbar_orientation) or "vertical")
+            self._view_layout = str(state.get("view_layout", self._view_layout) or "grid")
+            self._frame_fill_mode = bool(state.get("frame_fill_mode", self._frame_fill_mode))
+            self._frame_fill_prev_state = self._clone_undo_value(state.get("frame_fill_prev_state"))
+            self._fit_to_canvas = bool(state.get("fit_to_canvas", self._fit_to_canvas))
+            self._relative_axes_override = self._clone_undo_value(state.get("relative_axes_override", self._relative_axes_override))
+
+            desired_scale_bar = bool(state.get("scale_bar_enabled", self.scale_bar_enabled))
+            if desired_scale_bar != self.scale_bar_enabled:
+                self.scale_bar_enabled = desired_scale_bar
+                if desired_scale_bar:
+                    self._connect_scale_bar_events()
+                else:
+                    self._disconnect_scale_bar_events()
+
+            self.molecules = []
+            for entry in state.get("molecule_state", []) or []:
+                try:
+                    self.molecules.append(Molecule.from_dict(entry))
+                except Exception:
+                    continue
+            self.import_outline_state(state.get("outline_state"))
+
+            views = [self._clone_undo_view(v) for v in (state.get("views") or [])]
+            self.set_views(views, preserve_profiles=False)
+
+            self._active_profile_color = state.get("active_profile_color", self._active_profile_color) or self._active_profile_color
+            try:
+                self._active_profile_lw = float(state.get("active_profile_lw", self._active_profile_lw))
+            except Exception:
+                pass
+            self._active_profile_line_style = self._normalize_profile_line_style(
+                state.get("active_profile_line_style", self._active_profile_line_style),
+                self._active_profile_line_style,
+            )
+            self._active_profile_marker_style = self._normalize_profile_marker_style(
+                state.get("active_profile_marker_style", self._active_profile_marker_style),
+                self._active_profile_marker_style,
+            )
+            try:
+                self._active_profile_marker_size = float(
+                    state.get("active_profile_marker_size", self._active_profile_marker_size)
+                )
+            except Exception:
+                pass
+            self._active_profile_original_color = state.get("active_profile_original_color")
+            mode = str(state.get("profile_label_mode", self._profile_label_mode) or "length").strip().lower()
+            if mode not in ("length", "full", "hidden"):
+                mode = "length"
+            self._profile_label_mode = mode
+            self._profile_user_enabled = bool(state.get("profile_user_enabled", getattr(self, "_profile_user_enabled", False)))
+            profile_state = state.get("profile_state")
+            if isinstance(profile_state, dict):
+                self.import_profile_state(self._clone_undo_value(profile_state), emit=False)
+
+            angle_state = state.get("angle_state")
+            if bool(state.get("angle_enabled", False)):
+                self.angle_enabled = True
+                self._connect_angle_events()
+                if isinstance(angle_state, dict):
+                    self.import_angle_state(self._clone_undo_value(angle_state))
+                else:
+                    self._ensure_angle_frames()
+                self._apply_angle_visibility()
+            else:
+                self.angle_enabled = False
+
+            self._apply_profile_visibility()
+            self.draw_idle()
+            self._notify_views_callback()
+            return True
+        finally:
+            self._undo_suspend_depth = max(0, self._undo_suspend_depth - 1)
+            self._undo_restore_in_progress = False
 
     def set_view_clim(self, view, clim):
         """Update the color limits for a specific view and redraw while preserving overlays."""
@@ -651,22 +1284,34 @@ class MultiPreviewCanvas(FigureCanvas):
     def _redraw(self):
         # Preserve current zoom/limits per view before clearing
         current_limits = {}
+        current_base_limits = {}
         preserve_zoom = not getattr(self, "_suspend_zoom_restore", False)
+        profile_state = None
+        try:
+            profile_state = self.export_profile_state()
+        except Exception:
+            profile_state = None
         if preserve_zoom:
             try:
                 for ax, v in list(self._ax_view_map.items()):
                     try:
-                        current_limits[self._outline_key(v)] = (ax.get_xlim(), ax.get_ylim())
+                        key = self._outline_key(v)
+                        current_limits[key] = (ax.get_xlim(), ax.get_ylim())
+                        current_base_limits[key] = self._zoom_reset_limits.get(ax, (ax.get_xlim(), ax.get_ylim()))
                     except Exception:
                         continue
             except Exception:
                 current_limits = {}
+                current_base_limits = {}
         else:
             self._suspend_zoom_restore = False
 
         self.fig.clf()
         self._ax_view_map = {}
         self._image_meta = {}
+        self._fixed_crop_overlay_artists = {}
+        self._molecule_gizmo_axes = None
+        self._molecule_gizmo_artists = {}
         # reset zoom baselines for new axes
         self._zoom_reset_limits = {}
         self._scale_bar_artists = []
@@ -771,10 +1416,23 @@ class MultiPreviewCanvas(FigureCanvas):
                     cbar.set_label(cbar_label)
                 if not self._show_ticks:
                     cbar.set_ticks([])
+                try:
+                    apply_text_style(cbar.ax.xaxis.label, family=self._font_family, **self._plot_style_state())
+                    apply_text_style(cbar.ax.yaxis.label, family=self._font_family, **self._plot_style_state())
+                    for lbl in list(cbar.ax.get_xticklabels()) + list(cbar.ax.get_yticklabels()):
+                        apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
+                except Exception:
+                    pass
                 self._colorbars.append(cbar)
             title = v.get('title', '')
-            ax.set_title(title, fontsize=9)
+            if title and self._show_title:
+                ax.set_title(title, fontsize=9)
+                apply_text_style(ax.title, family=self._font_family, **self._plot_style_state())
+            else:
+                ax.set_title("")
             ax.tick_params(labelsize=8)
+            for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+                apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
             self._draw_acquisition_overlay(ax, v)
             if ax is self.main_ax:
                 self._draw_shortcut_hint(ax)
@@ -783,7 +1441,8 @@ class MultiPreviewCanvas(FigureCanvas):
                 ax.set_yticks([])
             # Restore previous zoom if available
             if preserve_zoom:
-                prev_lim = current_limits.get(self._outline_key(v))
+                key = self._outline_key(v)
+                prev_lim = current_limits.get(key)
                 if prev_lim:
                     try:
                         ax.set_xlim(prev_lim[0])
@@ -795,10 +1454,15 @@ class MultiPreviewCanvas(FigureCanvas):
                     self._add_scale_bar(ax, v)
                 except Exception:
                     pass
+            self._draw_image_size_overlay(ax, v)
             if ax not in self._zoom_reset_limits:
-                self._zoom_reset_limits[ax] = (ax.get_xlim(), ax.get_ylim())
+                key = self._outline_key(v)
+                base_lim = current_base_limits.get(key)
+                self._zoom_reset_limits[ax] = base_lim if base_lim else (ax.get_xlim(), ax.get_ylim())
             # Draw molecules on every view
             self._draw_molecules(ax)
+            if ax is self.main_ax:
+                self._draw_molecule_gizmo(ax)
             self._draw_spectra(ax)
             try:
                 self._draw_outlines(ax, v)
@@ -815,8 +1479,20 @@ class MultiPreviewCanvas(FigureCanvas):
         self._apply_tight_layout_safe(pad=0.25)
         self._apply_view_theme()
         self._apply_view_font_scale()
-        # if profile mode is enabled, (re)create artists on main ax
-        if self.profile_enabled:
+        profile_restored = False
+        if isinstance(profile_state, dict):
+            try:
+                if (
+                    profile_state.get("active_pts") is not None
+                    or profile_state.get("saved")
+                    or profile_state.get("enabled")
+                    or profile_state.get("user_enabled")
+                ):
+                    self.import_profile_state(profile_state, emit=False)
+                    profile_restored = True
+            except Exception:
+                profile_restored = False
+        if not profile_restored and self.profile_enabled:
             self._ensure_profile_artists()
             self._emit_profile()
         if self.angle_enabled:
@@ -839,48 +1515,126 @@ class MultiPreviewCanvas(FigureCanvas):
             # Z-range for depth cueing
             z_vals = coords[:, 2]
             z_min = z_vals.min()
-            z_range = z_vals.ptp()
+            z_range = z_vals.max() - z_vals.min()
             if z_range < 1e-6:
                 z_range = 1.0
 
             lc = None
+            lc_underlay = None
             sc = None
             shadow_sc = None
-            atom_style = (mol.render_style or "shaded").lower()
+            atom_underlay_sc = None
+            atom_style = normalize_molecule_render_style(mol.render_style)
             bond_style = (mol.bond_style or "default").lower()
-            # Style params
-            if atom_style == "spacefill":
-                size_base, size_scale = 120, 200
-                shadow_alpha = 0.25
-            elif atom_style == "sticks":
-                # Sticks: medium bonds, tiny atom caps
-                size_base, size_scale = 18, 35
-                shadow_alpha = 0.12
-            elif atom_style == "skeletal":
-                size_base, size_scale = 10, 20
-                shadow_alpha = 0.0
-            elif atom_style == "licorice":
-                size_base, size_scale = 60, 100
-                shadow_alpha = 0.2
-            elif atom_style == "wire":
-                size_base, size_scale = 20, 40
-                shadow_alpha = 0.1
-            else:  # shaded / flat default
-                size_base, size_scale = 80, 140
-                shadow_alpha = 0.25
+            style_profiles = {
+                "shaded": {
+                    "size_base": 80, "size_scale": 140, "shadow_alpha": 0.25,
+                    "show_shadow": True, "atom_alpha": 1.0, "highlight": 0.25,
+                    "edgecolor": "black", "edgewidth": 0.6, "bond_scale": 1.0,
+                    "bond_alpha_min": 0.4, "bond_alpha_span": 0.6, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": False,
+                },
+                "flat": {
+                    "size_base": 76, "size_scale": 126, "shadow_alpha": 0.0,
+                    "show_shadow": False, "atom_alpha": 0.98, "highlight": 0.0,
+                    "edgecolor": "black", "edgewidth": 0.5, "bond_scale": 1.0,
+                    "bond_alpha_min": 0.55, "bond_alpha_span": 0.4, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": False,
+                },
+                "ballstick": {
+                    "size_base": 34, "size_scale": 62, "shadow_alpha": 0.14,
+                    "show_shadow": True, "atom_alpha": 1.0, "highlight": 0.18,
+                    "edgecolor": "black", "edgewidth": 0.75, "bond_scale": 1.35,
+                    "bond_alpha_min": 0.55, "bond_alpha_span": 0.4, "split_bonds": True,
+                    "force_bond_by_atoms": True, "outline": False,
+                },
+                "cpk": {
+                    "size_base": 150, "size_scale": 240, "shadow_alpha": 0.28,
+                    "show_shadow": True, "atom_alpha": 0.96, "highlight": 0.3,
+                    "edgecolor": "black", "edgewidth": 0.75, "bond_scale": 0.75,
+                    "bond_alpha_min": 0.3, "bond_alpha_span": 0.35, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": False,
+                },
+                "licorice": {
+                    "size_base": 48, "size_scale": 82, "shadow_alpha": 0.2,
+                    "show_shadow": True, "atom_alpha": 0.98, "highlight": 0.12,
+                    "edgecolor": "black", "edgewidth": 0.55, "bond_scale": 1.5,
+                    "bond_alpha_min": 0.5, "bond_alpha_span": 0.45, "split_bonds": True,
+                    "force_bond_by_atoms": True, "outline": False,
+                },
+                "wire": {
+                    "size_base": 14, "size_scale": 24, "shadow_alpha": 0.0,
+                    "show_shadow": False, "atom_alpha": 0.82, "highlight": 0.0,
+                    "edgecolor": "black", "edgewidth": 0.3, "bond_scale": 0.65,
+                    "bond_alpha_min": 0.45, "bond_alpha_span": 0.35, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": False,
+                },
+                "line": {
+                    "size_base": 8, "size_scale": 14, "shadow_alpha": 0.0,
+                    "show_shadow": False, "atom_alpha": 0.8, "highlight": 0.0,
+                    "edgecolor": "none", "edgewidth": 0.0, "bond_scale": 0.5,
+                    "bond_alpha_min": 0.55, "bond_alpha_span": 0.25, "split_bonds": True,
+                    "force_bond_by_atoms": True, "outline": False,
+                },
+                "sticks": {
+                    "size_base": 18, "size_scale": 35, "shadow_alpha": 0.12,
+                    "show_shadow": True, "atom_alpha": 0.96, "highlight": 0.08,
+                    "edgecolor": "black", "edgewidth": 0.35, "bond_scale": 1.6,
+                    "bond_alpha_min": 0.55, "bond_alpha_span": 0.4, "split_bonds": True,
+                    "force_bond_by_atoms": True, "outline": False,
+                },
+                "skeletal": {
+                    "size_base": 10, "size_scale": 20, "shadow_alpha": 0.0,
+                    "show_shadow": False, "atom_alpha": 0.88, "highlight": 0.0,
+                    "edgecolor": "black", "edgewidth": 0.25, "bond_scale": 0.85,
+                    "bond_alpha_min": 0.5, "bond_alpha_span": 0.35, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": False,
+                },
+                "outline": {
+                    "size_base": 78, "size_scale": 128, "shadow_alpha": 0.0,
+                    "show_shadow": False, "atom_alpha": 0.12, "highlight": 0.0,
+                    "edgecolor": "white", "edgewidth": 1.0, "bond_scale": 1.1,
+                    "bond_alpha_min": 0.85, "bond_alpha_span": 0.05, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": True,
+                },
+                "ghost": {
+                    "size_base": 82, "size_scale": 132, "shadow_alpha": 0.0,
+                    "show_shadow": False, "atom_alpha": 0.28, "highlight": 0.05,
+                    "edgecolor": "black", "edgewidth": 0.35, "bond_scale": 0.9,
+                    "bond_alpha_min": 0.22, "bond_alpha_span": 0.18, "split_bonds": False,
+                    "force_bond_by_atoms": False, "outline": False,
+                },
+            }
+            profile = style_profiles.get(atom_style, style_profiles["shaded"])
+            size_base = profile["size_base"]
+            size_scale = profile["size_scale"]
+            shadow_alpha = profile["shadow_alpha"]
+
+            def _atom_base_rgba(idx):
+                elem = mol.elements[idx] if idx < len(mol.elements) else ""
+                cmap = getattr(mol, "atom_color_map", {}) or {}
+                override = cmap.get(str(elem).upper()) or cmap.get(str(elem).title())
+                if override:
+                    return matplotlib.colors.to_rgba(override)
+                if mol.atom_color_override:
+                    return matplotlib.colors.to_rgba(mol.atom_color_override)
+                return matplotlib.colors.to_rgba(get_atom_color(elem, self.molecule_palette))
 
             # Draw Bonds
             if 'Bonds' in mol.display_mode and len(mol.bonds) > 0:
                 lines = []
+                underlay_lines = []
                 colors = []
+                underlay_colors = []
                 linewidths = []
-                lw_scale = 1.0
+                underlay_widths = []
+                lw_scale = profile["bond_scale"]
                 if bond_style == "thick":
-                    lw_scale = 1.6
+                    lw_scale *= 1.6
                 elif bond_style == "thin":
-                    lw_scale = 0.7
+                    lw_scale *= 0.7
                 display_mode_lower = (mol.display_mode or "").lower()
-                force_atom_bond_colors = (atom_style == "sticks") or ("bonds only" in display_mode_lower)
+                force_atom_bond_colors = profile["force_bond_by_atoms"] or ("bonds only" in display_mode_lower)
                 for (i, j) in mol.bonds:
                     if i >= len(coords) or j >= len(coords): continue
                     ei = (mol.elements[i] or "").strip().upper() if i < len(mol.elements) else ""
@@ -893,34 +1647,77 @@ class MultiPreviewCanvas(FigureCanvas):
                             pass
                     p1 = coords[i]
                     p2 = coords[j]
-                    lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
-                    
-                    # Depth cueing for bonds
                     z_mid = (p1[2] + p2[2]) * 0.5
                     z_norm = (z_mid - z_min) / z_range
-                    alpha = 0.4 + 0.6 * z_norm
-                    # Choose bond color
+                    alpha = profile["bond_alpha_min"] + profile["bond_alpha_span"] * z_norm
+                    lw = (1.0 + 2.0 * z_norm) * lw_scale
                     bond_mode = getattr(mol, "bond_color_mode", None) or self._bond_color_mode
                     if force_atom_bond_colors and bond_mode == "default":
                         bond_mode = "by_atoms"
+                    rgba1 = _atom_base_rgba(i)
+                    rgba2 = _atom_base_rgba(j)
                     if bond_mode == "single" and mol.bond_color_override:
                         br, bg, bb, _ = matplotlib.colors.to_rgba(mol.bond_color_override)
+                        segment_color = (br, bg, bb, alpha)
+                        lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+                        colors.append(segment_color)
+                        linewidths.append(lw)
+                        if profile["outline"]:
+                            underlay_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+                            underlay_colors.append((0.0, 0.0, 0.0, 0.95))
+                            underlay_widths.append(lw + 2.4)
                     elif bond_mode == "by_atoms":
-                        c1 = mol.atom_color_map.get(ei, mol.atom_color_map.get(ei.title(), None)) if hasattr(mol, "atom_color_map") else None
-                        c2 = mol.atom_color_map.get(ej, mol.atom_color_map.get(ej.title(), None)) if hasattr(mol, "atom_color_map") else None
-                        if not c1: c1 = get_atom_color(ei, self.molecule_palette)
-                        if not c2: c2 = get_atom_color(ej, self.molecule_palette)
-                        r1, g1, b1, _ = matplotlib.colors.to_rgba(c1)
-                        r2, g2, b2, _ = matplotlib.colors.to_rgba(c2)
-                        br, bg, bb = (0.5*(r1+r2), 0.5*(g1+g2), 0.5*(b1+b2))
+                        r1, g1, b1, _ = rgba1
+                        r2, g2, b2, _ = rgba2
+                        if profile["split_bonds"]:
+                            mid = 0.5 * (p1 + p2)
+                            lines.append([(p1[0], p1[1]), (mid[0], mid[1])])
+                            colors.append((r1, g1, b1, alpha))
+                            linewidths.append(lw)
+                            lines.append([(mid[0], mid[1]), (p2[0], p2[1])])
+                            colors.append((r2, g2, b2, alpha))
+                            linewidths.append(lw)
+                            if profile["outline"]:
+                                underlay_lines.extend([
+                                    [(p1[0], p1[1]), (mid[0], mid[1])],
+                                    [(mid[0], mid[1]), (p2[0], p2[1])],
+                                ])
+                                underlay_colors.extend([(0.0, 0.0, 0.0, 0.95)] * 2)
+                                underlay_widths.extend([lw + 2.4, lw + 2.4])
+                        else:
+                            br, bg, bb = (0.5 * (r1 + r2), 0.5 * (g1 + g2), 0.5 * (b1 + b2))
+                            lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+                            colors.append((br, bg, bb, alpha))
+                            linewidths.append(lw)
+                            if profile["outline"]:
+                                underlay_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+                                underlay_colors.append((0.0, 0.0, 0.0, 0.95))
+                                underlay_widths.append(lw + 2.4)
                     else:
                         br, bg, bb = self._default_bond_color
-                    colors.append((br, bg, bb, alpha))
-                    linewidths.append((1.0 + 2.0 * z_norm) * lw_scale)
-                
+                        lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+                        colors.append((br, bg, bb, alpha))
+                        linewidths.append(lw)
+                        if profile["outline"]:
+                            underlay_lines.append([(p1[0], p1[1]), (p2[0], p2[1])])
+                            underlay_colors.append((0.0, 0.0, 0.0, 0.95))
+                            underlay_widths.append(lw + 2.4)
+
+                if underlay_lines:
+                    lc_underlay = LineCollection(underlay_lines, colors=underlay_colors, linewidths=underlay_widths, zorder=28.7)
+                    ax.add_collection(lc_underlay)
+                    try:
+                        lc_underlay.set_capstyle("round")
+                    except Exception:
+                        pass
                 lc = LineCollection(lines, colors=colors, linewidths=linewidths, zorder=29)
                 ax.add_collection(lc)
-                lc.set_pickradius(5) # Help hit testing if needed later
+                lc.set_pickradius(5)
+                try:
+                    if atom_style in {"ballstick", "licorice", "sticks", "line"}:
+                        lc.set_capstyle("round")
+                except Exception:
+                    pass
 
             # Draw Atoms
             if 'Atoms' in mol.display_mode:
@@ -939,6 +1736,8 @@ class MultiPreviewCanvas(FigureCanvas):
                 
                 z_norm = (z - z_min) / z_range
                 rad_mode = getattr(mol, "radius_mode", "covalent")
+                if atom_style == "cpk" and str(rad_mode or "").lower() == "covalent":
+                    rad_mode = "vdw"
                 rad_scale = getattr(mol, "radius_scale", 1.0)
                 rad_ref = max(get_atom_radius('C', 'covalent'), 1e-3)
                 radius_factors = []
@@ -947,27 +1746,26 @@ class MultiPreviewCanvas(FigureCanvas):
                     radius_factors.append(max(r_el / rad_ref, 0.05) * rad_scale)
                 sizes = (size_base + size_scale * z_norm) * np.array(radius_factors)
                 
-                base_colors = []
-                for e in elements_sorted:
-                    m = getattr(mol, "atom_color_map", {}) or {}
-                    override = m.get(e.upper()) or m.get(e.title())
-                    if override:
-                        base_colors.append(override)
-                    elif mol.atom_color_override:
-                        base_colors.append(mol.atom_color_override)
-                    else:
-                        base_colors.append(get_atom_color(e, self.molecule_palette))
-                rgba_colors = [matplotlib.colors.to_rgba(c) for c in base_colors]
+                rgba_colors = [_atom_base_rgba(i) for i in order]
                 final_colors = []
                 for i, (r, g, b, a) in enumerate(rgba_colors):
-                    depth_alpha = 0.45 + 0.55 * z_norm[i]
-                    highlight = 0.25 if atom_style in ("shaded", "spacefill") else 0.0
+                    depth_alpha = profile["atom_alpha"] * (0.45 + 0.55 * z_norm[i])
+                    highlight = profile["highlight"]
                     r_h = min(1.0, r + (1 - r) * highlight)
                     g_h = min(1.0, g + (1 - g) * highlight)
                     b_h = min(1.0, b + (1 - b) * highlight)
                     final_colors.append((r_h, g_h, b_h, depth_alpha))
                 
-                if self._show_molecule_shadow and atom_style in ("shaded", "spacefill", "licorice"):
+                if profile["outline"]:
+                    atom_underlay_sc = ax.scatter(
+                        x, y,
+                        s=sizes * 1.55,
+                        c=[(0.0, 0.0, 0.0, 0.92)] * len(x),
+                        edgecolors='none',
+                        linewidths=0,
+                        zorder=28.85,
+                    )
+                if self._show_molecule_shadow and profile["show_shadow"]:
                     shadow_sc = ax.scatter(
                         x + 0.05, y - 0.05,
                         s=sizes * 1.25,
@@ -976,16 +1774,271 @@ class MultiPreviewCanvas(FigureCanvas):
                         linewidths=0,
                         zorder=28,
                     )
-                sc = ax.scatter(x, y, s=sizes, c=final_colors, edgecolors='black',
-                                linewidths=0.6 if atom_style != "wire" else 0.3, zorder=30)
+                sc = ax.scatter(
+                    x,
+                    y,
+                    s=sizes,
+                    c=final_colors,
+                    edgecolors=profile["edgecolor"],
+                    linewidths=profile["edgewidth"],
+                    zorder=30,
+                )
+                if atom_style == "outline":
+                    try:
+                        sc.set_path_effects([PathEffects.Stroke(linewidth=2.2, foreground='black'), PathEffects.Normal()])
+                    except Exception:
+                        pass
 
             self._molecule_artists.append({
                 'mol': mol,
                 'ax': ax,
                 'scatter': sc,
+                'atom_underlay': atom_underlay_sc,
                 'shadow': shadow_sc,
+                'line_underlay': lc_underlay,
                 'lines': lc
             })
+
+    def _active_molecule_for_gizmo(self):
+        if not self.molecules:
+            return None
+        idx = getattr(self, "_active_molecule_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(self.molecules):
+            return self.molecules[idx]
+        return self.molecules[0] if self.molecules else None
+
+    def _active_molecule_index_for_gizmo(self):
+        if not self.molecules:
+            return None
+        idx = getattr(self, "_active_molecule_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(self.molecules):
+            return idx
+        return 0
+
+    def _should_show_molecule_gizmo(self):
+        if not self.show_molecules or not self.molecules:
+            return False
+        if bool(getattr(self, "_show_molecule_gizmo", False)):
+            return True
+        return (time.perf_counter() * 1000.0) < float(getattr(self, "_molecule_gizmo_until", 0.0) or 0.0)
+
+    def _molecule_orientation_matrix(self, mol):
+        if mol is None:
+            return np.eye(3, dtype=float)
+        rads = np.radians(np.asarray(getattr(mol, "angles", [0.0, 0.0, 0.0]), dtype=float))
+        cx, cy, cz = np.cos(rads)
+        sx, sy, sz = np.sin(rads)
+        rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=float)
+        ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=float)
+        rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+        mat = rz @ ry @ rx
+        if bool(getattr(mol, "mirror_x", False)):
+            mat[0, :] *= -1.0
+        if bool(getattr(mol, "mirror_y", False)):
+            mat[1, :] *= -1.0
+        return mat
+
+    def _molecule_axis_screen_vectors(self, mol):
+        mat = self._molecule_orientation_matrix(mol)
+        vectors = []
+        for idx, color in enumerate(("#ef4444", "#22c55e", "#3b82f6")):
+            vec = np.asarray(mat[:, idx], dtype=float)
+            screen = np.array([vec[0] + 0.38 * vec[2], vec[1] + 0.18 * vec[2]], dtype=float)
+            vectors.append((idx, vec, screen, color))
+        return vectors
+
+    def _molecule_gizmo_hit_test(self, event):
+        gizmo_ax = getattr(self, "_molecule_gizmo_axes", None)
+        if gizmo_ax is None or not self._should_show_molecule_gizmo():
+            return None
+        if event is None or getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+            return None
+        bbox = getattr(gizmo_ax, "bbox", None)
+        if bbox is None or not bbox.contains(event.x, event.y):
+            return None
+        if getattr(event, "button", None) not in (1, None):
+            return None
+        width = float(getattr(bbox, "width", 0.0) or 0.0)
+        height = float(getattr(bbox, "height", 0.0) or 0.0)
+        if width <= 0.0 or height <= 0.0:
+            return None
+        local_x = ((float(event.x) - float(bbox.x0)) / width) * 2.0 - 1.0
+        local_y = ((float(event.y) - float(bbox.y0)) / height) * 2.0 - 1.0
+        radius = math.hypot(local_x, local_y)
+        if radius > 1.02:
+            return None
+        mode = "rotate_z" if radius >= 0.58 else "rotate_xy"
+        return {"mode": mode, "local": (float(local_x), float(local_y))}
+
+    def _begin_molecule_gizmo_drag(self, hit, event):
+        idx = self._active_molecule_index_for_gizmo()
+        if idx is None:
+            return False
+        if not hit or event is None or getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+            return False
+        try:
+            self._push_molecule_snapshot()
+        except Exception:
+            pass
+        self._active_molecule_idx = idx
+        self._molecule_gizmo_drag = {
+            "idx": idx,
+            "mode": str(hit.get("mode") or "rotate_xy"),
+            "start_px": (float(event.x), float(event.y)),
+            "start_local": tuple(hit.get("local") or (0.0, 0.0)),
+            "start_angles": np.array(self.molecules[idx].angles, dtype=float, copy=True),
+        }
+        self._wake_molecule_gizmo(2400, redraw=False)
+        self._update_molecule_gizmo_overlay()
+        return True
+
+    def _wake_molecule_gizmo(self, duration_ms: int = 1800, *, redraw: bool = True):
+        now_ms = time.perf_counter() * 1000.0
+        self._molecule_gizmo_until = max(
+            float(getattr(self, "_molecule_gizmo_until", 0.0) or 0.0),
+            now_ms + float(duration_ms),
+        )
+        try:
+            self._molecule_gizmo_timer.start(max(40, int(duration_ms)))
+        except Exception:
+            pass
+        if not redraw and self._molecule_gizmo_axes is None:
+            redraw = True
+        if redraw:
+            try:
+                self._redraw()
+            except Exception:
+                try:
+                    self.draw_idle()
+                except Exception:
+                    pass
+
+    def _on_molecule_gizmo_timeout(self):
+        if bool(getattr(self, "_show_molecule_gizmo", False)):
+            return
+        remaining = float(getattr(self, "_molecule_gizmo_until", 0.0) or 0.0) - (time.perf_counter() * 1000.0)
+        if remaining > 40.0:
+            try:
+                self._molecule_gizmo_timer.start(int(remaining))
+            except Exception:
+                pass
+            return
+        self._molecule_gizmo_until = 0.0
+        if self._molecule_gizmo_axes is not None:
+            self._redraw()
+
+    def _update_molecule_gizmo_overlay(self):
+        gizmo_ax = getattr(self, "_molecule_gizmo_axes", None)
+        artists = getattr(self, "_molecule_gizmo_artists", {}) or {}
+        if gizmo_ax is None or not artists:
+            return False
+        mol = self._active_molecule_for_gizmo()
+        if mol is None or not self._should_show_molecule_gizmo():
+            return False
+        vectors = self._molecule_axis_screen_vectors(mol)
+        norms = [max(0.22, float(np.linalg.norm(screen))) for _, _, screen, _ in vectors]
+        scale = 0.74 / max(norms or [1.0])
+        for order, (idx, vec, screen, _color) in enumerate(sorted(vectors, key=lambda item: float(item[1][2]))):
+            arrow = artists.get(f"arrow_{idx}")
+            label = artists.get(f"label_{idx}")
+            if arrow is None or label is None:
+                continue
+            end = screen * scale
+            label_pos = screen * min(scale * 1.14, 0.92)
+            alpha = 0.45 + 0.45 * ((float(vec[2]) + 1.0) * 0.5)
+            try:
+                arrow.set_positions((0.0, 0.0), (float(end[0]), float(end[1])))
+                arrow.set_alpha(alpha)
+                arrow.set_zorder(3 + order)
+                label.set_position((float(label_pos[0]), float(label_pos[1])))
+                label.set_alpha(max(0.68, alpha))
+                label.set_zorder(6 + order)
+            except Exception:
+                continue
+        try:
+            gizmo_ax.figure.canvas.draw_idle()
+        except Exception:
+            pass
+        return True
+
+    def _draw_molecule_gizmo(self, ax):
+        if ax is None or not self._should_show_molecule_gizmo():
+            self._molecule_gizmo_axes = None
+            self._molecule_gizmo_artists = {}
+            return
+        mol = self._active_molecule_for_gizmo()
+        if mol is None:
+            self._molecule_gizmo_axes = None
+            self._molecule_gizmo_artists = {}
+            return
+
+        gizmo_ax = ax.inset_axes([0.02, 0.72, 0.16, 0.16], zorder=36)
+        gizmo_ax.set_facecolor((0.0, 0.0, 0.0, 0.0))
+        gizmo_ax.set_xticks([])
+        gizmo_ax.set_yticks([])
+        gizmo_ax.set_xlim(-1.0, 1.0)
+        gizmo_ax.set_ylim(-1.0, 1.0)
+        for spine in gizmo_ax.spines.values():
+            spine.set_visible(False)
+
+        dark = bool(getattr(self, "_detail_dark", False))
+        ring_edge = "#d7dde7" if dark else "#334155"
+        bg_face = (0.04, 0.06, 0.10, 0.42) if dark else (1.0, 1.0, 1.0, 0.74)
+        ring = patches.Circle((0.0, 0.0), 0.94, facecolor=bg_face, edgecolor=ring_edge, linewidth=1.0, zorder=1)
+        core = patches.Circle((0.0, 0.0), 0.06, facecolor=ring_edge, edgecolor="none", alpha=0.92, zorder=7)
+        gizmo_ax.add_patch(ring)
+        gizmo_ax.add_patch(core)
+
+        artists = {"ring": ring, "core": core}
+        for idx, (label_text, color) in enumerate((("X", "#ef4444"), ("Y", "#22c55e"), ("Z", "#3b82f6"))):
+            arrow = patches.FancyArrowPatch(
+                (0.0, 0.0),
+                (0.0, 0.0),
+                arrowstyle="-|>",
+                mutation_scale=10.5,
+                linewidth=2.2,
+                color=color,
+                alpha=0.92,
+                zorder=4,
+            )
+            gizmo_ax.add_patch(arrow)
+            label = gizmo_ax.text(
+                0.0,
+                0.0,
+                label_text,
+                color=color,
+                fontsize=8.5,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                zorder=8,
+            )
+            artists[f"arrow_{idx}"] = arrow
+            artists[f"label_{idx}"] = label
+
+        self._molecule_gizmo_axes = gizmo_ax
+        self._molecule_gizmo_artists = artists
+        self._update_molecule_gizmo_overlay()
+
+    def _reset_molecule_to_file_state(self, idx=None, *, keep_offset: bool = True):
+        if idx is None:
+            idx = self._active_molecule_index_for_gizmo()
+        if idx is None or idx < 0 or idx >= len(self.molecules):
+            return False
+        try:
+            current = self.molecules[idx]
+        except Exception:
+            return False
+        try:
+            new_mol = current.reset_to_file_state(keep_offset=keep_offset)
+        except Exception:
+            return False
+        self._push_molecule_snapshot()
+        self.molecules[idx] = new_mol
+        self._active_molecule_idx = idx
+        self._wake_molecule_gizmo(2400, redraw=False)
+        self._redraw()
+        return True
 
     def _draw_spectra(self, ax):
         view = self._ax_view_map.get(ax, {})
@@ -1022,7 +2075,34 @@ class MultiPreviewCanvas(FigureCanvas):
             ey0, ey1 = 0.0, float(max(arr_h - 1, 1))
         cols = max(arr_w - 1, 1)
         rows = max(arr_h - 1, 1)
+        def _spec_identity(spec):
+            if not spec:
+                return None
+            base = spec.get("path")
+            try:
+                base = str(Path(base))
+            except Exception:
+                base = str(base)
+            idx = spec.get("matrix_index")
+            if idx is not None:
+                return f"{base}#idx{idx}"
+            x = spec.get("x")
+            y = spec.get("y")
+            if x is not None or y is not None:
+                try:
+                    x_val = float(x) if x is not None else ""
+                    y_val = float(y) if y is not None else ""
+                    return f"{base}#pos{round(x_val, 6)}_{round(y_val, 6)}"
+                except Exception:
+                    return f"{base}#pos{x}_{y}"
+            return base
         def _axis_from_pixel(col, row):
+            row_use = float(row)
+            # Stored spectro marker rows are in thumbnail/image pixel space
+            # with row 0 at the top. Relative-axes preview flips the image and
+            # draws it with origin='lower', so convert to the displayed row.
+            if str(origin).lower() == 'lower' and rows > 0:
+                row_use = float(rows) - row_use
             if extent_used is not None and meta.get('shape'):
                 xmin, xmax, ymin, ymax = extent_used
                 span_x = xmax - xmin
@@ -1035,12 +2115,12 @@ class MultiPreviewCanvas(FigureCanvas):
                     y_axis = ymax if str(origin).lower() == 'upper' else ymin
                 else:
                     if str(origin).lower() == 'upper':
-                        y_axis = ymax - (row / float(rows)) * span_y
+                        y_axis = ymax - (row_use / float(rows)) * span_y
                     else:
-                        y_axis = ymin + (row / float(rows)) * span_y
+                        y_axis = ymin + (row_use / float(rows)) * span_y
                 return x_axis, y_axis
             x_axis = ex0 if cols == 0 else ex0 + (col / float(cols)) * (ex1 - ex0)
-            y_axis = ey0 if rows == 0 else ey0 + (row / float(rows)) * (ey1 - ey0)
+            y_axis = ey0 if rows == 0 else ey0 + (row_use / float(rows)) * (ey1 - ey0)
             return x_axis, y_axis
         normal_xs = []
         normal_ys = []
@@ -1049,8 +2129,10 @@ class MultiPreviewCanvas(FigureCanvas):
         points = []
         missing_specs = []
         highlight_spec = view.get('highlight_spec')
+        highlight_key = _spec_identity(highlight_spec)
         pulse = float(getattr(self, "_highlight_pulse_strength", 1.0) or 1.0)
         pixel_lookup = {id(spec): (col, row) for spec, col, row in (view.get('spec_pixels') or [])}
+        stack_badges = list(view.get("stack_badges") or [])
         for idx, s in enumerate(specs):
             coords = pixel_lookup.get(id(s))
             if coords is None:
@@ -1058,7 +2140,7 @@ class MultiPreviewCanvas(FigureCanvas):
                 continue
             x, y = _axis_from_pixel(coords[0], coords[1])
             points.append((x, y, s))
-            if highlight_spec is not None and s is highlight_spec:
+            if highlight_key is not None and _spec_identity(s) == highlight_key:
                 highlight_xs.append(x); highlight_ys.append(y)
             else:
                 normal_xs.append(x); normal_ys.append(y)
@@ -1075,7 +2157,7 @@ class MultiPreviewCanvas(FigureCanvas):
                 fx = x0 + (c + 0.5) * dx
                 fy = y0 + (r + 0.5) * dy
                 points.append((fx, fy, spec))
-                if highlight_spec is not None and spec is highlight_spec:
+                if highlight_key is not None and _spec_identity(spec) == highlight_key:
                     highlight_xs.append(fx); highlight_ys.append(fy)
                 else:
                     normal_xs.append(fx); normal_ys.append(fy)
@@ -1090,6 +2172,26 @@ class MultiPreviewCanvas(FigureCanvas):
                 core = 140 * (0.7 + 0.3 * pulse)
                 ax.scatter(highlight_xs, highlight_ys, s=outer, marker='o', facecolor='#ffe8fb', edgecolor='none', alpha=0.22, zorder=36)
                 ax.scatter(highlight_xs, highlight_ys, s=core, marker='o', facecolor='none', edgecolor='#ff5fb7', linewidths=2.4, alpha=0.9, zorder=37)
+            for badge in stack_badges:
+                try:
+                    bx, by = _axis_from_pixel(float(badge.get("col")), float(badge.get("row")))
+                    label = str(badge.get("label") or "").strip()
+                    if not label:
+                        continue
+                    ax.text(
+                        bx,
+                        by,
+                        label,
+                        fontsize=7.2 * getattr(self, "_font_scale", 1.0),
+                        fontweight="bold",
+                        color="#ffe478",
+                        ha="left",
+                        va="bottom",
+                        zorder=38,
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#281e12", edgecolor="#ffe0a0", linewidth=0.9, alpha=0.92),
+                    )
+                except Exception:
+                    continue
             self._spectra_points[ax] = points
         except Exception:
             self._spectra_points[ax] = []
@@ -1162,6 +2264,7 @@ class MultiPreviewCanvas(FigureCanvas):
     def enable_scale_bar(self, enable: bool):
         if enable == self.scale_bar_enabled:
             return
+        self.push_undo_state("scale_bar")
         self.scale_bar_enabled = enable
         if enable:
             self._connect_scale_bar_events()
@@ -1214,40 +2317,94 @@ class MultiPreviewCanvas(FigureCanvas):
         
         return size, label
 
-    def _add_scale_bar(self, ax, view):
+    def _scale_bar_span(self, ax, view):
+        width = 0.0
+        unit = view.get('axis_unit') or 'nm'
+        try:
+            xlim = ax.get_xlim()
+            width = abs(float(xlim[1]) - float(xlim[0]))
+        except Exception:
+            width = 0.0
+        if width > 0:
+            if view.get('extent') is None and view.get('extent_raw') is None:
+                unit = 'px'
+            return width, unit
         extent = view.get('extent')
         if extent is None:
-            # Fallback for pixel coords
+            extent = view.get('extent_raw')
+        if extent is None:
             h, w = np.shape(view['arr'])
-            width = w
-            unit = 'px'
-        else:
-            width = abs(extent[1] - extent[0])
-            unit = view.get('axis_unit') or 'nm'
-            
+            return float(w), 'px'
+        return abs(extent[1] - extent[0]), unit
+
+    def _add_scale_bar(self, ax, view):
+        width, unit = self._scale_bar_span(ax, view)
         size, label = self._calculate_best_scale_bar(width, unit)
+        label = label if label and str(label).strip() else None
         
         font_scale = getattr(self, '_view_font_scale', 1.0)
+        dark = bool(self._detail_dark)
+        default_color = '#f5f5f5' if dark else '#111111'
+        sb_settings = getattr(self, '_scale_bar_settings', {})
+        sb_text_col = sb_settings.get('text_color') or default_color
+        sb_bar_col = sb_settings.get('bar_color') or default_color
+        font_family = sb_settings.get('font_family', 'sans-serif')
         sb = AnchoredSizeBar(ax.transData, size, label, 
                              loc='center',  # Anchor point on the artist itself
                              pad=0.4, borderpad=0, sep=3, 
                              frameon=False, 
                              size_vertical=width*0.004*font_scale,
-                             color='white',
+                             color=sb_bar_col,
                              label_top=True,
                              bbox_to_anchor=self._scale_bar_pos,
                              bbox_transform=ax.transAxes)
         
         # Apply font scaling
         sb.size_bar.get_children()[0].set_linewidth(0) # remove border if any
+        try:
+            sb.size_bar.get_children()[0].set_color(sb_bar_col)
+        except Exception:
+            pass
         text = sb.txt_label.get_children()[0]
-        
+        text.set_color(sb_text_col)
+        text.set_fontfamily(font_family)
         text.set_fontsize(10 * font_scale)
         text.set_fontweight('bold')
+        try:
+            apply_text_style(text, family=font_family, **self._plot_style_state())
+        except Exception:
+            pass
         sb.set_zorder(20)
         
         ax.add_artist(sb)
         self._scale_bar_artists.append(sb)
+
+    def _refresh_scale_bars(self, ax=None, redraw: bool = False):
+        keep = []
+        for sb in list(self._scale_bar_artists):
+            sb_ax = getattr(sb, "axes", None)
+            if ax is not None and sb_ax is not ax:
+                keep.append(sb)
+                continue
+            try:
+                sb.remove()
+            except Exception:
+                if ax is not None and sb_ax is not ax:
+                    keep.append(sb)
+        self._scale_bar_artists = keep
+        if not self.scale_bar_enabled:
+            if redraw:
+                self.draw_idle()
+            return
+        for target_ax, view in list(self._ax_view_map.items()):
+            if ax is not None and target_ax is not ax:
+                continue
+            try:
+                self._add_scale_bar(target_ax, view)
+            except Exception:
+                continue
+        if redraw:
+            self.draw_idle()
 
     def _on_sb_press(self, event):
         if not self.scale_bar_enabled: return
@@ -1374,16 +2531,136 @@ class MultiPreviewCanvas(FigureCanvas):
     def set_profile_state_callback(self, cb):
         self._profile_state_callback = cb
 
+    def _normalize_profile_line_style(self, style, default="-"):
+        style_key = str(style or default or "-").strip().lower()
+        mapping = {
+            "solid": "-",
+            "-": "-",
+            "dash": "--",
+            "dashed": "--",
+            "--": "--",
+            "dot": ":",
+            "dotted": ":",
+            ":": ":",
+            "dashdot": "-.",
+            "-.": "-.",
+            "none": "None",
+            "": "None",
+        }
+        return mapping.get(style_key, default)
+
+    def _normalize_profile_marker_style(self, style, default="o"):
+        style_key = str(style or default or "o").strip().lower()
+        mapping = {
+            "none": "None",
+            "": "None",
+            "circle": "o",
+            "o": "o",
+            "square": "s",
+            "s": "s",
+            "triangle": "^",
+            "^": "^",
+            "diamond": "D",
+            "d": "D",
+            "plus": "+",
+            "+": "+",
+            "cross": "x",
+            "x": "x",
+            "star": "*",
+            "*": "*",
+        }
+        return mapping.get(style_key, default)
+
+    def _next_saved_profile_id(self):
+        profile_id = f"profile-{int(getattr(self, '_profile_saved_profile_seq', 1))}"
+        self._profile_saved_profile_seq = int(getattr(self, '_profile_saved_profile_seq', 1)) + 1
+        return profile_id
+
+    def _ensure_saved_profile_id(self, entry):
+        if not isinstance(entry, dict):
+            return ""
+        profile_id = str(entry.get("profile_id") or "").strip()
+        if not profile_id:
+            profile_id = self._next_saved_profile_id()
+            entry["profile_id"] = profile_id
+        return profile_id
+
+    def _profile_live_ref(self, profile_key=None, entry=None):
+        source_id = register_profile_canvas(self)
+        if not source_id:
+            return None
+        if entry is not None:
+            profile_id = self._ensure_saved_profile_id(entry)
+            if not profile_id:
+                return None
+            return {"source_id": source_id, "kind": "saved", "profile_id": profile_id}
+        if profile_key is None:
+            return {"source_id": source_id, "kind": "active"}
+        try:
+            idx = int(profile_key)
+        except Exception:
+            return None
+        if idx < 0 or idx >= len(self._saved_profiles):
+            return None
+        profile_id = self._ensure_saved_profile_id(self._saved_profiles[idx])
+        if not profile_id:
+            return None
+        return {"source_id": source_id, "kind": "saved", "profile_id": profile_id}
+
+    def _saved_profile_index_from_ref(self, profile_ref):
+        if not isinstance(profile_ref, dict):
+            return None
+        source_id = str(profile_ref.get("source_id") or "").strip()
+        if source_id != str(register_profile_canvas(self) or "").strip():
+            return None
+        if str(profile_ref.get("kind") or "").strip().lower() == "active":
+            return None
+        profile_id = str(
+            profile_ref.get("profile_id")
+            or profile_ref.get("overlay_id")
+            or ""
+        ).strip()
+        if not profile_id:
+            return None
+        for idx, entry in enumerate(self._saved_profiles):
+            if str(self._ensure_saved_profile_id(entry) or "") == profile_id:
+                return idx
+        return None
+
+    def _build_profile_style(self, *, color=None, lw=None, line_style=None, marker_style=None, marker_size=None, active=False):
+        return {
+            "color": color,
+            "lw": float(lw if lw is not None else (self._active_profile_lw if active else 1.5)),
+            "line_style": self._normalize_profile_line_style(line_style, "-" if active else "--"),
+            "marker_style": self._normalize_profile_marker_style(marker_style, self._active_profile_marker_style if active else "o"),
+            "marker_size": float(marker_size if marker_size is not None else (self._active_profile_marker_size if active else 5.0)),
+        }
+
     def export_profile_state(self):
         saved = []
         for entry in self._saved_profiles:
             pts = entry.get('pts')
             if pts is None:
                 continue
-            saved.append({'pts': tuple(pts), 'color': entry.get('color'), 'lw': entry.get('lw')})
+            saved.append({
+                'pts': tuple(pts),
+                'color': entry.get('color'),
+                'lw': entry.get('lw'),
+                'line_style': entry.get('line_style'),
+                'marker_style': entry.get('marker_style'),
+                'marker_size': entry.get('marker_size'),
+            })
         state = {
             'active_pts': tuple(self.profile_pts) if self.profile_pts is not None else None,
             'saved': saved,
+            'enabled': bool(self.profile_enabled),
+            'user_enabled': bool(getattr(self, "_profile_user_enabled", self.profile_enabled)),
+            'active_color': self._active_profile_color,
+            'active_lw': float(self._active_profile_lw),
+            'active_line_style': self._active_profile_line_style,
+            'active_marker_style': self._active_profile_marker_style,
+            'active_marker_size': float(self._active_profile_marker_size),
+            'active_profile_original_id': self._active_profile_original_id,
             'marker_key': self._profile_marker_key,
             'marker_positions_by_key': dict(self._profile_marker_positions_by_key),
             'marker_domain_by_key': dict(self._profile_marker_domain_by_key),
@@ -1392,16 +2669,53 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def export_profile_datasets(self):
         """Return active/saved profile datasets for external dialogs."""
-        active = self._build_profile_data(self.profile_pts, color=self._active_profile_color)
+        active = self._build_profile_data(
+            self.profile_pts,
+            color=self._active_profile_color,
+            lw=self._active_profile_lw,
+            line_style=self._active_profile_line_style,
+            marker_style=self._active_profile_marker_style,
+            marker_size=self._active_profile_marker_size,
+            live_profile_ref=self._profile_live_ref(None),
+        )
+        if isinstance(active, dict) and self._active_profile_original_id:
+            active["profile_id"] = str(self._active_profile_original_id)
         saved = []
         for entry in self._saved_profiles:
             data = entry.get('data')
             if data is None:
-                data = self._build_profile_data(entry.get('pts'), color=entry.get('color'))
+                data = self._build_profile_data(
+                    entry.get('pts'),
+                    color=entry.get('color'),
+                    lw=entry.get('lw'),
+                    line_style=entry.get('line_style'),
+                    marker_style=entry.get('marker_style'),
+                    marker_size=entry.get('marker_size'),
+                    live_profile_ref=self._profile_live_ref(entry=entry),
+                )
+                if isinstance(data, dict):
+                    data["profile_id"] = str(self._ensure_saved_profile_id(entry))
                 entry['data'] = data
+            elif isinstance(data, dict):
+                data['live_profile_ref'] = self._profile_live_ref(entry=entry)
+                data["profile_id"] = str(self._ensure_saved_profile_id(entry))
             if data:
                 saved.append(data)
         return active, saved
+
+    @staticmethod
+    def _normalize_profile_marker_key_map(mapping):
+        """Restore JSON-loaded marker-key maps to native None/int keys."""
+        normalized = {}
+        for key, value in dict(mapping or {}).items():
+            if key in (None, "null", "None", ""):
+                normalized[None] = value
+                continue
+            try:
+                normalized[int(key)] = value
+            except Exception:
+                normalized[key] = value
+        return normalized
 
     def import_profile_state(self, state, emit=True):
         if state is None:
@@ -1412,21 +2726,67 @@ class MultiPreviewCanvas(FigureCanvas):
             self._profile_state_syncing = True
             active_pts = state.get('active_pts')
             saved = state.get('saved') or []
-            self._profile_marker_key = state.get('marker_key')
-            self._profile_marker_positions_by_key = dict(state.get('marker_positions_by_key') or {})
-            self._profile_marker_domain_by_key = dict(state.get('marker_domain_by_key') or {})
+            enabled = bool(state.get('enabled', bool(active_pts is not None)))
+            self._profile_user_enabled = bool(state.get('user_enabled', enabled))
+            self._active_profile_color = state.get('active_color', self._active_profile_color) or self._active_profile_color
+            try:
+                self._active_profile_lw = float(state.get('active_lw', self._active_profile_lw))
+            except Exception:
+                pass
+            self._active_profile_line_style = self._normalize_profile_line_style(
+                state.get('active_line_style', self._active_profile_line_style),
+                self._active_profile_line_style,
+            )
+            self._active_profile_marker_style = self._normalize_profile_marker_style(
+                state.get('active_marker_style', self._active_profile_marker_style),
+                self._active_profile_marker_style,
+            )
+            try:
+                self._active_profile_marker_size = float(
+                    state.get('active_marker_size', self._active_profile_marker_size)
+                )
+            except Exception:
+                pass
+            original_id = state.get('active_profile_original_id')
+            self._active_profile_original_id = str(original_id).strip() if original_id else None
+            marker_key = state.get('marker_key')
+            if marker_key in ("null", "None", ""):
+                marker_key = None
+            elif marker_key is not None:
+                try:
+                    marker_key = int(marker_key)
+                except Exception:
+                    pass
+            self._profile_marker_key = marker_key
+            self._profile_marker_positions_by_key = self._normalize_profile_marker_key_map(
+                state.get('marker_positions_by_key') or {}
+            )
+            self._profile_marker_domain_by_key = self._normalize_profile_marker_key_map(
+                state.get('marker_domain_by_key') or {}
+            )
+            if not enabled and self.profile_enabled:
+                self.enable_profile(False)
             if active_pts is not None:
                 self._set_profile_pts(tuple(active_pts))
-                if not self.profile_enabled:
+                if enabled and not self.profile_enabled:
                     self.enable_profile(True)
             self._clear_saved_profile_artists(notify=False)
             for entry in saved:
                 pts = entry.get('pts')
                 if pts is None:
                     continue
-                self._add_saved_profile_from_pts(tuple(pts), entry.get('color'), entry.get('lw'))
-            self._ensure_profile_artists()
-            self._update_profile_artists()
+                self._add_saved_profile_from_pts(
+                    tuple(pts),
+                    entry.get('color'),
+                    entry.get('lw'),
+                    line_style=entry.get('line_style'),
+                    marker_style=entry.get('marker_style'),
+                    marker_size=entry.get('marker_size'),
+                )
+            if enabled:
+                self._ensure_profile_artists()
+                self._update_profile_artists()
+            self._apply_profile_visibility()
             self.set_profile_marker_key(self._profile_marker_key)
         finally:
             self._profile_state_syncing = False
@@ -1495,10 +2855,15 @@ class MultiPreviewCanvas(FigureCanvas):
     def enable_angle(self, enable: bool):
         if enable == self.angle_enabled:
             return
+        self.push_undo_state("angle_tool")
         self.angle_enabled = enable
         if enable:
             self._connect_angle_events()
-            self._ensure_angle_frames()
+            self._undo_suspend_depth += 1
+            try:
+                self._ensure_angle_frames()
+            finally:
+                self._undo_suspend_depth = max(0, self._undo_suspend_depth - 1)
             self._emit_angle()
         else:
             self._disconnect_angle_events()
@@ -1508,9 +2873,15 @@ class MultiPreviewCanvas(FigureCanvas):
         self.draw_idle()
 
     def clear_angle_measurement(self):
+        if self.angle_enabled or self._angle_frames:
+            self.push_undo_state("clear_angle")
         self._clear_angle_artists()
         if self.angle_enabled:
-            self._ensure_angle_frames()
+            self._undo_suspend_depth += 1
+            try:
+                self._ensure_angle_frames()
+            finally:
+                self._undo_suspend_depth = max(0, self._undo_suspend_depth - 1)
             self._emit_angle()
 
     def _connect_angle_events(self):
@@ -1593,6 +2964,11 @@ class MultiPreviewCanvas(FigureCanvas):
                 ax.xaxis.label.set_fontsize(label_size)
                 ax.yaxis.label.set_fontsize(label_size)
                 ax.title.set_fontsize(title_size)
+                apply_text_style(ax.xaxis.label, family=self._font_family, **self._plot_style_state())
+                apply_text_style(ax.yaxis.label, family=self._font_family, **self._plot_style_state())
+                apply_text_style(ax.title, family=self._font_family, **self._plot_style_state())
+                for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+                    apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
             except Exception:
                 pass
         for cbar in getattr(self, '_colorbars', []):
@@ -1600,6 +2976,10 @@ class MultiPreviewCanvas(FigureCanvas):
                 cbar.ax.tick_params(labelsize=tick_size)
                 cbar.ax.yaxis.label.set_fontsize(label_size)
                 cbar.ax.xaxis.label.set_fontsize(label_size)
+                apply_text_style(cbar.ax.yaxis.label, family=self._font_family, **self._plot_style_state())
+                apply_text_style(cbar.ax.xaxis.label, family=self._font_family, **self._plot_style_state())
+                for lbl in list(cbar.ax.get_xticklabels()) + list(cbar.ax.get_yticklabels()):
+                    apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
             except Exception:
                 pass
         # Update scale bar font size
@@ -1629,6 +3009,7 @@ class MultiPreviewCanvas(FigureCanvas):
             mode = "length"
         if mode == self._profile_label_mode:
             return
+        self.push_undo_state("profile_label_mode")
         self._profile_label_mode = mode
         self._update_profile_markers()
         for entry in self._saved_profiles:
@@ -1682,12 +3063,155 @@ class MultiPreviewCanvas(FigureCanvas):
     def set_copy_feedback_handler(self, handler):
         self._copy_feedback_handler = handler
 
+    def _notify_copy_feedback(self, view=None, *, fmt="png", displayed=False):
+        if not callable(self._copy_feedback_handler):
+            return
+        payload = {
+            "format": str(fmt or "png").lower(),
+            "displayed": bool(displayed),
+            "canvas": self,
+        }
+        ref_view = view
+        if ref_view is None:
+            ref_view = self.views[0] if self.views else {}
+        try:
+            self._copy_feedback_handler(ref_view, payload)
+        except TypeError:
+            try:
+                self._copy_feedback_handler(ref_view)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def get_overview_pixmap(self):
         """Return a pixmap snapshot of the current canvas (with overlays)."""
         try:
             return self.grab()
         except Exception:
             return None
+
+    def _set_axes_titles_visible(self, visible: bool):
+        changed = []
+        for ax in getattr(self.fig, "axes", []) or []:
+            try:
+                title_artist = ax.title
+            except Exception:
+                continue
+            if title_artist is None:
+                continue
+            try:
+                title_text = str(title_artist.get_text() or "").strip()
+                was_visible = bool(title_artist.get_visible())
+            except Exception:
+                continue
+            if not title_text or was_visible == bool(visible):
+                continue
+            try:
+                title_artist.set_visible(bool(visible))
+                changed.append((title_artist, was_visible))
+            except Exception:
+                continue
+        return changed
+
+    def _render_displayed_pixmap(self, *, show_titles=True):
+        buf = io.BytesIO()
+        title_state = []
+
+        def _save():
+            nonlocal title_state
+            if not show_titles:
+                title_state = self._set_axes_titles_visible(False)
+            try:
+                self.fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+            finally:
+                if title_state:
+                    for title_artist, was_visible in title_state:
+                        try:
+                            title_artist.set_visible(bool(was_visible))
+                        except Exception:
+                            pass
+
+        self._save_current_figure_without_shortcut_hint(_save)
+        data = buf.getvalue()
+        if not data:
+            return None
+        pixmap = QtGui.QPixmap()
+        if not pixmap.loadFromData(data, "PNG"):
+            return None
+        if title_state:
+            self.draw_idle()
+        return pixmap
+
+    def _resolve_powerpoint_label(self, view=None):
+        if isinstance(view, dict):
+            title = str(view.get("title") or "").strip()
+            if title:
+                return title
+            path_text = str(view.get("path") or "").strip()
+            if path_text:
+                return Path(path_text).stem
+
+        if len(self.views or []) == 1:
+            only_view = self.views[0] or {}
+            title = str(only_view.get("title") or "").strip()
+            if title:
+                return title
+
+        try:
+            window = self.window()
+        except Exception:
+            window = None
+        if window is not None:
+            try:
+                window_title = str(window.windowTitle() or "").strip()
+            except Exception:
+                window_title = ""
+            if window_title and window_title.lower() != "sxm viewer":
+                return window_title
+        return None
+
+    def _show_powerpoint_success(self, slide_number, shape_name):
+        _ = shape_name
+        QtWidgets.QToolTip.showText(
+            QtGui.QCursor.pos(),
+            f"Sent to slide {slide_number}",
+            self,
+            self.rect(),
+            2500,
+        )
+
+    def _send_displayed_to_powerpoint(self, view=None, *, new_slide=True):
+        label_text = self._resolve_powerpoint_label(view)
+        hide_titles = bool(label_text) and len(self.views or []) == 1
+        pixmap = self._render_displayed_pixmap(show_titles=not hide_titles)
+        if pixmap is None or pixmap.isNull():
+            pixmap = self.get_overview_pixmap()
+
+        try:
+            slide_number, shape_name = send_pixmap_to_ppt(
+                pixmap,
+                label=label_text,
+                new_slide=bool(new_slide),
+            )
+        except ConnectionError:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "PowerPoint",
+                "PowerPoint is not running. Please open a presentation first.",
+            )
+            return
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "PowerPoint", "No image to send.")
+            return
+        except EnvironmentError as exc:
+            QtWidgets.QMessageBox.critical(self, "PowerPoint", str(exc))
+            return
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "PowerPoint", str(exc))
+            return
+
+        self._show_powerpoint_success(slide_number, shape_name)
 
     def set_value_callback(self, cb):
         self._value_callback = cb
@@ -1713,11 +3237,12 @@ class MultiPreviewCanvas(FigureCanvas):
         self.profile_enabled = enable
         if enable:
             self._connect_profile_events()
-            self._ensure_profile_artists()
-            try:
-                self._emit_profile()
-            except Exception:
-                pass
+            if self.profile_pts is not None:
+                self._ensure_profile_artists()
+                try:
+                    self._emit_profile()
+                except Exception:
+                    pass
         else:
             self._disconnect_profile_events()
             self._clear_profile_artists()
@@ -1737,7 +3262,17 @@ class MultiPreviewCanvas(FigureCanvas):
             except Exception:
                 mods = QtCore.Qt.NoModifier
                 key = None
+            if self._fixed_crop_transform_mode:
+                if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                    self._on_apply_fixed_crop_shortcut()
+                    return
+                if key == QtCore.Qt.Key_Escape:
+                    self._on_cancel_fixed_crop_shortcut()
+                    return
             if mods & QtCore.Qt.ControlModifier:
+                if key == QtCore.Qt.Key_C:
+                    self._copy_displayed("png")
+                    return
                 if key == QtCore.Qt.Key_1:
                     self.set_show_profile_overlays(not self._show_profile_overlays)
                     return
@@ -1756,27 +3291,72 @@ class MultiPreviewCanvas(FigureCanvas):
                 if key == QtCore.Qt.Key_H:
                     self.set_show_shortcut_hint(not self._show_shortcut_hint)
                     return
-        if self.profile_enabled and event is not None:
-            try:
-                if event.modifiers() & QtCore.Qt.ControlModifier and event.key() == QtCore.Qt.Key_Z:
-                    self._undo_last_profile_snapshot()
+            if not (mods & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier)):
+                if key == QtCore.Qt.Key_A and callable(self._histogram_auto_callback):
+                    try:
+                        self._histogram_auto_callback(self)
+                    except Exception:
+                        pass
                     return
-            except Exception:
-                pass
+            if (mods & QtCore.Qt.ControlModifier) and key == QtCore.Qt.Key_Z:
+                if self.handle_undo_request():
+                    return
+            if not (mods & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier)):
+                if self._handle_popup_keyboard_shortcuts(key, shift=bool(mods & QtCore.Qt.ShiftModifier)):
+                    return
         if event is not None:
             try:
-                if event.modifiers() & QtCore.Qt.ControlModifier and event.key() == QtCore.Qt.Key_Z:
-                    # Undo priority: outlines -> molecules
-                    if self._undo_last_outline():
-                        return
-                    self.undo_last_molecule_change()
-                    return
                 if event.modifiers() == QtCore.Qt.NoModifier and event.key() == QtCore.Qt.Key_R:
                     self._reset_view_zoom()
                     return
             except Exception:
                 pass
         super().keyPressEvent(event)
+
+    def _handle_popup_keyboard_shortcuts(self, key, *, shift: bool = False):
+        """Handle popup shortcuts that should work without enabling tools explicitly."""
+        if key is None:
+            return False
+        if self._rotate_selected_molecule_from_key(key, reverse=shift):
+            return True
+        if shift and key == QtCore.Qt.Key_R:
+            return self._reset_molecule_to_file_state()
+        if key in (QtCore.Qt.Key_0, QtCore.Qt.Key_Z):
+            setter = getattr(self, "_popup_relative_zero_setter", None)
+            if callable(setter):
+                try:
+                    setter(not bool(getattr(self, "_popup_relative_zero_enabled", False)))
+                except Exception:
+                    pass
+                return True
+        return False
+
+    def _rotate_selected_molecule_from_key(self, key, *, reverse: bool = False):
+        """Rotate the actively selected molecule around X/Y/Z using keyboard keys."""
+        axis_map = {
+            QtCore.Qt.Key_X: 0,
+            QtCore.Qt.Key_Y: 1,
+            QtCore.Qt.Key_Z: 2,
+        }
+        axis = axis_map.get(key)
+        idx = getattr(self, "_active_molecule_idx", None)
+        if axis is None or idx is None or idx < 0 or idx >= len(self.molecules):
+            return False
+        try:
+            self._push_molecule_snapshot()
+        except Exception:
+            pass
+        try:
+            mol = self.molecules[idx]
+            new_angles = np.array(mol.angles, dtype=float, copy=True)
+            new_angles[axis] += -5.0 if reverse else 5.0
+            mol.angles = new_angles
+            self._update_molecule_artists()
+            self._wake_molecule_gizmo(2200, redraw=False)
+            self._update_molecule_gizmo_overlay()
+        except Exception:
+            return False
+        return True
 
     def _connect_profile_events(self):
         if self._cids:
@@ -1797,29 +3377,40 @@ class MultiPreviewCanvas(FigureCanvas):
         if self.main_ax is None:
             return
         if self._profile_line is None:
-            # initialize points centered if not set
             if self.profile_pts is None:
-                try:
-                    v0 = self.views[0]
-                    arr = np.asarray(v0['arr'])
-                    h, w = arr.shape
-                    if v0.get('extent') is None:
-                        x0 = w*0.25; y0 = h*0.5; x1 = w*0.75; y1 = h*0.5
-                    else:
-                        xmin, xmax, ymin, ymax = v0['extent'][0], v0['extent'][1], v0['extent'][2], v0['extent'][3]
-                        # our code sets extent as [0, XRange, YRange, 0], so choose a centered horizontal line
-                        x0 = xmin + 0.25*(xmax - xmin); x1 = xmin + 0.75*(xmax - xmin)
-                        y0 = ymax + 0.5*(ymin - ymax); y1 = y0
-                except Exception:
-                    x0 = 0.25; x1 = 0.75; y0 = y1 = 0.5
-                self._set_profile_pts((x0, y0, x1, y1))
-            x0, y0, x1, y1 = self.profile_pts or (x0, y0, x1, y1)
+                return
+            x0, y0, x1, y1 = self.profile_pts
             self._set_profile_pts((x0, y0, x1, y1))
             x0, y0, x1, y1 = self.profile_pts
             color = self._active_profile_color
-            self._profile_line, = self.main_ax.plot([x0,x1],[y0,y1], color=color, lw=self._active_profile_lw, alpha=0.95, zorder=9)
-            self._profile_p0, = self.main_ax.plot([x0],[y0], marker='o', color=color, ms=7, mec='black', mew=1.0, zorder=10)
-            self._profile_p1, = self.main_ax.plot([x1],[y1], marker='o', color=color, ms=7, mec='black', mew=1.0, zorder=10)
+            self._profile_line, = self.main_ax.plot(
+                [x0, x1], [y0, y1],
+                color=color,
+                lw=self._active_profile_lw,
+                alpha=0.95,
+                zorder=9,
+                linestyle=self._active_profile_line_style,
+            )
+            self._profile_p0, = self.main_ax.plot(
+                [x0], [y0],
+                marker=self._active_profile_marker_style,
+                linestyle='None',
+                color=color,
+                ms=self._active_profile_marker_size,
+                mec='black',
+                mew=1.0,
+                zorder=10,
+            )
+            self._profile_p1, = self.main_ax.plot(
+                [x1], [y1],
+                marker=self._active_profile_marker_style,
+                linestyle='None',
+                color=color,
+                ms=self._active_profile_marker_size,
+                mec='black',
+                mew=1.0,
+                zorder=10,
+            )
             self._profile_endpoint_labels = self._create_endpoint_labels((x0, y0, x1, y1), color)
             self._profile_label = self._create_profile_id_label((x0, y0, x1, y1), "Active", color)
             self._update_profile_markers()
@@ -1836,9 +3427,34 @@ class MultiPreviewCanvas(FigureCanvas):
             if ax is self.main_ax:
                 continue
             try:
-                l, = ax.plot([x0,x1],[y0,y1], color=color, lw=self._active_profile_lw, alpha=0.95, zorder=9)
-                p0, = ax.plot([x0],[y0], marker='o', color=color, ms=7, mec='black', mew=1.0, zorder=10)
-                p1, = ax.plot([x1],[y1], marker='o', color=color, ms=7, mec='black', mew=1.0, zorder=10)
+                l, = ax.plot(
+                    [x0, x1], [y0, y1],
+                    color=color,
+                    lw=self._active_profile_lw,
+                    alpha=0.95,
+                    zorder=9,
+                    linestyle=self._active_profile_line_style,
+                )
+                p0, = ax.plot(
+                    [x0], [y0],
+                    marker=self._active_profile_marker_style,
+                    linestyle='None',
+                    color=color,
+                    ms=self._active_profile_marker_size,
+                    mec='black',
+                    mew=1.0,
+                    zorder=10,
+                )
+                p1, = ax.plot(
+                    [x1], [y1],
+                    marker=self._active_profile_marker_style,
+                    linestyle='None',
+                    color=color,
+                    ms=self._active_profile_marker_size,
+                    mec='black',
+                    mew=1.0,
+                    zorder=10,
+                )
                 self._profile_echo_artists.append({'line': l, 'p0': p0, 'p1': p1})
             except Exception:
                 pass
@@ -1853,6 +3469,7 @@ class MultiPreviewCanvas(FigureCanvas):
             self._ensure_frame_artists(frame)
 
     def _add_angle_frame_at(self, x, y):
+        self.push_undo_state("add_angle_frame")
         center = (x, y) if (x is not None and y is not None) else None
         frame = self._create_angle_frame(center=center)
         self._angle_frames.append(frame)
@@ -1991,45 +3608,48 @@ class MultiPreviewCanvas(FigureCanvas):
             self.draw_idle()
 
     def _apply_angle_visibility(self):
-        visible = bool(self._show_angle_overlays)
-        for frame in self._angle_frames or []:
+        overlay_visible = bool(self._show_angle_overlays)
+        active_idx = self._active_angle_frame_idx
+        for idx, frame in enumerate(self._angle_frames or []):
+            # Keep the active measurement visible while the tool is enabled.
+            frame_visible = bool(self.angle_enabled and idx == active_idx) or overlay_visible
             style = frame.get("style", "dots")
             for art in frame.get("lines", []) or []:
                 if art is None:
                     continue
                 try:
-                    art.set_visible(visible and style == "dots")
+                    art.set_visible(frame_visible and style == "dots")
                 except Exception:
                     pass
             for art in frame.get("markers", []) or []:
                 if art is None:
                     continue
                 try:
-                    art.set_visible(visible and style == "dots")
+                    art.set_visible(frame_visible and style == "dots")
                 except Exception:
                     pass
             for art in frame.get("arrows", []) or []:
                 if art is None:
                     continue
                 try:
-                    art.set_visible(visible and style == "arrows")
+                    art.set_visible(frame_visible and style == "arrows")
                 except Exception:
                     pass
             label = frame.get("label")
             if label is not None:
                 try:
-                    label.set_visible(visible)
+                    label.set_visible(frame_visible)
                 except Exception:
                     pass
             patch = frame.get("patch")
             if patch is not None:
                 try:
-                    patch.set_visible(visible)
+                    patch.set_visible(frame_visible)
                 except Exception:
                     pass
             for lbl in frame.get("len_labels", []) or []:
                 try:
-                    lbl.set_visible(visible)
+                    lbl.set_visible(frame_visible)
                 except Exception:
                     pass
 
@@ -2186,6 +3806,9 @@ class MultiPreviewCanvas(FigureCanvas):
             return
         if style is None:
             style = 'arrows' if frame.get('style', 'dots') == 'dots' else 'dots'
+        if style == frame.get('style', 'dots'):
+            return
+        self.push_undo_state("angle_style")
         frame['style'] = style
         self._update_angle_artists()
         self._emit_angle()
@@ -2284,8 +3907,9 @@ class MultiPreviewCanvas(FigureCanvas):
             self.draw_idle()
 
     def _apply_profile_visibility(self):
-        visible = bool(self._show_profile_overlays)
-        artists = [
+        active_visible = bool(self.profile_pts is not None and self._show_profile_overlays)
+        overlay_visible = bool(self._show_profile_overlays)
+        active_artists = [
             self._profile_line,
             self._profile_p0,
             self._profile_p1,
@@ -2294,27 +3918,33 @@ class MultiPreviewCanvas(FigureCanvas):
             self._profile_label,
             self._profile_hud_text,
         ]
-        artists.extend(list(self._profile_endpoint_labels or []))
-        artists.extend(list(self._profile_marker_artists or []))
+        active_artists.extend(list(self._profile_endpoint_labels or []))
+        active_artists.extend(list(self._profile_marker_artists or []))
         for echo in self._profile_echo_artists or []:
             if isinstance(echo, dict):
-                artists.extend(echo.values())
-        for entry in self._saved_profiles or []:
-            artists.extend(entry.get("artists", []) or [])
-        for art in artists:
+                active_artists.extend(echo.values())
+        for art in active_artists:
             if art is None:
                 continue
             try:
-                art.set_visible(visible)
+                art.set_visible(active_visible)
             except Exception:
                 continue
+        for entry in self._saved_profiles or []:
+            for art in entry.get("artists", []) or []:
+                if art is None:
+                    continue
+                try:
+                    art.set_visible(overlay_visible)
+                except Exception:
+                    continue
 
     def _schedule_profile_update(self):
         if not self._profile_update_timer.isActive():
             self._profile_update_timer.start()
 
     def _flush_profile_updates(self):
-        if not self.profile_enabled:
+        if not (self.profile_enabled or self._profile_move_only):
             return
         if self.profile_pts is None:
             return
@@ -2325,7 +3955,7 @@ class MultiPreviewCanvas(FigureCanvas):
         self._emit_profile()
         self.draw_idle()
 
-    def activate_saved_profile(self, index):
+    def activate_saved_profile(self, index, push_undo=True):
         """Promote a saved overlay back to the active profile line."""
         if index is None or not self._saved_profiles:
             return False
@@ -2335,8 +3965,30 @@ class MultiPreviewCanvas(FigureCanvas):
             return False
         if idx < 0 or idx >= len(self._saved_profiles):
             return False
+        if push_undo:
+            self.push_undo_state("activate_profile")
         entry = self._saved_profiles.pop(idx)
         self._active_profile_original_color = entry.get('color')
+        self._active_profile_original_id = str(self._ensure_saved_profile_id(entry))
+        entry_color = entry.get('color')
+        if entry_color:
+            self._active_profile_color = str(entry_color)
+        try:
+            self._active_profile_lw = float(entry.get('lw', self._active_profile_lw))
+        except Exception:
+            pass
+        self._active_profile_line_style = self._normalize_profile_line_style(
+            entry.get('line_style'),
+            self._active_profile_line_style,
+        )
+        self._active_profile_marker_style = self._normalize_profile_marker_style(
+            entry.get('marker_style'),
+            self._active_profile_marker_style,
+        )
+        try:
+            self._active_profile_marker_size = float(entry.get('marker_size', self._active_profile_marker_size))
+        except Exception:
+            pass
         if self._profile_marker_positions_by_key:
             new_map = {}
             new_domain = {}
@@ -2517,14 +4169,15 @@ class MultiPreviewCanvas(FigureCanvas):
         if self.profile_pts is None or self.main_ax is None:
             self._remove_profile_markers()
             return
+        color = self._active_profile_color or '#fbc02d'
         
         # Reuse existing artists if possible
         if self._profile_ticks is not None and self._profile_info_text is not None:
             self._remove_profile_markers() # Fallback to recreate if complex update needed, or optimize further
-            ticks, text = self._create_ticks_and_label(self.profile_pts, color='yellow', alpha=0.9, base_size=9)
+            ticks, text = self._create_ticks_and_label(self.profile_pts, color=color, alpha=0.9, base_size=9)
         else:
             self._remove_profile_markers()
-            ticks, text = self._create_ticks_and_label(self.profile_pts, color='yellow', alpha=0.9, base_size=9)
+            ticks, text = self._create_ticks_and_label(self.profile_pts, color=color, alpha=0.9, base_size=9)
             
         self._profile_ticks = ticks
         self._profile_info_text = text
@@ -2726,7 +4379,7 @@ class MultiPreviewCanvas(FigureCanvas):
             return min_idx
         return None
 
-    def _build_profile_data(self, pts, color=None, view=None):
+    def _build_profile_data(self, pts, color=None, view=None, lw=None, line_style=None, marker_style=None, marker_size=None, live_profile_ref=None):
         if pts is None or not self.views:
             return None
         try:
@@ -2798,6 +4451,23 @@ class MultiPreviewCanvas(FigureCanvas):
                 except Exception:
                     x_phys = None
             meta = v0.get('meta') if isinstance(v0, dict) else None
+            source_path = str(v0.get('path') or (meta or {}).get('path') or (meta or {}).get('file_path') or "").strip()
+            source_title = str(v0.get('title') or "").strip()
+            source_acq = str(self._acquisition_overlay_text(v0) or "").strip()
+            source_folder = ""
+            source_folder_name = ""
+            source_name = ""
+            source_datetime = str(v0.get("datetime") or (meta or {}).get("datetime") or "").strip()
+            source_date = str(v0.get("date") or (meta or {}).get("date") or "").strip()
+            source_time = str(v0.get("time") or (meta or {}).get("time") or "").strip()
+            if source_path:
+                try:
+                    p = Path(source_path)
+                    source_folder = str(p.parent)
+                    source_folder_name = p.parent.name
+                    source_name = p.name
+                except Exception:
+                    source_name = source_path
             return {
                 'x_px': x_px,
                 'x_nm': x_phys,
@@ -2807,9 +4477,23 @@ class MultiPreviewCanvas(FigureCanvas):
                 'axis_unit': axis_unit,
                 'distance_unit': distance_unit if x_phys is not None else 'px',
                 'color': color,
+                'lw': float(lw) if lw is not None else None,
+                'line_style': self._normalize_profile_line_style(line_style, '-'),
+                'marker_style': self._normalize_profile_marker_style(marker_style, 'o'),
+                'marker_size': float(marker_size) if marker_size is not None else None,
                 'label': self._format_profile_label(pts),
                 'relative_axes': self._use_relative_axes(v0),
                 'meta': meta,
+                'source_path': source_path,
+                'source_folder': source_folder,
+                'source_folder_name': source_folder_name,
+                'source_file_name': source_name,
+                'source_title': source_title,
+                'source_acquisition_text': source_acq,
+                'source_datetime': source_datetime,
+                'source_date': source_date,
+                'source_time': source_time,
+                'live_profile_ref': copy.deepcopy(live_profile_ref) if isinstance(live_profile_ref, dict) else None,
             }
         except Exception:
             return None
@@ -2869,16 +4553,38 @@ class MultiPreviewCanvas(FigureCanvas):
     def _snapshot_active_profile(self):
         if self.profile_pts is None or self.main_ax is None:
             return
+        self.push_undo_state("snapshot_profile")
         pts = tuple(self.profile_pts)
+        original_profile_id = str(self._active_profile_original_id or "").strip() or None
         if self._active_profile_original_color:
             color = self._active_profile_original_color
             self._active_profile_original_color = None
         else:
             color = next(self._profile_color_cycle)
         lw = self._active_profile_lw
-        line, = self.main_ax.plot([pts[0], pts[2]], [pts[1], pts[3]], color=color, lw=lw, alpha=0.7, zorder=6, linestyle='--')
+        line_style = self._normalize_profile_line_style(self._active_profile_line_style, '--')
+        marker_style = self._normalize_profile_marker_style(self._active_profile_marker_style, 'o')
+        marker_size = float(self._active_profile_marker_size)
+        line, = self.main_ax.plot(
+            [pts[0], pts[2]], [pts[1], pts[3]],
+            color=color,
+            lw=lw,
+            alpha=0.7,
+            zorder=6,
+            linestyle=line_style,
+        )
         # Combine endpoints into one artist
-        endpoints, = self.main_ax.plot([pts[0], pts[2]], [pts[1], pts[3]], marker='o', linestyle='None', color=color, ms=5, mec='black', mew=0.7, alpha=0.9, zorder=7)
+        endpoints, = self.main_ax.plot(
+            [pts[0], pts[2]], [pts[1], pts[3]],
+            marker=marker_style,
+            linestyle='None',
+            color=color,
+            ms=marker_size,
+            mec='black',
+            mew=0.7,
+            alpha=0.9,
+            zorder=7,
+        )
         
         artists = [line, endpoints]
         
@@ -2888,10 +4594,10 @@ class MultiPreviewCanvas(FigureCanvas):
                 continue
             try:
                 l, = ax.plot([pts[0], pts[2]], [pts[1], pts[3]],
-                             color=color, lw=lw, alpha=0.7, zorder=6, linestyle='--')
+                             color=color, lw=lw, alpha=0.7, zorder=6, linestyle=line_style)
                 ep, = ax.plot([pts[0], pts[2]], [pts[1], pts[3]], 
-                              marker='o', linestyle='None', color=color,
-                              ms=5, mec='black', mew=0.7, alpha=0.9, zorder=7)
+                              marker=marker_style, linestyle='None', color=color,
+                              ms=marker_size, mec='black', mew=0.7, alpha=0.9, zorder=7)
                 artists.extend([l, ep])
             except Exception:
                 pass
@@ -2916,9 +4622,22 @@ class MultiPreviewCanvas(FigureCanvas):
         if overlay_label is not None:
             artists.append(overlay_label)
         artists += endpoint_labels
-        data = self._build_profile_data(pts, color=color)
+        data = self._build_profile_data(
+            pts,
+            color=color,
+            lw=lw,
+            line_style=line_style,
+            marker_style=marker_style,
+            marker_size=marker_size,
+        )
+        profile_id = original_profile_id or self._next_saved_profile_id()
         entry = {'artists': artists, 'pts': pts, 'color': color, 'data': data,
-                 'overlay_label_artist': overlay_label, 'endpoint_labels': endpoint_labels, 'lw': lw}
+                 'overlay_label_artist': overlay_label, 'endpoint_labels': endpoint_labels, 'lw': lw,
+                 'line_style': line_style, 'marker_style': marker_style, 'marker_size': marker_size,
+                 'line_artist': line, 'endpoint_artist': endpoints, 'profile_id': profile_id}
+        self._active_profile_original_id = None
+        if isinstance(data, dict):
+            data['live_profile_ref'] = self._profile_live_ref(entry=entry)
         if text is not None:
             entry['label_artist'] = text
             entry['label_base_size'] = base_size
@@ -2958,6 +4677,7 @@ class MultiPreviewCanvas(FigureCanvas):
                 break
         if target is None:
             return
+        self.push_undo_state("delete_profile")
         for art in target.get('artists', []):
             try:
                 if art is not None:
@@ -2971,6 +4691,7 @@ class MultiPreviewCanvas(FigureCanvas):
     def _remove_saved_profile(self, idx):
         if idx < 0 or idx >= len(self._saved_profiles):
             return
+        self.push_undo_state("remove_profile")
         entry = self._saved_profiles.pop(idx)
         if self._profile_marker_positions_by_key:
             new_map = {}
@@ -3045,9 +4766,151 @@ class MultiPreviewCanvas(FigureCanvas):
                 continue
         return None
 
+    def _saved_profile_hit(self, x, y, thresh=18.0):
+        if x is None or y is None or not self._saved_profiles:
+            return None
+        for idx in reversed(range(len(self._saved_profiles))):
+            entry = self._saved_profiles[idx]
+            pts = entry.get('pts')
+            if pts is None:
+                continue
+            try:
+                x0, y0, x1, y1 = pts
+                d0 = self._pt_distance_pixels(x, y, x0, y0)
+                d1 = self._pt_distance_pixels(x, y, x1, y1)
+                if d0 <= thresh or d1 <= thresh:
+                    return {"idx": idx, "mode": "p0" if d0 <= d1 else "p1"}
+                dist_line = self._distance_to_segment_pixels(x, y, pts)
+                if dist_line <= thresh:
+                    return {"idx": idx, "mode": "line"}
+            except Exception:
+                continue
+        return None
+
+    def _select_saved_profile_overlay(self, idx):
+        if idx is None or idx < 0 or idx >= len(self._saved_profiles):
+            self.highlight_saved_profile(None)
+            if callable(self._profile_highlight_cb):
+                try:
+                    self._profile_highlight_cb(None)
+                except Exception:
+                    pass
+            return
+        self.highlight_saved_profile(idx)
+        if callable(self._profile_highlight_cb):
+            try:
+                self._profile_highlight_cb(idx)
+            except Exception:
+                pass
+        self.set_profile_marker_key(idx)
+
+    def _rebuild_saved_profile_entry(self, idx, pts, *, redraw=True):
+        if idx < 0 or idx >= len(self._saved_profiles) or self.main_ax is None or pts is None:
+            return False
+        prev = self._saved_profiles[idx]
+        for art in prev.get('artists', []):
+            try:
+                if art is not None:
+                    art.remove()
+            except Exception:
+                pass
+        pts = tuple(pts)
+        color = prev.get('color') or '#ffffff'
+        lw = float(prev.get('lw', 1.5) or 1.5)
+        line_style = self._normalize_profile_line_style(prev.get('line_style'), '--')
+        marker_style = self._normalize_profile_marker_style(prev.get('marker_style'), 'o')
+        marker_size = float(prev.get('marker_size', 5.0) or 5.0)
+        line, = self.main_ax.plot(
+            [pts[0], pts[2]], [pts[1], pts[3]],
+            color=color, lw=lw, alpha=0.7, zorder=6, linestyle=line_style
+        )
+        endpoints, = self.main_ax.plot(
+            [pts[0], pts[2]], [pts[1], pts[3]],
+            marker=marker_style, linestyle='None', color=color,
+            ms=marker_size, mec='black', mew=0.7, alpha=0.9, zorder=7
+        )
+        artists = [line, endpoints]
+        for ax in self._ax_view_map:
+            if ax is self.main_ax:
+                continue
+            try:
+                l, = ax.plot(
+                    [pts[0], pts[2]], [pts[1], pts[3]],
+                    color=color, lw=lw, alpha=0.7, zorder=6, linestyle=line_style
+                )
+                ep, = ax.plot(
+                    [pts[0], pts[2]], [pts[1], pts[3]],
+                    marker=marker_style, linestyle='None', color=color,
+                    ms=marker_size, mec='black', mew=0.7, alpha=0.9, zorder=7
+                )
+                artists.extend([l, ep])
+            except Exception:
+                pass
+        base_size = int(prev.get('label_base_size', 8) or 8)
+        ticks, text = self._create_ticks_and_label(pts, color=color, alpha=0.7, base_size=base_size)
+        overlay_label = self._create_profile_id_label(pts, f"Overlay {idx + 1}", color)
+        endpoint_labels = self._create_endpoint_labels(pts, color)
+        if overlay_label is not None:
+            try:
+                overlay_label.set_visible(False)
+            except Exception:
+                pass
+            artists.append(overlay_label)
+        for lbl in endpoint_labels:
+            try:
+                lbl.set_visible(False)
+            except Exception:
+                pass
+        if ticks is not None:
+            artists.append(ticks)
+        if text is not None:
+            artists.append(text)
+        artists += endpoint_labels
+        data = self._build_profile_data(
+            pts,
+            color=color,
+            lw=lw,
+            line_style=line_style,
+            marker_style=marker_style,
+            marker_size=marker_size,
+            live_profile_ref=self._profile_live_ref(entry=prev),
+        )
+        if isinstance(data, dict):
+            data["profile_id"] = str(self._ensure_saved_profile_id(prev))
+        entry = {
+            'artists': artists,
+            'pts': pts,
+            'color': color,
+            'data': data,
+            'overlay_label_artist': overlay_label,
+            'endpoint_labels': endpoint_labels,
+            'lw': lw,
+            'line_style': line_style,
+            'marker_style': marker_style,
+            'marker_size': marker_size,
+            'line_artist': line,
+            'endpoint_artist': endpoints,
+            'profile_id': self._ensure_saved_profile_id(prev),
+        }
+        if text is not None:
+            entry['label_artist'] = text
+            entry['label_base_size'] = base_size
+        self._saved_profiles[idx] = entry
+        self._refresh_overlay_labels()
+        if self._highlighted_overlay is not None:
+            self.highlight_saved_profile(self._highlighted_overlay)
+        else:
+            self._apply_profile_visibility()
+        if self._profile_marker_key == idx:
+            self._update_profile_marker_artists()
+            self._update_profile_hud()
+        if redraw:
+            self.draw_idle()
+        return True
+
     def _undo_last_profile_snapshot(self):
         if not self._saved_profiles:
-            return
+            return False
         entry = self._saved_profiles.pop()
         for art in entry.get('artists', []):
             try:
@@ -3057,6 +4920,7 @@ class MultiPreviewCanvas(FigureCanvas):
                 pass
         self.draw_idle()
         self._emit_profile()
+        return True
 
     def _clear_saved_profile_artists(self, notify=False):
         for entry in self._saved_profiles:
@@ -3073,16 +4937,19 @@ class MultiPreviewCanvas(FigureCanvas):
             self._emit_profile()
         self._refresh_overlay_labels()
 
-    def _add_saved_profile_from_pts(self, pts, color, lw=1.5):
+    def _add_saved_profile_from_pts(self, pts, color, lw=1.5, line_style='--', marker_style='o', marker_size=5.0):
         if pts is None or self.main_ax is None:
             return
         pts = tuple(pts)
         color = color or next(self._profile_color_cycle)
         lw = float(lw or 1.5)
+        line_style = self._normalize_profile_line_style(line_style, '--')
+        marker_style = self._normalize_profile_marker_style(marker_style, 'o')
+        marker_size = float(marker_size or 5.0)
         line, = self.main_ax.plot([pts[0], pts[2]], [pts[1], pts[3]],
-                                  color=color, lw=lw, alpha=0.7, zorder=6, linestyle='--')
-        endpoints, = self.main_ax.plot([pts[0], pts[2]], [pts[1], pts[3]], marker='o', linestyle='None', color=color,
-                                       ms=5, mec='black', mew=0.7, alpha=0.9, zorder=7)
+                                  color=color, lw=lw, alpha=0.7, zorder=6, linestyle=line_style)
+        endpoints, = self.main_ax.plot([pts[0], pts[2]], [pts[1], pts[3]], marker=marker_style, linestyle='None', color=color,
+                                       ms=marker_size, mec='black', mew=0.7, alpha=0.9, zorder=7)
         
         artists = [line, endpoints]
         
@@ -3092,10 +4959,10 @@ class MultiPreviewCanvas(FigureCanvas):
                 continue
             try:
                 l, = ax.plot([pts[0], pts[2]], [pts[1], pts[3]],
-                             color=color, lw=lw, alpha=0.7, zorder=6, linestyle='--')
+                             color=color, lw=lw, alpha=0.7, zorder=6, linestyle=line_style)
                 ep, = ax.plot([pts[0], pts[2]], [pts[1], pts[3]], 
-                              marker='o', linestyle='None', color=color,
-                              ms=5, mec='black', mew=0.7, alpha=0.9, zorder=7)
+                              marker=marker_style, linestyle='None', color=color,
+                              ms=marker_size, mec='black', mew=0.7, alpha=0.9, zorder=7)
                 artists.extend([l, ep])
             except Exception:
                 pass
@@ -3120,9 +4987,21 @@ class MultiPreviewCanvas(FigureCanvas):
         if overlay_label is not None:
             artists.append(overlay_label)
         artists += endpoint_labels
-        data = self._build_profile_data(pts, color=color)
+        data = self._build_profile_data(
+            pts,
+            color=color,
+            lw=lw,
+            line_style=line_style,
+            marker_style=marker_style,
+            marker_size=marker_size,
+        )
         entry = {'artists': artists, 'pts': pts, 'color': color, 'data': data,
-                 'overlay_label_artist': overlay_label, 'endpoint_labels': endpoint_labels, 'lw': lw}
+                 'overlay_label_artist': overlay_label, 'endpoint_labels': endpoint_labels, 'lw': lw,
+                 'line_style': line_style, 'marker_style': marker_style, 'marker_size': marker_size,
+                 'line_artist': line, 'endpoint_artist': endpoints,
+                 'profile_id': self._next_saved_profile_id()}
+        if isinstance(data, dict):
+            data['live_profile_ref'] = self._profile_live_ref(entry=entry)
         if text is not None:
             entry['label_artist'] = text
             entry['label_base_size'] = base_size
@@ -3139,6 +5018,8 @@ class MultiPreviewCanvas(FigureCanvas):
                     pass
 
     def clear_saved_profiles(self, notify=True):
+        if self._saved_profiles:
+            self.push_undo_state("clear_profiles")
         self._clear_saved_profile_artists(notify=notify)
 
     def highlight_saved_profile(self, index):
@@ -3188,12 +5069,14 @@ class MultiPreviewCanvas(FigureCanvas):
         self.draw_idle()
 
     def _on_press(self, event):
-        if not self.profile_enabled or event.inaxes is None or event.inaxes is not self.main_ax:
+        if (not self.profile_enabled and not self._profile_move_only) or event.inaxes is None or event.inaxes is not self.main_ax:
             return
         x, y = event.xdata, event.ydata
         if x is None or y is None:
             return
         shift_pressed = self._shift_pressed(event)
+        mods_qt = self._event_qt_modifiers(event)
+        ctrl_pressed = bool(mods_qt & QtCore.Qt.ControlModifier)
         
         # Right click context menu for profiles
         if event.button == 3:
@@ -3216,7 +5099,24 @@ class MultiPreviewCanvas(FigureCanvas):
             self._profile_marker_drag_idx = marker_idx
             self._dragging = None
             return
+        saved_hit = self._saved_profile_hit(x, y)
+        if saved_hit is not None:
+            overlay_idx = int(saved_hit.get("idx"))
+            self._select_saved_profile_overlay(overlay_idx)
+            self.push_undo_state("move_saved_profile")
+            self._saved_profile_drag = {
+                "idx": overlay_idx,
+                "mode": str(saved_hit.get("mode") or "line"),
+                "origin": tuple(self._saved_profiles[overlay_idx].get("pts") or (x, y, x, y)),
+                "start": (x, y),
+            }
+            return
         if self.profile_pts is None:
+            if not ctrl_pressed:
+                return
+            if self._profile_move_only:
+                return
+            self.push_undo_state("start_profile")
             self._set_profile_pts((x, y, x, y))
             self._ensure_profile_artists()
             self._dragging = 'p1'
@@ -3231,12 +5131,14 @@ class MultiPreviewCanvas(FigureCanvas):
         thresh = 18.0  # pixels
         if d0 <= thresh or d0 <= d1:
             if d0 <= thresh:
+                self.push_undo_state("move_profile")
                 self._dragging = 'p0'
                 self._line_drag_origin = None
                 self._set_profile_animated(True)
                 self._prepare_profile_blit()
                 return
         if d1 <= thresh:
+            self.push_undo_state("move_profile")
             self._dragging = 'p1'
             self._line_drag_origin = None
             self._set_profile_animated(True)
@@ -3245,6 +5147,7 @@ class MultiPreviewCanvas(FigureCanvas):
         if self.profile_pts is not None:
             dist_line = self._distance_to_segment_pixels(x, y, self.profile_pts)
             if dist_line <= thresh:
+                self.push_undo_state("move_profile")
                 self._dragging = 'line'
                 self._line_drag_origin = (x, y, self.profile_pts)
                 self._set_profile_animated(True)
@@ -3253,31 +5156,21 @@ class MultiPreviewCanvas(FigureCanvas):
         # Increased threshold to 15.0 to prevent accidental "misses" causing profile loss
         overlay_idx = self._overlay_index_near(x, y, thresh=15.0)
         if overlay_idx is not None:
-            if self.profile_pts is not None:
-                self._snapshot_active_profile()
-            activated = self.activate_saved_profile(overlay_idx)
-            if activated:
-                if callable(self._profile_highlight_cb):
-                    try:
-                        self._profile_highlight_cb(None)
-                    except Exception:
-                        pass
-                x0, y0, x1, y1 = self.profile_pts
-                return
-            else:
-                self.highlight_saved_profile(overlay_idx)
-                if callable(self._profile_highlight_cb):
-                    try:
-                        self._profile_highlight_cb(overlay_idx)
-                    except Exception:
-                        pass
-                self._dragging = None
-                self._line_drag_origin = None
-                return
+            self._select_saved_profile_overlay(overlay_idx)
+            self._dragging = None
+            self._line_drag_origin = None
+            return
         # else: start a new line from here
+        if not ctrl_pressed:
+            return
         if self.profile_pts is not None:
             self._snapshot_active_profile()
+        else:
+            self.push_undo_state("start_profile")
+        if self._profile_move_only:
+            return
         self._active_profile_original_color = None
+        self._active_profile_original_id = None
         self._set_profile_pts((x, y, x, y))
         self._dragging = 'p1'
         self._line_drag_origin = None
@@ -3327,6 +5220,188 @@ class MultiPreviewCanvas(FigureCanvas):
         elif overlay_idx is not None and action == delete_act:
             self._remove_saved_profile(overlay_idx)
 
+    def _apply_active_profile_style(self):
+        color = self._active_profile_color
+        if self._profile_line is not None:
+            try:
+                self._profile_line.set_color(color)
+                self._profile_line.set_linewidth(self._active_profile_lw)
+                self._profile_line.set_linestyle(self._active_profile_line_style)
+            except Exception:
+                pass
+        for point in (self._profile_p0, self._profile_p1):
+            if point is None:
+                continue
+            try:
+                point.set_color(color)
+                point.set_marker(self._active_profile_marker_style)
+                point.set_markersize(self._active_profile_marker_size)
+                point.set_markeredgecolor('black')
+            except Exception:
+                pass
+        for entry in self._profile_echo_artists or []:
+            try:
+                if entry.get('line') is not None:
+                    entry['line'].set_color(color)
+                    entry['line'].set_linewidth(self._active_profile_lw)
+                    entry['line'].set_linestyle(self._active_profile_line_style)
+                for key in ('p0', 'p1'):
+                    artist = entry.get(key)
+                    if artist is None:
+                        continue
+                    artist.set_color(color)
+                    artist.set_marker(self._active_profile_marker_style)
+                    artist.set_markersize(self._active_profile_marker_size)
+                    artist.set_markeredgecolor('black')
+            except Exception:
+                pass
+        for artist in list(self._profile_endpoint_labels or []) + [self._profile_label, self._profile_info_text]:
+            if artist is None:
+                continue
+            try:
+                artist.set_color(color)
+            except Exception:
+                pass
+        if self._profile_ticks is not None:
+            try:
+                self._profile_ticks.set_color(color)
+                self._profile_ticks.set_markersize(max(3.0, 4.0 * self._profile_label_scale))
+            except Exception:
+                pass
+
+    def _apply_saved_profile_style(self, entry):
+        if not entry:
+            return
+        color = entry.get('color') or '#ffffff'
+        lw = float(entry.get('lw', 1.5) or 1.5)
+        line_style = self._normalize_profile_line_style(entry.get('line_style'), '--')
+        marker_style = self._normalize_profile_marker_style(entry.get('marker_style'), 'o')
+        marker_size = float(entry.get('marker_size', 5.0) or 5.0)
+        line_artists = []
+        endpoint_artists = []
+        for art in entry.get('artists', []) or []:
+            if art is None:
+                continue
+            try:
+                linestyle = art.get_linestyle() if hasattr(art, 'get_linestyle') else None
+            except Exception:
+                linestyle = None
+            if linestyle not in (None, 'None', 'none', ''):
+                line_artists.append(art)
+            elif hasattr(art, 'set_marker'):
+                endpoint_artists.append(art)
+        for art in line_artists:
+            try:
+                art.set_color(color)
+                art.set_linewidth(lw)
+                art.set_linestyle(line_style)
+            except Exception:
+                pass
+        for art in endpoint_artists:
+            try:
+                art.set_color(color)
+                art.set_marker(marker_style)
+                art.set_markersize(marker_size)
+                if hasattr(art, 'set_markeredgecolor'):
+                    art.set_markeredgecolor('black')
+            except Exception:
+                pass
+        for artist in [entry.get('overlay_label_artist'), entry.get('label_artist')] + list(entry.get('endpoint_labels') or []):
+            if artist is None:
+                continue
+            try:
+                artist.set_color(color)
+            except Exception:
+                pass
+        entry['data'] = None
+
+    def set_profile_style(self, profile_key=None, profile_ref=None, **changes):
+        """Update active or saved profile styling and refresh emitted datasets."""
+        idx = None
+        if profile_ref is not None:
+            if str(profile_ref.get("kind") or "").strip().lower() == "active":
+                if str(profile_ref.get("source_id") or "").strip() != str(register_profile_canvas(self) or "").strip():
+                    return False
+                active = True
+            else:
+                idx = self._saved_profile_index_from_ref(profile_ref)
+                if idx is None:
+                    return False
+                active = False
+        else:
+            active = profile_key is None
+            if not active:
+                try:
+                    idx = int(profile_key)
+                except Exception:
+                    return False
+                if idx < 0 or idx >= len(self._saved_profiles):
+                    return False
+        if active and self.profile_pts is None:
+            return False
+        self.push_undo_state("profile_style")
+        if active:
+            color = changes.get('color')
+            if color:
+                self._active_profile_color = str(color)
+            lw = changes.get('lw')
+            if lw is not None:
+                self._active_profile_lw = max(0.5, float(lw))
+            line_style = changes.get('line_style')
+            if line_style is not None:
+                self._active_profile_line_style = self._normalize_profile_line_style(
+                    line_style, self._active_profile_line_style
+                )
+            marker_style = changes.get('marker_style')
+            if marker_style is not None:
+                self._active_profile_marker_style = self._normalize_profile_marker_style(
+                    marker_style, self._active_profile_marker_style
+                )
+            marker_size = changes.get('marker_size')
+            if marker_size is not None:
+                self._active_profile_marker_size = max(2.0, float(marker_size))
+            self._apply_active_profile_style()
+        else:
+            entry = self._saved_profiles[idx]
+            color = changes.get('color')
+            if color:
+                entry['color'] = str(color)
+            lw = changes.get('lw')
+            if lw is not None:
+                entry['lw'] = max(0.5, float(lw))
+            line_style = changes.get('line_style')
+            if line_style is not None:
+                entry['line_style'] = self._normalize_profile_line_style(line_style, entry.get('line_style', '--'))
+            marker_style = changes.get('marker_style')
+            if marker_style is not None:
+                entry['marker_style'] = self._normalize_profile_marker_style(marker_style, entry.get('marker_style', 'o'))
+            marker_size = changes.get('marker_size')
+            if marker_size is not None:
+                entry['marker_size'] = max(2.0, float(marker_size))
+            self._apply_saved_profile_style(entry)
+        self.draw_idle()
+        self._emit_profile()
+        return True
+
+    def apply_profile_palette(self, palette_name: str):
+        """Apply a named color cycle to the active profile and saved overlays."""
+        colors = get_color_cycle(palette_name)
+        if not colors:
+            return False
+        self.push_undo_state("profile_palette")
+        self._profile_palette_name = palette_name or DEFAULT_COLOR_CYCLE
+        self._profile_palette_colors = list(colors)
+        self._profile_color_cycle = itertools.cycle(self._profile_palette_colors)
+        if self.profile_pts is not None:
+            self._active_profile_color = self._profile_palette_colors[0]
+            self._apply_active_profile_style()
+        for idx, entry in enumerate(self._saved_profiles):
+            entry['color'] = self._profile_palette_colors[(idx + 1) % len(self._profile_palette_colors)]
+            self._apply_saved_profile_style(entry)
+        self.draw_idle()
+        self._emit_profile()
+        return True
+
     def _change_profile_color(self, overlay_idx, active):
         current_color = self._active_profile_color
         if overlay_idx is not None and 0 <= overlay_idx < len(self._saved_profiles):
@@ -3334,62 +5409,45 @@ class MultiPreviewCanvas(FigureCanvas):
         
         col = QtWidgets.QColorDialog.getColor(QtGui.QColor(current_color), self, "Select Profile Color")
         if not col.isValid(): return
-        new_color = col.name()
-        
-        if active:
-            self._active_profile_color = new_color
-            if self._profile_line:
-                self._profile_line.set_color(new_color)
-            if self._profile_p0:
-                self._profile_p0.set_color(new_color)
-            if self._profile_p1:
-                self._profile_p1.set_color(new_color)
-            for entry in self._profile_echo_artists:
-                if entry.get('line'): entry['line'].set_color(new_color)
-                if entry.get('p0'): entry['p0'].set_color(new_color)
-                if entry.get('p1'): entry['p1'].set_color(new_color)
-            self.draw_idle()
-            self._emit_profile()
-        
-        if overlay_idx is not None and 0 <= overlay_idx < len(self._saved_profiles):
-            entry = self._saved_profiles[overlay_idx]
-            entry['color'] = new_color
-            # Update artists
-            for art in entry.get('artists', []):
-                try: art.set_color(new_color)
-                except: pass
-                try: art.set_markeredgecolor('black')
-                except: pass
-            if entry.get('overlay_label_artist'):
-                entry['overlay_label_artist'].set_color(new_color)
-            self.draw_idle()
-            self._emit_profile()
+        self.set_profile_style(None if active else overlay_idx, color=col.name())
 
     def _change_profile_width(self, overlay_idx, active, delta):
+        has_overlay = overlay_idx is not None and 0 <= overlay_idx < len(self._saved_profiles)
+        if not active and not has_overlay:
+            return
         if active:
-            self._active_profile_lw = max(0.5, self._active_profile_lw + delta)
-            if self._profile_line:
-                self._profile_line.set_linewidth(self._active_profile_lw)
-                for entry in self._profile_echo_artists:
-                    if entry.get('line'): entry['line'].set_linewidth(self._active_profile_lw)
-            self.draw_idle()
-        
-        if overlay_idx is not None and 0 <= overlay_idx < len(self._saved_profiles):
+            self.set_profile_style(None, lw=max(0.5, self._active_profile_lw + delta))
+        elif has_overlay:
             entry = self._saved_profiles[overlay_idx]
-            cur_lw = entry.get('lw', 1.5)
-            new_lw = max(0.5, cur_lw + delta)
-            entry['lw'] = new_lw
-            # Update artists (first artist is usually the line)
-            artists = entry.get('artists', [])
-            if artists and isinstance(artists[0], Line2D):
-                artists[0].set_linewidth(new_lw)
-            self.draw_idle()
+            self.set_profile_style(overlay_idx, lw=max(0.5, float(entry.get('lw', 1.5) or 1.5) + delta))
 
     def _on_motion(self, event):
-        if not self.profile_enabled or event.inaxes is None or event.inaxes is not self.main_ax:
+        if (not self.profile_enabled and not self._profile_move_only) or event.inaxes is None or event.inaxes is not self.main_ax:
             return
         x, y = event.xdata, event.ydata
         if x is None or y is None:
+            return
+        if self._saved_profile_drag is not None:
+            drag = self._saved_profile_drag
+            idx = drag.get("idx")
+            if idx is None or idx < 0 or idx >= len(self._saved_profiles):
+                self._saved_profile_drag = None
+                return
+            pts = drag.get("origin") or self._saved_profiles[idx].get("pts")
+            if pts is None:
+                return
+            x0, y0, x1, y1 = pts
+            mode = drag.get("mode")
+            if mode == "p0":
+                new_pts = (x, y, x1, y1)
+            elif mode == "p1":
+                new_pts = (x0, y0, x, y)
+            else:
+                sx, sy = drag.get("start", (x, y))
+                dx = x - sx
+                dy = y - sy
+                new_pts = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+            self._rebuild_saved_profile_entry(idx, new_pts, redraw=True)
             return
         if self._profile_marker_drag_idx is not None:
             if not self._profile_marker_domain or self._profile_marker_positions is None:
@@ -3444,7 +5502,11 @@ class MultiPreviewCanvas(FigureCanvas):
         self._schedule_profile_update()
 
     def _on_release(self, event):
-        if not self.profile_enabled:
+        if not (self.profile_enabled or self._profile_move_only):
+            return
+        if self._saved_profile_drag is not None:
+            self._saved_profile_drag = None
+            self._emit_profile()
             return
         self._dragging = None
         self._set_profile_animated(False)
@@ -3459,6 +5521,28 @@ class MultiPreviewCanvas(FigureCanvas):
         if self._profile_state_deferred:
             self._profile_state_deferred = False
             self._flush_profile_state()
+        if getattr(self, "_profile_quick_transient", False):
+            self._profile_quick_transient = False
+            self._profile_user_enabled = False
+            self._profile_move_only = self.profile_pts is not None
+
+    def _profile_hit_test(self, event, *, thresh: float = 18.0):
+        if event is None or event.inaxes is not self.main_ax:
+            return False
+        x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return False
+        if self._profile_marker_hit(x, y) is not None:
+            return True
+        if self.profile_pts is not None:
+            x0, y0, x1, y1 = self.profile_pts
+            if self._pt_distance_pixels(x, y, x0, y0) <= thresh:
+                return True
+            if self._pt_distance_pixels(x, y, x1, y1) <= thresh:
+                return True
+            if self._distance_to_segment_pixels(x, y, self.profile_pts) <= thresh:
+                return True
+        return self._overlay_index_near(x, y, thresh=15.0) is not None
 
     def _profile_animation_artists(self):
         artists = [
@@ -3607,6 +5691,7 @@ class MultiPreviewCanvas(FigureCanvas):
         hit = self._angle_handle_at(x, y)
         if not hit:
             return
+        self.push_undo_state("move_angle")
         self._angle_dragging = hit
         self._prepare_angle_blit()
 
@@ -3642,13 +5727,27 @@ class MultiPreviewCanvas(FigureCanvas):
         self._update_angle_artists()
 
     def _emit_profile(self):
-        if not getattr(self, "profile_enabled", False) or self.profile_pts is None:
+        if not (
+            getattr(self, "profile_enabled", False)
+            or getattr(self, "_profile_move_only", False)
+            or bool(self._saved_profiles)
+        ):
             self._emit_profile_state()
             return
-        if not callable(self.profile_callback):
-            self._emit_profile_state()
-            return
-        active = self._build_profile_data(self.profile_pts, color=self._active_profile_color, view=self.views[0] if self.views else None)
+        active = None
+        if self.profile_pts is not None:
+            active = self._build_profile_data(
+                self.profile_pts,
+                color=self._active_profile_color,
+                view=self.views[0] if self.views else None,
+                lw=self._active_profile_lw,
+                line_style=self._active_profile_line_style,
+                marker_style=self._active_profile_marker_style,
+                marker_size=self._active_profile_marker_size,
+                live_profile_ref=self._profile_live_ref(None),
+            )
+            if isinstance(active, dict) and self._active_profile_original_id:
+                active["profile_id"] = str(self._active_profile_original_id)
         if active:
             ref = active.get('x_nm') if active.get('x_nm') is not None else active.get('x_px')
             if ref is not None:
@@ -3669,7 +5768,16 @@ class MultiPreviewCanvas(FigureCanvas):
                 extra_colors = ['#ff4081', '#00e5ff', '#76ff03', '#d500f9']
                 for i, v in enumerate(self.views[1:]):
                     col = extra_colors[i % len(extra_colors)]
-                    p = self._build_profile_data(self.profile_pts, color=col, view=v)
+                    p = self._build_profile_data(
+                        self.profile_pts,
+                        color=col,
+                        view=v,
+                        lw=self._active_profile_lw,
+                        line_style=self._active_profile_line_style,
+                        marker_style=self._active_profile_marker_style,
+                        marker_size=self._active_profile_marker_size,
+                        live_profile_ref=self._profile_live_ref(None),
+                    )
                     if p:
                         name = v.get('colorbar_label') or v.get('title') or f"Ch{i+2}"
                         p['name'] = name
@@ -3680,14 +5788,32 @@ class MultiPreviewCanvas(FigureCanvas):
         for entry in self._saved_profiles:
             data = entry.get('data')
             if data is None:
-                data = self._build_profile_data(entry.get('pts'), color=entry.get('color'))
+                data = self._build_profile_data(
+                    entry.get('pts'),
+                    color=entry.get('color'),
+                    lw=entry.get('lw'),
+                    line_style=entry.get('line_style'),
+                    marker_style=entry.get('marker_style'),
+                    marker_size=entry.get('marker_size'),
+                    live_profile_ref=self._profile_live_ref(entry=entry),
+                )
+                if isinstance(data, dict):
+                    data["profile_id"] = str(self._ensure_saved_profile_id(entry))
                 entry['data'] = data
+            elif isinstance(data, dict):
+                data['live_profile_ref'] = self._profile_live_ref(entry=entry)
+                data["profile_id"] = str(self._ensure_saved_profile_id(entry))
             if data:
                 saved_data.append(data)
         try:
-            self.profile_callback(active, saved_data)
+            notify_profile_source_changed(self, active, saved_data)
         except Exception:
             pass
+        if callable(self.profile_callback):
+            try:
+                self.profile_callback(active, saved_data)
+            except Exception:
+                pass
         self._emit_profile_state()
 
     def _emit_profile_state(self):
@@ -3713,8 +5839,24 @@ class MultiPreviewCanvas(FigureCanvas):
         except Exception:
             pass
 
+    def _event_qt_modifiers(self, event):
+        mods_qt = QtCore.Qt.NoModifier
+        try:
+            mods_qt = getattr(getattr(event, "guiEvent", None), "modifiers", lambda: QtCore.Qt.NoModifier)()
+        except Exception:
+            mods_qt = QtCore.Qt.NoModifier
+        if mods_qt == QtCore.Qt.NoModifier:
+            try:
+                mods_qt = QtWidgets.QApplication.keyboardModifiers()
+            except Exception:
+                mods_qt = QtCore.Qt.NoModifier
+        return mods_qt
+
     def _on_base_click(self, event):
         if event is None or event.inaxes is None:
+            return
+        if self._shortcut_hint_hit(event):
+            self.set_show_shortcut_hint(False)
             return
         # If clicking on a scale bar, do not trigger base canvas actions (like drag/copy)
         if self.scale_bar_enabled:
@@ -3723,12 +5865,29 @@ class MultiPreviewCanvas(FigureCanvas):
                     return
         if self.scale_bar_enabled and self._scale_bar_drag_start is not None:
             return
+        gizmo_hit = self._molecule_gizmo_hit_test(event)
+        if gizmo_hit is not None:
+            self._begin_molecule_gizmo_drag(gizmo_hit, event)
+            return
         ax = event.inaxes
-        
-        if self._check_molecule_hit(event):
+        view = self._ax_view_map.get(ax)
+        if ax is getattr(self, "_molecule_gizmo_axes", None):
+            return
+        if self._fixed_crop_transform_mode and event.button == 1 and view is not None:
+            mods_qt = self._event_qt_modifiers(event)
+            hit = self._fixed_crop_template_handle_hit(event, view, ax)
+            if hit is not None:
+                if hit.get("mode") == "move" and bool(mods_qt & QtCore.Qt.ControlModifier):
+                    hit = dict(hit)
+                    hit["mode"] = "rotate"
+                if self._begin_fixed_crop_template_drag(hit, event, view, ax):
+                    return
+            # Keep edit mode deterministic: left-click outside handles should not
+            # start pan/quick-crop/profile actions while transform editing is on.
             return
 
-        view = self._ax_view_map.get(ax)
+        if self._check_molecule_hit(event):
+            return
         # Double-click: pop out the clicked view if callback provided
         if getattr(event, "dblclick", False) and event.button == 1 and view is not None:
             if callable(self._double_click_callback):
@@ -3740,6 +5899,7 @@ class MultiPreviewCanvas(FigureCanvas):
         # Crop/outline rectangle start (handle before tool guards):
         #   Shift + drag -> arbitrary rectangle (crop)
         #   Ctrl + Shift + drag -> square selection (crop)
+        #   Shift + drag while crop-template square mode is active -> square selection
         #   Alt + drag -> outline extraction in ROI
         # Right-click: outline context menu (style/clear/undo)
         if event.button == 3 and view is not None:
@@ -3759,11 +5919,20 @@ class MultiPreviewCanvas(FigureCanvas):
                 gui_mods = QtCore.Qt.NoModifier
         mods_qt = gui_mods
         alt_pressed = bool(mods_qt & QtCore.Qt.AltModifier) or 'alt' in str(getattr(event, "key", "")).lower() or bool(getattr(self, "outline_mode", False))
-        want_square = (event.button == 1) and (mods_qt & QtCore.Qt.ControlModifier) and (mods_qt & QtCore.Qt.ShiftModifier)
+        template_square = bool((self._fixed_crop_template or {}).get("square", False))
+        want_square = (
+            (event.button == 1)
+            and bool(mods_qt & QtCore.Qt.ShiftModifier)
+            and (
+                bool(mods_qt & QtCore.Qt.ControlModifier)
+                or (self._fixed_crop_quick_mode and template_square)
+            )
+        )
         want_rect = (event.button == 1) and (mods_qt & QtCore.Qt.ShiftModifier)
         quick_profile = (
             event.button == 1
             and ax is self.main_ax
+            and bool(getattr(self, "_measurement_shortcuts_enabled", True))
             and bool(mods_qt & QtCore.Qt.ControlModifier)
             and not bool(mods_qt & QtCore.Qt.AltModifier)
             and not bool(mods_qt & QtCore.Qt.ShiftModifier)
@@ -3771,6 +5940,7 @@ class MultiPreviewCanvas(FigureCanvas):
         quick_angle = (
             event.button == 1
             and ax is self.main_ax
+            and bool(getattr(self, "_measurement_shortcuts_enabled", True))
             and bool(mods_qt & QtCore.Qt.ControlModifier)
             and bool(mods_qt & QtCore.Qt.AltModifier)
             and not bool(mods_qt & QtCore.Qt.ShiftModifier)
@@ -3791,8 +5961,14 @@ class MultiPreviewCanvas(FigureCanvas):
                 if self.angle_enabled:
                     self.set_angle_tool_enabled(False)
                 was_enabled = bool(self.profile_enabled)
+                if self._profile_move_only:
+                    self._profile_move_only = False
+                    self._profile_user_enabled = True
+                    self._profile_quick_transient = True
+                    was_enabled = False
                 if not self.profile_enabled:
                     self.set_profile_tool_enabled(True)
+                    self._profile_quick_transient = True
                 if not was_enabled:
                     # Start the first profile drag immediately when the tool
                     # is activated via Ctrl+Click.
@@ -3960,6 +6136,7 @@ class MultiPreviewCanvas(FigureCanvas):
             return
         self._push_molecule_snapshot()
         self.molecules = []
+        self._active_molecule_idx = None
         self._molecule_artists = []
         self._redraw()
 
@@ -3969,6 +6146,7 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def _push_molecule_snapshot(self):
         """Save current molecule state for undo."""
+        self.push_undo_state("molecules")
         try:
             snap = [m.copy() for m in self.molecules]
             self._molecule_history.append(snap)
@@ -3980,19 +6158,23 @@ class MultiPreviewCanvas(FigureCanvas):
     def undo_last_molecule_change(self):
         """Undo the latest molecule change, if any."""
         if not self._molecule_history:
-            return
+            return False
         try:
             last = self._molecule_history.pop()
             self.molecules = [m.copy() for m in last]
             self._redraw()
+            return True
         except Exception:
-            pass
+            return False
 
     def _check_molecule_hit(self, event):
-        # When measurement tools are active, avoid picking/dragging molecules to prevent accidental moves.
-        if self.profile_enabled or self.angle_enabled:
+        # Angle editing has exclusive ownership of the canvas.
+        if self.angle_enabled:
             return False
         if not self.show_molecules or not self.molecules or event.inaxes is None:
+            return False
+        # If the pointer is actually on a profile, let the profile tool win.
+        if self._profile_hit_test(event):
             return False
         
         # Simple hit test: check distance to any atom in any molecule
@@ -4016,6 +6198,8 @@ class MultiPreviewCanvas(FigureCanvas):
             
             # Threshold: 0.5 nm radius click tolerance
             if min_dist < 0.25: 
+                self._active_molecule_idx = idx
+                self._wake_molecule_gizmo(2200, redraw=False)
                 if event.button == 1 or event.button == 2:
                     if not self._molecule_drag_snapshot:
                         self._push_molecule_snapshot()
@@ -4036,7 +6220,7 @@ class MultiPreviewCanvas(FigureCanvas):
                         self._molecule_drag_mode = 'rotate_z'
                     else:
                         self._molecule_drag_mode = 'translate'
-                        
+                    self._update_molecule_gizmo_overlay()
                     return True
                 elif event.button == 3:
                     self._show_molecule_menu(event, mol)
@@ -4068,10 +6252,46 @@ class MultiPreviewCanvas(FigureCanvas):
             except Exception:
                 self.draw_idle()
             return
+        gizmo_drag = getattr(self, "_molecule_gizmo_drag", None)
+        if gizmo_drag is not None:
+            idx = gizmo_drag.get("idx")
+            if idx is None or idx < 0 or idx >= len(self.molecules):
+                self._molecule_gizmo_drag = None
+                return
+            if getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+                return
+            mol = self.molecules[idx]
+            start_angles = gizmo_drag.get("start_angles")
+            if start_angles is None:
+                start_angles = mol.angles
+            new_angles = np.array(start_angles, dtype=float, copy=True)
+            if gizmo_drag.get("mode") == "rotate_z":
+                gizmo_ax = getattr(self, "_molecule_gizmo_axes", None)
+                bbox = getattr(gizmo_ax, "bbox", None)
+                if bbox is None:
+                    return
+                center_x = float(bbox.x0 + (bbox.width * 0.5))
+                center_y = float(bbox.y0 + (bbox.height * 0.5))
+                start_local = gizmo_drag.get("start_local") or (0.0, 0.0)
+                start_angle = math.degrees(math.atan2(float(start_local[1]), float(start_local[0])))
+                current_angle = math.degrees(math.atan2(float(event.y) - center_y, float(event.x) - center_x))
+                new_angles[2] += current_angle - start_angle
+            else:
+                dx_px = float(event.x) - float(gizmo_drag["start_px"][0])
+                dy_px = float(event.y) - float(gizmo_drag["start_px"][1])
+                sensitivity = 0.45
+                new_angles[0] += dy_px * sensitivity
+                new_angles[1] += dx_px * sensitivity
+            mol.angles = new_angles
+            self._wake_molecule_gizmo(2400, redraw=False)
+            self._update_molecule_artists()
+            self._update_molecule_gizmo_overlay()
+            return
         if self._molecule_drag_idx is not None:
             if event.xdata is None or event.ydata is None:
                 return
             mol = self.molecules[self._molecule_drag_idx]
+            self._wake_molecule_gizmo(2200, redraw=False)
             
             if self._molecule_drag_mode == 'translate':
                 dx = event.xdata - self._molecule_drag_start[0]
@@ -4113,8 +6333,12 @@ class MultiPreviewCanvas(FigureCanvas):
                     self._molecule_rotation_guide.center = (mol.offset[0], mol.offset[1])
 
             self._update_molecule_artists()
+            self._update_molecule_gizmo_overlay()
 
     def _on_molecule_release(self, event):
+        if self._molecule_gizmo_drag is not None:
+            self._molecule_gizmo_drag = None
+            return
         if self._molecule_drag_idx is not None:
             self._molecule_drag_idx = None
             self._molecule_drag_start = None
@@ -4152,40 +6376,60 @@ class MultiPreviewCanvas(FigureCanvas):
     def set_molecule_palette_callback(self, cb):
         self._molecule_palette_cb = cb
 
+    def apply_view_colormap(self, cmap_name: str, *, target_view=None, notify: bool = True):
+        """Apply a colormap to one or all current views and redraw in place."""
+        cmap_name = str(cmap_name or "").strip()
+        if not cmap_name:
+            return False
+        targets = []
+        for current_view in list(self.views or []):
+            if target_view is not None and current_view is not target_view:
+                continue
+            if str(current_view.get("cmap") or "") == cmap_name:
+                continue
+            targets.append(current_view)
+        if not targets:
+            return False
+        self.push_undo_state("colormap")
+        changed = False
+        for current_view in targets:
+            current_view["cmap"] = cmap_name
+            changed = True
+        self._redraw()
+        if notify:
+            self._notify_views_callback()
+        return True
+
     def _show_molecule_menu(self, event, mol):
         style = QtWidgets.QApplication.style()
         icon = lambda std: style.standardIcon(std) if style else QtGui.QIcon()
 
         menu = QtWidgets.QMenu(self)
 
-        # Properties
-        props_act = menu.addAction(icon(QtWidgets.QStyle.SP_FileDialogDetailedView), "Properties (Rotate/Scale)...")
+        # Main edit entry point
+        props_act = menu.addAction(icon(QtWidgets.QStyle.SP_FileDialogDetailedView), "Edit molecule...")
         menu.addSeparator()
 
-        # View toggles
+        # Quick view toggles
         toggle_shadow_act = menu.addAction(icon(QtWidgets.QStyle.SP_DialogYesButton), "Show shadows")
         toggle_shadow_act.setCheckable(True)
         toggle_shadow_act.setChecked(self._show_molecule_shadow)
         show_h_act = menu.addAction(icon(QtWidgets.QStyle.SP_TitleBarShadeButton), "Show hydrogens")
         show_h_act.setCheckable(True)
         show_h_act.setChecked(getattr(self, "_show_hydrogens", True))
-
-        # Colors submenu
-        colors_menu = menu.addMenu(icon(QtWidgets.QStyle.SP_DialogOpenButton), "Colors...")
-        atom_color_act = colors_menu.addAction(icon(QtWidgets.QStyle.SP_DriveDVDIcon), "Set atom color...")
-        atom_elem_color_act = colors_menu.addAction(icon(QtWidgets.QStyle.SP_FileIcon), "Set element color...")
-        bond_color_act = colors_menu.addAction(icon(QtWidgets.QStyle.SP_FileDialogListView), "Set bond color...")
-        reset_colors_act = colors_menu.addAction(icon(QtWidgets.QStyle.SP_BrowserReload), "Reset colors")
-
         menu.addSeparator()
+
+        # Reset/state
+        reset_file_act = menu.addAction(icon(QtWidgets.QStyle.SP_BrowserReload), "Reset to file state")
+        reset_file_act.setShortcut(QtGui.QKeySequence("Shift+R"))
+        reset_file_act.setEnabled(bool(getattr(mol, "filepath", None)))
         reset_all_act = menu.addAction(icon(QtWidgets.QStyle.SP_MessageBoxWarning), "Reset all molecules")
 
-        # Undo
         undo_act = menu.addAction(icon(QtWidgets.QStyle.SP_ArrowBack), "Undo last change")
         undo_act.setShortcut(QtGui.QKeySequence("Ctrl+Z"))
 
         # Palette submenu
-        pal_menu = menu.addMenu(icon(QtWidgets.QStyle.SP_DialogHelpButton), "Palette")
+        pal_menu = menu.addMenu(icon(QtWidgets.QStyle.SP_DialogHelpButton), "Atom palette")
         current_pal = (getattr(self, "molecule_palette", "cpk") or "cpk").lower()
         palette_actions = {}
         for pal in available_atom_palettes():
@@ -4203,40 +6447,28 @@ class MultiPreviewCanvas(FigureCanvas):
 
         action = menu.exec_(event.guiEvent.globalPos())
         if action == props_act:
-            dlg = MoleculePropertiesDialog(mol, self, callback=self._redraw)
+            overlay_settings = {
+                "palette": getattr(self, "molecule_palette", "pymol"),
+                "show_shadows": bool(self._show_molecule_shadow),
+                "show_hydrogens": bool(getattr(self, "_show_hydrogens", True)),
+                "show_shadows_available": True,
+                "show_hydrogens_available": True,
+                "palette_available": True,
+            }
+            def _apply():
+                self._show_molecule_shadow = bool(overlay_settings.get("show_shadows", True))
+                self._show_hydrogens = bool(overlay_settings.get("show_hydrogens", True))
+                self.set_molecule_palette(overlay_settings.get("palette", "pymol"), notify=False)
+                self._redraw()
+            dlg = MoleculePropertiesDialog(mol, self, callback=_apply, overlay_settings=overlay_settings)
             dlg.show()
-        elif action == atom_color_act:
-            c = self._pick_color(mol.atom_color_override or get_atom_color('C', self.molecule_palette))
-            if c:
-                self._push_molecule_snapshot()
-                mol.atom_color_override = c
-                self._redraw()
-        elif action == atom_elem_color_act:
-            elem, ok = QtWidgets.QInputDialog.getText(self, "Element", "Element symbol:", text="C")
-            if ok and elem.strip():
-                c = self._pick_color(get_atom_color(elem.strip(), self.molecule_palette))
-                if c:
-                    self._push_molecule_snapshot()
-                    m = getattr(mol, "atom_color_map", None)
-                    if m is None:
-                        mol.atom_color_map = {}
-                        m = mol.atom_color_map
-                    m[elem.strip().upper()] = c
-                    self._redraw()
-        elif action == bond_color_act:
-            c = self._pick_color(mol.bond_color_override or "#e0e0e0")
-            if c:
-                self._push_molecule_snapshot()
-                mol.bond_color_override = c
-                mol.bond_color_mode = "single"
-                self._redraw()
-        elif action == reset_colors_act:
-            self._push_molecule_snapshot()
-            mol.atom_color_override = None
-            mol.bond_color_override = None
-            mol.bond_color_mode = 'default'
-            mol.atom_color_map = {}
-            self._redraw()
+        elif action == reset_file_act:
+            idx = None
+            try:
+                idx = self.molecules.index(mol)
+            except Exception:
+                idx = getattr(self, "_active_molecule_idx", None)
+            self._reset_molecule_to_file_state(idx)
         elif action == reset_all_act:
             self.reset_molecules()
         elif action == undo_act:
@@ -4267,8 +6499,7 @@ class MultiPreviewCanvas(FigureCanvas):
         try:
             qimg = self._view_to_qimage(view)
             QtWidgets.QApplication.clipboard().setImage(qimg)
-            if callable(self._copy_feedback_handler):
-                self._copy_feedback_handler(view)
+            self._notify_copy_feedback(view, fmt="png", displayed=False)
         except Exception:
             pass
 
@@ -4276,6 +6507,64 @@ class MultiPreviewCanvas(FigureCanvas):
         arr = np.asarray(view.get('arr'))
         cmap = view.get('cmap', 'viridis')
         return array_to_qimage(arr, cmap_name=cmap)
+
+    @classmethod
+    def _stash_drag_view_snapshot(cls, view):
+        if not isinstance(view, dict):
+            return None
+        try:
+            snapshot = dict(view)
+        except Exception:
+            return None
+        arr = snapshot.get("arr")
+        if arr is not None:
+            try:
+                snapshot["arr"] = np.array(arr, copy=True)
+            except Exception:
+                pass
+        meta = snapshot.get("meta")
+        if isinstance(meta, dict):
+            try:
+                snapshot["meta"] = dict(meta)
+            except Exception:
+                pass
+        token = f"viewdrag_{time.time_ns()}"
+        cls._DRAG_VIEW_SNAPSHOTS[token] = {
+            "view": snapshot,
+            "ts_ns": time.time_ns(),
+        }
+        while len(cls._DRAG_VIEW_SNAPSHOTS) > cls._DRAG_VIEW_SNAPSHOT_LIMIT:
+            try:
+                oldest = next(iter(cls._DRAG_VIEW_SNAPSHOTS))
+            except Exception:
+                break
+            cls._DRAG_VIEW_SNAPSHOTS.pop(oldest, None)
+        return token
+
+    @classmethod
+    def consume_drag_view_snapshot(cls, token):
+        if not token:
+            return None
+        entry = cls._DRAG_VIEW_SNAPSHOTS.pop(str(token), None)
+        if not isinstance(entry, dict):
+            return None
+        view = entry.get("view")
+        if not isinstance(view, dict):
+            return None
+        result = dict(view)
+        arr = result.get("arr")
+        if arr is not None:
+            try:
+                result["arr"] = np.array(arr, copy=True)
+            except Exception:
+                pass
+        meta = result.get("meta")
+        if isinstance(meta, dict):
+            try:
+                result["meta"] = dict(meta)
+            except Exception:
+                pass
+        return result
 
     def _show_context_menu(self, event, view):
         if view is None:
@@ -4297,7 +6586,23 @@ class MultiPreviewCanvas(FigureCanvas):
         angle_tool_act = quick_menu.addAction("Angle tool  (Ctrl+Alt+Click)")
         angle_tool_act.setCheckable(True)
         angle_tool_act.setChecked(bool(self.angle_enabled))
+        if not bool(getattr(self, "_measurement_shortcuts_enabled", True)):
+            profile_tool_act.setEnabled(False)
+            angle_tool_act.setEnabled(False)
+        quick_menu.addSeparator()
+        edit_crop_frame_act = quick_menu.addAction("Edit crop template")
+        edit_crop_frame_act.setCheckable(True)
+        edit_crop_frame_act.setChecked(bool(self._fixed_crop_transform_mode))
+        apply_crop_frame_act = quick_menu.addAction("Apply crop template  (Enter)")
+        apply_crop_frame_act.setEnabled(bool(self._fixed_crop_template_visible and self._fixed_crop_template))
+        exit_crop_frame_act = quick_menu.addAction("Exit template editor")
+        exit_crop_frame_act.setEnabled(bool(self._fixed_crop_transform_mode))
+        quick_menu.addSeparator()
         clear_overlays_act = quick_menu.addAction("Clear profile/angle overlays")
+        auto_hist_act = quick_menu.addAction("Auto contrast (1-99%)  (A)")
+        auto_hist_act.setEnabled(callable(self._histogram_auto_callback))
+        reset_hist_act = quick_menu.addAction("Reset range to data min/max")
+        reset_hist_act.setEnabled(callable(self._histogram_reset_callback))
         histogram_act = quick_menu.addAction("Histogram...")
         histogram_act.setEnabled(callable(self._histogram_dialog_callback))
 
@@ -4316,21 +6621,64 @@ class MultiPreviewCanvas(FigureCanvas):
         show_cbar_act = display_menu.addAction("Show Colorbar")
         show_cbar_act.setCheckable(True)
         show_cbar_act.setChecked(bool(self._show_colorbar))
+        rel_zero_act = None
+        if callable(self._display_relative_zero_menu_callback):
+            rel_zero_act = display_menu.addAction("Values relative to zero/reference")
+            rel_zero_act.setCheckable(True)
+            try:
+                rel_zero_act.setChecked(bool(self._display_relative_zero_menu_state_callback()))
+            except Exception:
+                rel_zero_act.setChecked(False)
+            rel_zero_tip = self._display_relative_zero_menu_tooltip or "Display values relative to the current zero/reference"
+            rel_zero_act.setToolTip(rel_zero_tip)
+            rel_zero_act.setStatusTip(rel_zero_tip)
+        cbar_orient_menu = display_menu.addMenu("Colorbar orientation")
+        cbar_orient_group = QtWidgets.QActionGroup(self)
+        cbar_orient_group.setExclusive(True)
+        cbar_vert_act = cbar_orient_menu.addAction("Vertical")
+        cbar_vert_act.setCheckable(True)
+        cbar_vert_act.setChecked(self._colorbar_orientation == 'vertical')
+        cbar_orient_group.addAction(cbar_vert_act)
+        cbar_horiz_act = cbar_orient_menu.addAction("Horizontal")
+        cbar_horiz_act.setCheckable(True)
+        cbar_horiz_act.setChecked(self._colorbar_orientation == 'horizontal')
+        cbar_orient_group.addAction(cbar_horiz_act)
         show_title_act = display_menu.addAction("Show Title")
         show_title_act.setCheckable(True)
         show_title_act.setChecked(bool(self._show_title))
+        show_profiles_act = display_menu.addAction("Show Profiles")
+        show_profiles_act.setCheckable(True)
+        show_profiles_act.setChecked(bool(self._show_profile_overlays))
+        show_crop_history_act = None
+        if callable(self._apply_popup_style_callback) and (self._fixed_crop_quick_mode or self._fixed_crop_history):
+            show_crop_history_act = display_menu.addAction("Show Crop Overlays")
+            show_crop_history_act.setCheckable(True)
+            show_crop_history_act.setChecked(bool(self._fixed_crop_history_visible))
+            crop_tip = "Show or hide crop-template overlays in this pop-up only."
+            show_crop_history_act.setToolTip(crop_tip)
+            show_crop_history_act.setStatusTip(crop_tip)
         acq_overlay_act = display_menu.addAction("Show Acquisition HUD")
         acq_overlay_act.setCheckable(True)
         acq_overlay_act.setChecked(bool(self._show_acquisition_overlay))
         hint_act = display_menu.addAction("Show Shortcut Hint")
         hint_act.setCheckable(True)
         hint_act.setChecked(bool(self._show_shortcut_hint))
+        gizmo_act = display_menu.addAction("Show Molecule Gizmo")
+        gizmo_act.setCheckable(True)
+        gizmo_act.setChecked(bool(getattr(self, "_show_molecule_gizmo", False)))
         frame_fill_act = display_menu.addAction("Frame fill")
         frame_fill_act.setCheckable(True)
         frame_fill_act.setChecked(bool(self._frame_fill_mode))
         rel_axes_act = display_menu.addAction("Relative axes")
         rel_axes_act.setCheckable(True)
         rel_axes_act.setChecked(bool(self._use_relative_axes(view)))
+        apply_popup_style_act = None
+        if callable(self._apply_popup_style_callback):
+            display_menu.addSeparator()
+            apply_popup_style_act = display_menu.addAction(self._apply_popup_style_label or "Apply this style to all pop-ups")
+            popup_style_tip = self._apply_popup_style_tooltip or "Copy font size, typography and display layout from this popup to the other open pop-ups"
+            apply_popup_style_act.setToolTip(popup_style_tip)
+            apply_popup_style_act.setStatusTip(popup_style_tip)
 
         layout_menu = display_menu.addMenu("Layout")
         layout_grid_act = layout_menu.addAction("Grid")
@@ -4341,10 +6689,10 @@ class MultiPreviewCanvas(FigureCanvas):
         layout_stack_act.setChecked(self._view_layout == "stacked")
 
         overlays_menu = menu.addMenu("Overlays")
-        show_profile_overlay_act = overlays_menu.addAction("Show Profiles  (Ctrl+1)")
+        show_profile_overlay_act = overlays_menu.addAction("Show Saved Profiles  (Ctrl+1)")
         show_profile_overlay_act.setCheckable(True)
         show_profile_overlay_act.setChecked(bool(self._show_profile_overlays))
-        show_angle_overlay_act = overlays_menu.addAction("Show Angles  (Ctrl+2)")
+        show_angle_overlay_act = overlays_menu.addAction("Show Saved Angles  (Ctrl+2)")
         show_angle_overlay_act.setCheckable(True)
         show_angle_overlay_act.setChecked(bool(self._show_angle_overlays))
         show_molecule_overlay_act = overlays_menu.addAction("Show Molecules  (Ctrl+3)")
@@ -4365,16 +6713,31 @@ class MultiPreviewCanvas(FigureCanvas):
             active = self._get_active_angle_frame()
             angle_style_act.setChecked(active and active.get('style', 'dots') == 'arrows')
 
-        export_menu = menu.addMenu("Copy / Export")
-        copy_act = export_menu.addAction("Copy image")
-        copy_svg_act = export_menu.addAction("Copy view as SVG (vector)")
-        copy_disp_png = export_menu.addAction("Copy displayed (PNG)")
-        copy_disp_svg = export_menu.addAction("Copy displayed (SVG)")
+        copy_menu = menu.addMenu("Copy")
+        copy_disp_png = copy_menu.addAction("Copy displayed as PNG  (Ctrl+C)")
+        copy_disp_svg = copy_menu.addAction("Copy displayed as SVG")
+        copy_menu.addSeparator()
+        copy_act = copy_menu.addAction("Copy data image only (PNG)")
+        copy_svg_act = copy_menu.addAction("Copy data view as SVG (vector)")
+
+        send_ppt_act = menu.addAction("Send to PowerPoint")
+        send_ppt_current_act = menu.addAction("Send to Current Slide")
+        ppt_supported, ppt_reason = powerpoint_support_status()
+        if not ppt_supported:
+            send_ppt_act.setEnabled(False)
+            send_ppt_current_act.setEnabled(False)
+            send_ppt_act.setToolTip(ppt_reason or "")
+            send_ppt_current_act.setToolTip(ppt_reason or "")
+
+        export_menu = menu.addMenu("Save / Export")
+        save_act = export_menu.addAction("Save data image as PNG...")
+        save_svg_act = export_menu.addAction("Save displayed view as SVG...")
+        save_pdf_act = export_menu.addAction("Save displayed view as PDF...")
         export_menu.addSeparator()
-        save_act = export_menu.addAction("Save image as...")
-        save_svg_act = export_menu.addAction("Save view as SVG...")
-        save_pdf_act = export_menu.addAction("Save view as PDF...")
         export_stp_act = export_menu.addAction("Export as WSxM STP...")
+
+        virtual_copy_act = menu.addAction("Create virtual copy in thumbnails")
+        virtual_copy_act.setEnabled(bool(callable(self._virtual_copy_callback) and view.get("arr") is not None))
 
         molecules_menu = menu.addMenu("Molecules")
         load_mol_act = molecules_menu.addAction("Load Molecule (XYZ/PDB)...")
@@ -4393,14 +6756,138 @@ class MultiPreviewCanvas(FigureCanvas):
                 recent_actions[act] = p
         clear_mols_act = molecules_menu.addAction("Clear Molecules")
 
+        cmap_menu = menu.addMenu("Colormap")
+        popup_cmap_apply_all_act = None
+        cmap_actions = {}
+        cmap_group = QtWidgets.QActionGroup(self)
+        cmap_group.setExclusive(True)
+        common_cmaps = [
+            "viridis",
+            "plasma",
+            "inferno",
+            "magma",
+            "cividis",
+            "turbo",
+            "gray",
+            "afmhot",
+            "Blues_r",
+            "RdBu_r",
+            "coolwarm",
+        ]
+        try:
+            available_cmaps = sorted(str(name) for name in matplotlib.colormaps.keys())
+        except Exception:
+            available_cmaps = list(common_cmaps)
+        seen_cmaps = []
+        for cmap_name in common_cmaps + available_cmaps:
+            if cmap_name not in seen_cmaps:
+                seen_cmaps.append(cmap_name)
+        current_cmap = str((view or {}).get("cmap") or "viridis")
+        more_cmaps_menu = None
+        for idx, cmap_name in enumerate(seen_cmaps):
+            parent_menu = cmap_menu if idx < 12 else more_cmaps_menu
+            if parent_menu is None:
+                more_cmaps_menu = cmap_menu.addMenu("More...")
+                parent_menu = more_cmaps_menu
+            act = parent_menu.addAction(cmap_name)
+            act.setCheckable(True)
+            act.setChecked(cmap_name == current_cmap)
+            try:
+                act.setIcon(_colormap_icon(cmap_name, width=96, height=14))
+            except Exception:
+                pass
+            cmap_group.addAction(act)
+            cmap_actions[act] = cmap_name
+        if callable(self._apply_popup_style_callback):
+            cmap_menu.addSeparator()
+            popup_cmap_apply_all_act = cmap_menu.addAction("Apply this colormap to all pop-ups")
+
+        collection_add_act = None
+        collection_remove_act = None
+        collection_help_act = None
+        if callable(self._collection_menu_callback) and view is not None:
+            collection_menu = menu.addMenu("Collection")
+            collection_add_act = collection_menu.addAction("Add This View to Collection...")
+            collection_add_act.setToolTip("Save this view into a curated cross-folder collection.")
+            collection_remove_act = collection_menu.addAction("Remove This View from Collection")
+            collection_remove_act.setToolTip("Remove the matching item from the current collection file.")
+            if callable(self._collection_help_callback):
+                collection_menu.addSeparator()
+                collection_help_act = collection_menu.addAction("How Collections Work")
+
+        source_meta = dict((view or {}).get("meta") or {})
+        source_path = str((view or {}).get("path") or source_meta.get("path") or source_meta.get("file_path") or "").strip()
+        add_source_file_menu(menu, source_path, self)
+
+        compare_set_a_act = None
+        compare_set_b_act = None
+        compare_with_a_act = None
+        compare_with_b_act = None
+        compare_open_act = None
+        compare_swap_act = None
+        compare_clear_act = None
+        if callable(self._compare_menu_callback) and view is not None:
+            compare_state = {}
+            if callable(self._compare_menu_state_callback):
+                try:
+                    compare_state = dict(self._compare_menu_state_callback() or {})
+                except Exception:
+                    compare_state = {}
+            compare_menu = menu.addMenu("Compare")
+            label_a = str(compare_state.get("label_a") or "Empty")
+            label_b = str(compare_state.get("label_b") or "Empty")
+            compare_menu.setToolTip(f"A: {label_a}\nB: {label_b}")
+            compare_set_a_act = compare_menu.addAction("Set This View as Compare A")
+            compare_set_a_act.setToolTip(f"Current A: {label_a}")
+            compare_set_b_act = compare_menu.addAction("Set This View as Compare B")
+            compare_set_b_act.setToolTip(f"Current B: {label_b}")
+            compare_menu.addSeparator()
+            compare_with_a_act = compare_menu.addAction("Compare A with This")
+            compare_with_a_act.setEnabled(bool(compare_state.get("has_a")))
+            compare_with_b_act = compare_menu.addAction("Compare B with This")
+            compare_with_b_act.setEnabled(bool(compare_state.get("has_b")))
+            compare_open_act = compare_menu.addAction("Open A/B Comparison")
+            compare_open_act.setEnabled(bool(compare_state.get("has_a")) and bool(compare_state.get("has_b")))
+            compare_swap_act = compare_menu.addAction("Swap A and B")
+            compare_swap_act.setEnabled(bool(compare_state.get("has_a")) and bool(compare_state.get("has_b")))
+            compare_clear_act = compare_menu.addAction("Clear Compare Selection")
+            compare_clear_act.setEnabled(bool(compare_state.get("has_a")) or bool(compare_state.get("has_b")))
+
         view_menu = menu.addMenu("View")
         reset_zoom_act = view_menu.addAction("Reset Zoom")
-        cbar_text = "Horizontal Colorbar" if self._colorbar_orientation == 'vertical' else "Vertical Colorbar"
-        toggle_cbar_act = view_menu.addAction(cbar_text)
         arrange_act = None
+        minimize_act = None
+        restore_act = None
+        close_all_act = None
+        window_actions_added = False
         if callable(self._arrange_windows_callback):
             view_menu.addSeparator()
+            window_actions_added = True
             arrange_act = view_menu.addAction("Arrange pop-outs")
+        if callable(self._minimize_windows_callback):
+            if not window_actions_added:
+                view_menu.addSeparator()
+                window_actions_added = True
+            minimize_act = view_menu.addAction("Minimize pop-outs")
+        if callable(self._restore_windows_callback):
+            if not window_actions_added:
+                view_menu.addSeparator()
+                window_actions_added = True
+            restore_act = view_menu.addAction("Bring pop-outs to front")
+        if callable(self._close_windows_callback):
+            if not window_actions_added:
+                view_menu.addSeparator()
+                window_actions_added = True
+            close_all_act = view_menu.addAction("Close all pop-outs")
+
+        add_font_menu_action(
+            menu,
+            self,
+            self._font_family,
+            self._apply_plot_font_family_choice,
+            current_style=self._plot_style_state(),
+            apply_style_callback=self.set_plot_typography,
+        )
 
         global_pos = None
         if event is not None:
@@ -4422,6 +6909,10 @@ class MultiPreviewCanvas(FigureCanvas):
             self._copy_displayed("png")
         elif chosen == copy_disp_svg:
             self._copy_displayed("svg")
+        elif chosen == send_ppt_act:
+            self._send_displayed_to_powerpoint(view, new_slide=True)
+        elif chosen == send_ppt_current_act:
+            self._send_displayed_to_powerpoint(view, new_slide=False)
         elif chosen == save_act:
             self._save_view_to_file(view)
         elif chosen == save_svg_act:
@@ -4434,16 +6925,38 @@ class MultiPreviewCanvas(FigureCanvas):
                     self._stp_export_callback(view)
                 except Exception:
                     pass
+        elif chosen == virtual_copy_act:
+            if callable(self._virtual_copy_callback):
+                try:
+                    self._virtual_copy_callback(view)
+                except Exception:
+                    pass
         elif chosen == reset_zoom_act:
             self._reset_view_zoom()
-        elif chosen == toggle_cbar_act:
-            self._toggle_colorbar_orientation()
+        elif chosen in (cbar_vert_act, cbar_horiz_act):
+            self._set_colorbar_orientation('vertical' if chosen == cbar_vert_act else 'horizontal')
         elif chosen == profile_tool_act:
             self.set_profile_tool_enabled(profile_tool_act.isChecked())
         elif chosen == angle_tool_act:
             self.set_angle_tool_enabled(angle_tool_act.isChecked())
+        elif chosen == edit_crop_frame_act:
+            self.enable_fixed_crop_transform_mode(edit_crop_frame_act.isChecked())
+        elif chosen == apply_crop_frame_act:
+            self._on_apply_fixed_crop_shortcut()
+        elif chosen == exit_crop_frame_act:
+            self.enable_fixed_crop_transform_mode(False)
         elif chosen == clear_overlays_act:
             self.clear_measurement_overlays()
+        elif chosen == auto_hist_act and callable(self._histogram_auto_callback):
+            try:
+                self._histogram_auto_callback(self)
+            except Exception:
+                pass
+        elif chosen == reset_hist_act and callable(self._histogram_reset_callback):
+            try:
+                self._histogram_reset_callback(self)
+            except Exception:
+                pass
         elif chosen == histogram_act and callable(self._histogram_dialog_callback):
             try:
                 self._histogram_dialog_callback(self)
@@ -4462,17 +6975,33 @@ class MultiPreviewCanvas(FigureCanvas):
             self._toggle_ticks()
         elif chosen == show_cbar_act:
             self._toggle_colorbar()
+        elif rel_zero_act and chosen == rel_zero_act:
+            try:
+                self._display_relative_zero_menu_callback(rel_zero_act.isChecked())
+            except Exception:
+                pass
         elif chosen == show_title_act:
             self.set_show_title(show_title_act.isChecked())
+        elif chosen == show_profiles_act:
+            self.set_show_profile_overlays(show_profiles_act.isChecked())
+        elif show_crop_history_act and chosen == show_crop_history_act:
+            self.show_fixed_crop_history(show_crop_history_act.isChecked())
         elif chosen == acq_overlay_act:
             self.set_show_acquisition_overlay(acq_overlay_act.isChecked())
         elif chosen == hint_act:
             self.set_show_shortcut_hint(hint_act.isChecked())
+        elif chosen == gizmo_act:
+            self.set_show_molecule_gizmo(gizmo_act.isChecked())
         elif chosen == frame_fill_act:
             self.set_frame_fill_mode(frame_fill_act.isChecked())
             self._notify_views_callback()
         elif chosen == rel_axes_act:
             self.set_relative_axes_override(rel_axes_act.isChecked())
+        elif apply_popup_style_act and chosen == apply_popup_style_act:
+            try:
+                self._apply_popup_style_callback()
+            except Exception:
+                pass
         elif chosen == layout_grid_act:
             self.set_view_layout("grid")
         elif chosen == layout_stack_act:
@@ -4489,9 +7018,84 @@ class MultiPreviewCanvas(FigureCanvas):
             self.add_molecule(recent_actions[chosen])
         elif chosen == clear_mols_act:
             self._clear_molecules()
+        elif chosen in cmap_actions:
+            try:
+                self.apply_view_colormap(cmap_actions[chosen], target_view=view, notify=True)
+            except Exception:
+                pass
+        elif popup_cmap_apply_all_act and chosen == popup_cmap_apply_all_act:
+            try:
+                self._apply_popup_style_callback()
+            except Exception:
+                pass
+        elif collection_add_act and chosen == collection_add_act:
+            try:
+                self._collection_menu_callback("collection_add", view, self)
+            except Exception:
+                pass
+        elif collection_remove_act and chosen == collection_remove_act:
+            try:
+                self._collection_menu_callback("collection_remove", view, self)
+            except Exception:
+                pass
+        elif collection_help_act and chosen == collection_help_act:
+            try:
+                self._collection_help_callback()
+            except Exception:
+                pass
+        elif compare_set_a_act and chosen == compare_set_a_act:
+            try:
+                self._compare_menu_callback("set_a", view, self)
+            except Exception:
+                pass
+        elif compare_set_b_act and chosen == compare_set_b_act:
+            try:
+                self._compare_menu_callback("set_b", view, self)
+            except Exception:
+                pass
+        elif compare_with_a_act and chosen == compare_with_a_act:
+            try:
+                self._compare_menu_callback("compare_with_a", view, self)
+            except Exception:
+                pass
+        elif compare_with_b_act and chosen == compare_with_b_act:
+            try:
+                self._compare_menu_callback("compare_with_b", view, self)
+            except Exception:
+                pass
+        elif compare_open_act and chosen == compare_open_act:
+            try:
+                self._compare_menu_callback("open_compare", view, self)
+            except Exception:
+                pass
+        elif compare_swap_act and chosen == compare_swap_act:
+            try:
+                self._compare_menu_callback("swap_compare", view, self)
+            except Exception:
+                pass
+        elif compare_clear_act and chosen == compare_clear_act:
+            try:
+                self._compare_menu_callback("clear_compare", view, self)
+            except Exception:
+                pass
         elif arrange_act and chosen == arrange_act:
             try:
                 self._arrange_windows_callback()
+            except Exception:
+                pass
+        elif minimize_act and chosen == minimize_act:
+            try:
+                self._minimize_windows_callback()
+            except Exception:
+                pass
+        elif restore_act and chosen == restore_act:
+            try:
+                self._restore_windows_callback()
+            except Exception:
+                pass
+        elif close_all_act and chosen == close_all_act:
+            try:
+                self._close_windows_callback()
             except Exception:
                 pass
         elif angle_style_act and chosen == angle_style_act:
@@ -4520,16 +7124,23 @@ class MultiPreviewCanvas(FigureCanvas):
     def _copy_displayed(self, fmt='png'):
         """Copy the current figure exactly as displayed (including overlays)."""
         buf = io.BytesIO()
+        def _save_without_hint():
+            if fmt == 'svg':
+                with matplotlib.rc_context({'svg.fonttype': 'none'}):
+                    self.fig.savefig(buf, format='svg', bbox_inches='tight')
+            else:
+                self.fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
         if fmt == 'svg':
-            with matplotlib.rc_context({'svg.fonttype': 'none'}):
-                self.fig.savefig(buf, format='svg', bbox_inches='tight')
+            self._save_current_figure_without_shortcut_hint(_save_without_hint)
             mime = QtCore.QMimeData()
             mime.setData("image/svg+xml", buf.getvalue())
             QtWidgets.QApplication.clipboard().setMimeData(mime)
+            self._notify_copy_feedback(fmt="svg", displayed=True)
         else:
-            self.fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+            self._save_current_figure_without_shortcut_hint(_save_without_hint)
             qimg = QtGui.QImage.fromData(buf.getvalue())
             QtWidgets.QApplication.clipboard().setImage(qimg)
+            self._notify_copy_feedback(fmt="png", displayed=True)
 
     def _copy_view_as_svg(self, view):
         try:
@@ -4544,8 +7155,7 @@ class MultiPreviewCanvas(FigureCanvas):
             mime = QtCore.QMimeData()
             mime.setData("image/svg+xml", svg_bytes)
             QtWidgets.QApplication.clipboard().setMimeData(mime)
-            if callable(self._copy_feedback_handler):
-                self._copy_feedback_handler(view)
+            self._notify_copy_feedback(view, fmt="svg", displayed=False)
         except Exception:
             pass
         finally:
@@ -4597,19 +7207,31 @@ class MultiPreviewCanvas(FigureCanvas):
             except Exception:
                 continue
         if did:
+            self._refresh_scale_bars()
             self.draw_idle()
 
     def _toggle_colorbar_orientation(self):
-        self._colorbar_orientation = 'horizontal' if self._colorbar_orientation == 'vertical' else 'vertical'
+        self._set_colorbar_orientation('horizontal' if self._colorbar_orientation == 'vertical' else 'vertical')
+
+    def _set_colorbar_orientation(self, orientation):
+        orientation = str(orientation or 'vertical').strip().lower()
+        if orientation not in ('vertical', 'horizontal'):
+            orientation = 'vertical'
+        if self._colorbar_orientation == orientation:
+            return
+        self.push_undo_state("colorbar_orientation")
+        self._colorbar_orientation = orientation
         self._redraw()
         self._notify_views_callback()
 
     def _toggle_ticks(self):
+        self.push_undo_state("show_ticks")
         self._show_ticks = not self._show_ticks
         self._redraw()
         self._notify_views_callback()
 
     def _toggle_colorbar(self):
+        self.push_undo_state("show_colorbar")
         self._show_colorbar = not self._show_colorbar
         self._redraw()
         self._notify_views_callback()
@@ -4648,6 +7270,7 @@ class MultiPreviewCanvas(FigureCanvas):
         new_ylim = self._clamp_limits(new_ylim, base_ylim)
         ax.set_xlim(new_xlim)
         ax.set_ylim(new_ylim)
+        self._refresh_scale_bars(ax=ax)
         self.draw_idle()
 
     def _clamp_limits(self, new_lim, base_lim):
@@ -4767,6 +7390,7 @@ class MultiPreviewCanvas(FigureCanvas):
                     pass
             updated = True
         if updated:
+            self._refresh_scale_bars()
             self.draw_idle()
 
     def _display_extent_for_view(self, view, extent):
@@ -4864,8 +7488,11 @@ class MultiPreviewCanvas(FigureCanvas):
         title = view.get('title', '')
         if title and self._show_title:
             ax.set_title(title, fontsize=9)
+            apply_text_style(ax.title, family=self._font_family, **self._plot_style_state())
         self._draw_acquisition_overlay(ax, view)
         ax.tick_params(labelsize=8)
+        for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+            apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
 
         if self.scale_bar_enabled:
             extent_for_scale = display_extent if display_extent is not None else raw_extent
@@ -4901,6 +7528,8 @@ class MultiPreviewCanvas(FigureCanvas):
             text.set_fontsize(10 * font_scale)
             text.set_fontweight('bold')
             ax.add_artist(sb)
+
+        self._draw_image_size_overlay(ax, view)
 
         if not self._show_ticks:
             ax.set_xticks([])
@@ -4997,6 +7626,9 @@ class MultiPreviewCanvas(FigureCanvas):
                     if not self._show_ticks:
                         cbar.set_ticks([])
                     cbar.outline.set_edgecolor(text_color)
+                    apply_text_style(cbar.ax.yaxis.label, family=self._font_family, **self._plot_style_state())
+                    for lbl in list(cbar.ax.get_xticklabels()) + list(cbar.ax.get_yticklabels()):
+                        apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
                 except Exception:
                     pass
             try:
@@ -5006,7 +7638,11 @@ class MultiPreviewCanvas(FigureCanvas):
             title = view.get('title', '') or view.get('label', '')
             if title and self._show_title:
                 ax.set_title(title, fontsize=9 * font_scale, color=text_color)
+                apply_text_style(ax.title, family=self._font_family, **self._plot_style_state())
             self._draw_acquisition_overlay(ax, view)
+            self._draw_image_size_overlay(ax, view)
+            for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+                apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
         fig.tight_layout()
         return fig
 
@@ -5047,7 +7683,7 @@ class MultiPreviewCanvas(FigureCanvas):
             return
         scale = max(0.6, min(2.5, getattr(self, "_view_font_scale", 1.0)))
         fontsize = max(7.0, 8.5 * scale)
-        ax.text(
+        text_artist = ax.text(
             0.985,
             0.985,
             text,
@@ -5065,14 +7701,100 @@ class MultiPreviewCanvas(FigureCanvas):
             },
             zorder=26,
         )
+        try:
+            apply_text_style(text_artist, family=self._font_family, **self._plot_style_state())
+        except Exception:
+            pass
+
+    def _image_size_overlay_text(self, view):
+        if not getattr(self, "_show_image_size_overlay", False) or not view:
+            return ""
+        extent = view.get("extent_raw")
+        if extent is None:
+            extent = view.get("extent")
+        width = None
+        height = None
+        unit = str(view.get("axis_unit") or "").strip()
+        if extent is not None:
+            try:
+                x0, x1, y1, y0 = extent
+                width = abs(float(x1) - float(x0))
+                height = abs(float(y0) - float(y1))
+            except Exception:
+                width = None
+                height = None
+        if width is None or height is None:
+            try:
+                arr = np.asarray(view.get("arr"))
+                if arr.ndim >= 2:
+                    height = float(arr.shape[0])
+                    width = float(arr.shape[1])
+                    unit = "px"
+            except Exception:
+                return ""
+        if width is None or height is None:
+            return ""
+        if not unit:
+            unit = "px" if view.get("extent") is None and view.get("extent_raw") is None else "nm"
+
+        def _fmt(value):
+            value = float(value)
+            if unit == "px":
+                return str(int(round(value)))
+            if abs(value - round(value)) < 1e-6:
+                return str(int(round(value)))
+            if abs(value) >= 100:
+                return f"{value:.0f}"
+            if abs(value) >= 10:
+                return f"{value:.1f}".rstrip("0").rstrip(".")
+            return f"{value:.3g}"
+
+        return f"{_fmt(width)} x {_fmt(height)} {unit}".strip()
+
+    def _draw_image_size_overlay(self, ax, view):
+        if ax is None:
+            return
+        text = self._image_size_overlay_text(view)
+        if not text:
+            return
+        scale = max(0.6, min(2.5, getattr(self, "_view_font_scale", 1.0)))
+        fontsize = max(7.0, 8.2 * scale)
+        y_pos = 0.16 if self.scale_bar_enabled else 0.02
+        text_artist = ax.text(
+            0.985,
+            y_pos,
+            text,
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=fontsize,
+            fontweight="semibold",
+            color="#f5f7fb",
+            bbox={
+                "facecolor": "black",
+                "alpha": 0.35,
+                "edgecolor": "none",
+                "boxstyle": "round,pad=0.2",
+            },
+            zorder=21,
+        )
+        try:
+            apply_text_style(text_artist, family=self._font_family, **self._plot_style_state())
+        except Exception:
+            pass
 
     def _draw_shortcut_hint(self, ax):
         if not self._show_shortcut_hint or ax is None:
             return
+        self._clear_shortcut_hint_artist()
         scale = max(0.6, min(2.5, getattr(self, "_view_font_scale", 1.0)))
         fontsize = max(6.5, 7.0 * scale)
-        hint = "Ctrl+Click profile | Ctrl+Alt+Click angle | Ctrl+1/2/3 overlays"
-        ax.text(
+        hint = (
+            "Ctrl+Click profile | Ctrl+Alt+Click angle | A auto contrast | 0 rel-zero | "
+            "click molecule then X/Y/Z rotate, Shift+X/Y/Z reverse | Shift+drag mol = Z rotate | "
+            "Ctrl+Shift+drag or middle-drag mol = 3D rotate | Ctrl+1/2/3 saved overlays | click to hide"
+        )
+        hint_artist = ax.text(
             0.012,
             0.012,
             hint,
@@ -5089,6 +7811,35 @@ class MultiPreviewCanvas(FigureCanvas):
             },
             zorder=24,
         )
+        try:
+            hint_artist.set_gid("ui_shortcut_hint")
+            self._shortcut_hint_artist = hint_artist
+            apply_text_style(hint_artist, family=self._font_family, **self._plot_style_state())
+        except Exception:
+            pass
+
+    def _set_shortcut_hint_artist_visibility(self, visible: bool):
+        art = getattr(self, "_shortcut_hint_artist", None)
+        if art is None:
+            return False
+        try:
+            art.set_visible(bool(visible))
+            return True
+        except Exception:
+            return False
+
+    def _save_current_figure_without_shortcut_hint(self, save_fn):
+        if not callable(save_fn):
+            return
+        changed = False
+        if getattr(self, "_show_shortcut_hint", False):
+            changed = self._set_shortcut_hint_artist_visibility(False)
+        try:
+            save_fn()
+        finally:
+            if changed:
+                self._set_shortcut_hint_artist_visibility(True)
+                self.draw_idle()
 
     def _style_export_figure(self, fig, ax, cbar):
         dark = bool(self._detail_dark)
@@ -5130,6 +7881,11 @@ class MultiPreviewCanvas(FigureCanvas):
             ax.xaxis.label.set_fontsize(label_size)
             ax.yaxis.label.set_fontsize(label_size)
             ax.title.set_fontsize(title_size)
+            apply_text_style(ax.xaxis.label, family=self._font_family, **self._plot_style_state())
+            apply_text_style(ax.yaxis.label, family=self._font_family, **self._plot_style_state())
+            apply_text_style(ax.title, family=self._font_family, **self._plot_style_state())
+            for lbl in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+                apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
         except Exception:
             pass
         if cbar is not None:    
@@ -5137,6 +7893,10 @@ class MultiPreviewCanvas(FigureCanvas):
                 cbar.ax.tick_params(labelsize=tick_size)
                 cbar.ax.yaxis.label.set_fontsize(label_size)
                 cbar.ax.xaxis.label.set_fontsize(label_size)
+                apply_text_style(cbar.ax.yaxis.label, family=self._font_family, **self._plot_style_state())
+                apply_text_style(cbar.ax.xaxis.label, family=self._font_family, **self._plot_style_state())
+                for lbl in list(cbar.ax.get_xticklabels()) + list(cbar.ax.get_yticklabels()):
+                    apply_text_style(lbl, family=self._font_family, **self._plot_style_state())
             except Exception:
                 pass
 
@@ -5171,6 +7931,7 @@ class MultiPreviewCanvas(FigureCanvas):
         key = self._outline_key(view)
         if key is None:
             return
+        self.push_undo_state("add_outline")
         entries = self._outlines.setdefault(key, [])
         for contour in contours_world:
             entry = {
@@ -5220,6 +7981,15 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def clear_outlines(self, view=None):
         """Clear stored outlines for all views or a specific view."""
+        if view is None:
+            has_outlines = bool(self._outlines)
+        else:
+            try:
+                has_outlines = bool(self._outlines.get(self._outline_key(view)))
+            except Exception:
+                has_outlines = False
+        if has_outlines:
+            self.push_undo_state("clear_outlines")
         if view is None:
             self._outlines.clear()
             self._outline_order.clear()
@@ -5342,6 +8112,8 @@ class MultiPreviewCanvas(FigureCanvas):
         """Apply style settings to all outlines of a view."""
         key = self._outline_key(view)
         entries = self._outlines.get(key, [])
+        if entries:
+            self.push_undo_state("outline_style")
         new_entries = []
         for e in entries:
             if isinstance(e, dict):
@@ -5537,7 +8309,7 @@ class MultiPreviewCanvas(FigureCanvas):
         arr = np.asarray(view.get("arr"))
         if arr.size == 0:
             return
-        flip = bool(view.get("relative_axes"))
+        flip = self._use_relative_axes(view)
         arr_disp = np.flipud(arr) if flip else arr
         h, w = arr_disp.shape[:2]
         xmin, xmax = ax.get_xlim()
@@ -5601,12 +8373,23 @@ class MultiPreviewCanvas(FigureCanvas):
             mime.setImageData(qimg)
             try:
                 meta = view.get('meta') or {}
+                channel_idx = view.get('channel_idx', meta.get('channel_index'))
+                if channel_idx is not None:
+                    try:
+                        channel_idx = int(channel_idx)
+                    except Exception:
+                        channel_idx = None
+                drag_token = self._stash_drag_view_snapshot(view)
                 payload = {
-                    'file_path': meta.get('file_path'),
-                    'channel_index': meta.get('channel_index'),
+                    'file_path': view.get('path') or meta.get('path') or meta.get('file_path'),
+                    'channel_index': channel_idx,
                     'cmap': view.get('cmap'),
+                    'drag_origin': 'preview_canvas',
+                    'view_drag_token': drag_token,
                 }
                 if payload.get('file_path') is not None and payload.get('channel_index') is not None:
+                    mime.setData('application/x-sxm-view', json.dumps(payload).encode('utf-8'))
+                elif drag_token:
                     mime.setData('application/x-sxm-view', json.dumps(payload).encode('utf-8'))
             except Exception:
                 pass
@@ -5638,6 +8421,32 @@ class MultiPreviewCanvas(FigureCanvas):
         super().mouseReleaseEvent(event)
 
     def _on_motion_value(self, event):
+        if self._fixed_crop_transform_mode:
+            ax = event.inaxes if event is not None else None
+            view = self._ax_view_map.get(ax) if ax is not None else None
+            if self._fixed_crop_template_drag is not None:
+                try:
+                    if self._update_fixed_crop_template_drag(event):
+                        mode = (self._fixed_crop_template_drag or {}).get("mode")
+                        self._set_fixed_crop_cursor(mode=mode, dragging=True)
+                        now_ms = time.perf_counter() * 1000.0
+                        if (now_ms - float(self._fixed_crop_drag_last_ts or 0.0)) >= float(self._fixed_crop_drag_throttle_ms or 12.0):
+                            self._fixed_crop_drag_last_ts = now_ms
+                            drag_ax = (self._fixed_crop_template_drag or {}).get("ax") or ax
+                            drag_view = self._ax_view_map.get(drag_ax) if drag_ax is not None else view
+                            self._refresh_fixed_crop_overlay_fast(drag_ax, drag_view, dragging=True)
+                        return
+                except Exception:
+                    pass
+            else:
+                mode = None
+                if ax is not None and view is not None and event is not None and event.xdata is not None and event.ydata is not None:
+                    hit = self._fixed_crop_template_handle_hit(event, view, ax)
+                    if hit is not None:
+                        mode = hit.get("mode")
+                        if mode == "move" and bool(self._event_qt_modifiers(event) & QtCore.Qt.ControlModifier):
+                            mode = "rotate"
+                self._set_fixed_crop_cursor(mode=mode, dragging=False)
         if self._outline_rect is not None and self._outline_start is not None and event.inaxes is self._outline_ax:
             try:
                 x0, y0 = self._outline_start
@@ -5696,6 +8505,20 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def _on_crop_release(self, event):
         """Finish a crop drag and emit a cropped view copy."""
+        if self._fixed_crop_template_drag is not None:
+            drag_ax = (self._fixed_crop_template_drag or {}).get("ax")
+            try:
+                self._update_fixed_crop_template_drag(event)
+            except Exception:
+                pass
+            self._finish_fixed_crop_template_drag()
+            self._fixed_crop_drag_last_ts = 0.0
+            drag_view = self._ax_view_map.get(drag_ax) if drag_ax is not None else None
+            if drag_ax is not None and drag_view is not None:
+                self._refresh_fixed_crop_overlay_fast(drag_ax, drag_view, dragging=False)
+            else:
+                self._redraw()
+            return
         if self._outline_start is not None and self._outline_ax is not None:
             self._finish_outline_drag(event)
             return
@@ -5731,7 +8554,7 @@ class MultiPreviewCanvas(FigureCanvas):
         if arr.size == 0:
             self._reset_crop_state()
             return
-        flip = bool(view.get("relative_axes"))
+        flip = self._use_relative_axes(view)
         arr_disp = np.flipud(arr) if flip else arr
         h, w = arr_disp.shape[:2]
         xlim0, xlim1 = self._crop_ax.get_xlim()
@@ -5746,14 +8569,10 @@ class MultiPreviewCanvas(FigureCanvas):
         if xlim0 == xlim1 or ylim0 == ylim1:
             self._reset_crop_state()
             return
-        def _map_x(x):
-            frac = (x - xlim0) / (xlim1 - xlim0)
-            return int(np.clip(round(frac * (w - 1)), 0, w - 1))
-        def _map_y(y):
-            frac = (y - ylim0) / (ylim1 - ylim0)
-            return int(np.clip(round(frac * (h - 1)), 0, h - 1))
-        c0, c1 = _map_x(x0c), _map_x(x1c)
-        r0, r1 = _map_y(y0c), _map_y(y1c)
+        c0 = self._axis_coord_to_pixel(view, x0c, w, 'x', ax=self._crop_ax)
+        c1 = self._axis_coord_to_pixel(view, x1c, w, 'x', ax=self._crop_ax)
+        r0 = self._axis_coord_to_pixel(view, y0c, h, 'y', ax=self._crop_ax)
+        r1 = self._axis_coord_to_pixel(view, y1c, h, 'y', ax=self._crop_ax)
         if c1 < c0:
             c0, c1 = c1, c0
         if r1 < r0:
@@ -5764,22 +8583,8 @@ class MultiPreviewCanvas(FigureCanvas):
             return
         cropped_arr = np.flipud(cropped_disp) if flip else cropped_disp
         # Build new extent in data coordinates, preserving orientation
-        ext = view.get("extent")
-        if ext is None:
-            crop_extent = None
-        else:
-            x_extent0, x_extent1, y_extent1, y_extent0 = ext
-            def _lerp_x(idx):
-                return x_extent0 + (x_extent1 - x_extent0) * (idx / (w - 1))
-            def _lerp_y(idx):
-                return y_extent0 + (y_extent1 - y_extent0) * (idx / (h - 1))
-            crop_extent = (
-                _lerp_x(c0),
-                _lerp_x(c1),
-                _lerp_y(r1),  # note: extent ordering is (x0, x1, y1, y0)
-                _lerp_y(r0),
-            )
-        bounds_data = self._pixel_bounds_to_axis_bounds(self._crop_ax, w, h, c0, c1, r0, r1)
+        crop_extent = self._compute_crop_extent(view, w, h, c0, c1, r0, r1)
+        bounds_data = crop_extent if crop_extent is not None else self._pixel_bounds_to_axis_bounds(view, self._crop_ax, w, h, c0, c1, r0, r1)
         entry = self._register_crop_entry(view, bounds_data, (c0, c1, r0, r1), self._crop_square, update_size=True)
         new_view = dict(view)
         try:
@@ -5827,12 +8632,87 @@ class MultiPreviewCanvas(FigureCanvas):
     def enable_fixed_crop_quick_mode(self, enabled: bool):
         self._fixed_crop_quick_mode = bool(enabled)
 
+    def enable_fixed_crop_transform_mode(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._fixed_crop_transform_mode:
+            return
+        self._fixed_crop_transform_mode = enabled
+        if enabled:
+            self._fixed_crop_template_visible = True
+            self._ensure_fixed_crop_template_for_transform()
+            try:
+                self.setFocus(QtCore.Qt.OtherFocusReason)
+            except Exception:
+                pass
+        else:
+            self._fixed_crop_template_drag = None
+            self._fixed_crop_drag_last_ts = 0.0
+            self._fixed_crop_template_visible = False
+            self._set_fixed_crop_cursor(mode=None, dragging=False)
+        self._notify_views_callback()
+        self._redraw()
+
+    def _fixed_crop_target_view(self, prefer_view=None, prefer_ax=None):
+        if prefer_view is not None and prefer_ax is not None:
+            return prefer_view, prefer_ax
+        key = self._fixed_crop_template_view_key
+        if key is not None:
+            for ax, view in self._ax_view_map.items():
+                if self._outline_key(view) == key:
+                    return view, ax
+        ax = self.main_ax or next(iter(self._ax_view_map.keys()), None)
+        if ax is None:
+            return None, None
+        return self._ax_view_map.get(ax), ax
+
+    def _ensure_fixed_crop_template_for_transform(self):
+        if self._fixed_crop_template and self._fixed_crop_template.get("pixel_bounds"):
+            return True
+        ax = self.main_ax or next(iter(self._ax_view_map.keys()), None)
+        view = self._ax_view_map.get(ax) if ax is not None else None
+        if view is None or ax is None:
+            return False
+        arr_obj = view.get("arr")
+        if arr_obj is None:
+            return False
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return False
+        h, w = arr.shape[:2]
+        seed_w = max(8, int(round(w * 0.45)))
+        seed_h = max(8, int(round(h * 0.45)))
+        template = self._compute_template_bounds_from_pixels(view, ax, seed_w, seed_h)
+        if not template:
+            return False
+        bounds_data, pixel_bounds = template
+        self._fixed_crop_template = {
+            "width": int(abs(pixel_bounds[1] - pixel_bounds[0]) + 1),
+            "height": int(abs(pixel_bounds[3] - pixel_bounds[2]) + 1),
+            "square": False,
+            "rotate": 0.0,
+            "pixel_bounds": tuple(pixel_bounds),
+        }
+        self._fixed_crop_template_bounds = bounds_data
+        self._fixed_crop_template_pixel_bounds = tuple(pixel_bounds)
+        self._fixed_crop_template_view_key = self._outline_key(view)
+        return True
+
     def show_fixed_crop_template(self, visible: bool):
-        self._fixed_crop_template_visible = bool(visible)
+        visible = bool(visible)
+        if visible == self._fixed_crop_template_visible:
+            if visible:
+                self._ensure_fixed_crop_template_for_transform()
+            return
+        self._fixed_crop_template_visible = visible
+        if self._fixed_crop_template_visible:
+            self._ensure_fixed_crop_template_for_transform()
         self._redraw()
 
     def show_fixed_crop_history(self, visible: bool):
-        self._fixed_crop_history_visible = bool(visible)
+        visible = bool(visible)
+        if visible == self._fixed_crop_history_visible:
+            return
+        self._fixed_crop_history_visible = visible
         self._redraw()
 
     def is_fixed_crop_history_visible(self):
@@ -5855,10 +8735,51 @@ class MultiPreviewCanvas(FigureCanvas):
                     pass
         self._fixed_crop_history_highlight_artists.clear()
 
+    def _history_entry_geometry(self, entry):
+        if not entry:
+            return None
+        data_bounds = entry.get("data_bounds")
+        if not data_bounds:
+            return None
+        x0, x1, y0, y1 = data_bounds
+        left, right = min(x0, x1), max(x0, x1)
+        bottom, top = min(y0, y1), max(y0, y1)
+        width = right - left
+        height = top - bottom
+        if width <= 0 or height <= 0:
+            return None
+        angle = float(entry.get("rotate", 0.0) or 0.0)
+        cx = (left + right) * 0.5
+        cy = (bottom + top) * 0.5
+        corners_local = np.array(
+            [
+                [left, bottom],
+                [right, bottom],
+                [right, top],
+                [left, top],
+            ],
+            dtype=float,
+        )
+        if abs(angle) > 1e-9:
+            rot = Affine2D().rotate_deg_around(cx, cy, angle)
+            corners = rot.transform(corners_local)
+            label_anchor = rot.transform((left + (width * 0.02), top - (height * 0.02)))
+        else:
+            corners = corners_local
+            label_anchor = np.array([left + (width * 0.02), top - (height * 0.02)], dtype=float)
+        return {
+            "left": float(left),
+            "right": float(right),
+            "bottom": float(bottom),
+            "top": float(top),
+            "width": float(width),
+            "height": float(height),
+            "angle": float(angle),
+            "corners": corners,
+            "label_anchor": label_anchor,
+        }
+
     def _update_highlight_artists(self):
-        if self._fixed_crop_history_visible:
-            self._cleanup_highlight_artists()
-            return
         seq = self._fixed_crop_history_highlight_seq
         if seq is None:
             self._cleanup_highlight_artists()
@@ -5870,43 +8791,34 @@ class MultiPreviewCanvas(FigureCanvas):
                 continue
             entry = next(
                 (entry for entry in self._fixed_crop_history
-                 if entry.get("key") == key and entry.get("sequence") == seq),
+                 if entry.get("key") == key and entry.get("sequence") == seq and bool(entry.get("visible", True))),
                 None,
             )
             if entry is None:
                 continue
-            active_keys.add(key)
-            x0, x1, y0, y1 = entry.get("data_bounds") or (0, 0, 0, 0)
-            left, right = min(x0, x1), max(x0, x1)
-            bottom, top = min(y0, y1), max(y0, y1)
-            width = right - left
-            height = top - bottom
-            if width <= 0 or height <= 0:
+            geom = self._history_entry_geometry(entry)
+            if geom is None:
                 continue
+            active_keys.add(key)
+            corners = geom["corners"]
             artists = self._fixed_crop_history_highlight_artists.get(key)
             if artists:
                 fill, outline = artists
-                fill.set_xy((left, bottom))
-                fill.set_width(width)
-                fill.set_height(height)
-                outline.set_xy((left, bottom))
-                outline.set_width(width)
-                outline.set_height(height)
+                fill.set_xy(corners)
+                outline.set_xy(corners)
             else:
-                fill = patches.Rectangle(
-                    (left, bottom),
-                    width,
-                    height,
+                fill = patches.Polygon(
+                    corners,
+                    closed=True,
                     linewidth=0,
                     edgecolor='none',
                     facecolor='#ff66ff',
                     alpha=0.15,
                     zorder=17,
                 )
-                outline = patches.Rectangle(
-                    (left, bottom),
-                    width,
-                    height,
+                outline = patches.Polygon(
+                    corners,
+                    closed=True,
                     linewidth=3.0,
                     edgecolor='#ffffff',
                     facecolor='none',
@@ -5926,25 +8838,74 @@ class MultiPreviewCanvas(FigureCanvas):
                     except Exception:
                         pass
 
-    def _axis_coord_to_pixel(self, ax, coord, length, axis_key):
-        if ax is None or coord is None or length <= 0:
-            return 0
-        limits = ax.get_xlim() if axis_key == 'x' else ax.get_ylim()
-        lim0, lim1 = limits
-        denom = max(1, length - 1)
-        frac = (coord - lim0) / (lim1 - lim0) if lim1 != lim0 else 0.0
-        idx = int(round(frac * denom))
-        return int(np.clip(idx, 0, length - 1))
+    def _view_extent(self, view):
+        if not view:
+            return None
+        raw_extent = view.get("extent_raw")
+        if raw_extent is None:
+            raw_extent = view.get("extent")
+        extent = self._display_extent_for_view(view, raw_extent)
+        if extent is None:
+            extent = raw_extent
+        try:
+            extent = tuple(extent) if extent is not None else None
+        except Exception:
+            extent = None
+        return extent if extent and len(extent) == 4 else None
 
-    def _pixel_bounds_to_axis_bounds(self, ax, w, h, c0, c1, r0, r1):
-        if ax is None:
+    def _axis_coord_to_pixel(self, view, coord, length, axis_key, ax=None):
+        if coord is None or length <= 0:
+            return 0
+        extent = self._view_extent(view)
+        if extent is not None:
+            lim0, lim1 = (extent[0], extent[1]) if axis_key == 'x' else (extent[2], extent[3])
+        elif ax is not None:
+            limits = ax.get_xlim() if axis_key == 'x' else ax.get_ylim()
+            lim0, lim1 = limits
+        else:
+            lim0, lim1 = 0.0, float(max(1, length - 1))
+        idx = _interp_index(coord, lim0, lim1, length)
+        if idx is None:
+            return 0
+        return int(np.clip(round(idx), 0, length - 1))
+
+    def _axis_coord_to_pixel_float(self, view, coord, length, axis_key, ax=None):
+        if coord is None or length <= 0:
+            return 0.0
+        extent = self._view_extent(view)
+        if extent is not None:
+            lim0, lim1 = (extent[0], extent[1]) if axis_key == 'x' else (extent[2], extent[3])
+        elif ax is not None:
+            limits = ax.get_xlim() if axis_key == 'x' else ax.get_ylim()
+            lim0, lim1 = limits
+        else:
+            lim0, lim1 = 0.0, float(max(1, length - 1))
+        idx = _interp_index(coord, lim0, lim1, length)
+        if idx is None:
+            return 0.0
+        return float(np.clip(idx, 0.0, max(0.0, float(length - 1))))
+
+    def _index_to_axis_coord(self, idx, start, end, size):
+        if size <= 0:
+            return start
+        denom = max(1, size - 1)
+        frac = idx / denom if denom else 0.0
+        if end > start:
+            return start + (end - start) * frac
+        return end + (start - end) * frac
+
+    def _pixel_bounds_to_axis_bounds(self, view, ax, w, h, c0, c1, r0, r1):
+        extent = self._view_extent(view)
+        if extent is None and ax is None:
             return None
         def _interp(idx, lim, size):
-            denom = max(1, size - 1)
-            frac = idx / denom if denom else 0.0
-            return lim[0] + (lim[1] - lim[0]) * frac
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
+            return self._index_to_axis_coord(idx, lim[0], lim[1], size)
+        if extent is not None:
+            xlim = (extent[0], extent[1])
+            ylim = (extent[2], extent[3])
+        else:
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
         left = min(c0, c1)
         right = max(c0, c1)
         bottom = min(r0, r1)
@@ -5960,19 +8921,336 @@ class MultiPreviewCanvas(FigureCanvas):
         ext = view.get("extent")
         if ext is None:
             return None
-        x_extent0, x_extent1, y_extent1, y_extent0 = ext
-        def _lerp(idx, start, end, denom):
-            return start + (end - start) * (idx / denom) if denom != 0 else start
-        denom_x = max(1, w - 1)
-        denom_y = max(1, h - 1)
+        x_extent0, x_extent1, y_extent_top, y_extent_bottom = ext
         return (
-            _lerp(c0, x_extent0, x_extent1, denom_x),
-            _lerp(c1, x_extent0, x_extent1, denom_x),
-            _lerp(r1, y_extent0, y_extent1, denom_y),
-            _lerp(r0, y_extent0, y_extent1, denom_y),
+            self._index_to_axis_coord(c0, x_extent0, x_extent1, w),
+            self._index_to_axis_coord(c1, x_extent0, x_extent1, w),
+            self._index_to_axis_coord(r0, y_extent_top, y_extent_bottom, h),
+            self._index_to_axis_coord(r1, y_extent_top, y_extent_bottom, h),
         )
 
-    def _register_crop_entry(self, view, bounds_data, pixel_bounds, square, update_size=True):
+    def _clear_fixed_crop_overlay_artists(self, ax=None):
+        if ax is None:
+            targets = list(self._fixed_crop_overlay_artists.keys())
+        else:
+            targets = [ax]
+        for target_ax in targets:
+            artists = self._fixed_crop_overlay_artists.pop(target_ax, [])
+            for artist in artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+
+    def _fixed_crop_rotate_handle_points(self, ax, geom):
+        angle = float(geom.get("angle", 0.0) or 0.0)
+        rot = Affine2D().rotate_deg_around(geom["cx"], geom["cy"], angle)
+        top_mid = rot.transform((geom["cx"], geom["top"]))
+        center_px = np.asarray(ax.transData.transform((geom["cx"], geom["cy"])), dtype=float)
+        top_mid_px = np.asarray(ax.transData.transform(top_mid), dtype=float)
+        vec = top_mid_px - center_px
+        norm = float(np.hypot(vec[0], vec[1]))
+        if norm <= 1e-9:
+            direction = np.array([0.0, -1.0], dtype=float)
+        else:
+            direction = vec / norm
+        rotate_px = top_mid_px + (direction * 28.0)
+        rotate_pt = ax.transData.inverted().transform(rotate_px)
+        return top_mid, rotate_pt
+
+    def _set_fixed_crop_cursor(self, mode=None, dragging=False):
+        target = (mode, bool(dragging))
+        if self._fixed_crop_cursor_mode == target:
+            return
+        self._fixed_crop_cursor_mode = target
+        cursor = QtCore.Qt.ArrowCursor
+        if mode == "rotate":
+            cursor = QtCore.Qt.CrossCursor
+        elif mode == "move":
+            cursor = QtCore.Qt.ClosedHandCursor if dragging else QtCore.Qt.SizeAllCursor
+        elif mode in ("resize_nw", "resize_se"):
+            cursor = QtCore.Qt.SizeFDiagCursor
+        elif mode in ("resize_ne", "resize_sw"):
+            cursor = QtCore.Qt.SizeBDiagCursor
+        try:
+            self.setCursor(cursor)
+        except Exception:
+            pass
+
+    def _refresh_fixed_crop_overlay_fast(self, ax, view, dragging=False):
+        if ax is None:
+            return
+        if not self._fixed_crop_template_visible or view is None:
+            self._clear_fixed_crop_overlay_artists(ax=ax)
+            self.draw_idle()
+            return
+        updated = False
+        try:
+            updated = self._update_template_overlay_artists(ax, view, skip_label=bool(dragging))
+        except Exception:
+            updated = False
+        if not updated:
+            self._clear_fixed_crop_overlay_artists(ax=ax)
+            try:
+                self._render_template_overlay(ax, view)
+            except Exception:
+                pass
+        self.draw_idle()
+
+    def _fixed_crop_template_geometry(self, view, ax):
+        template = self._fixed_crop_template
+        if template is None or not template.get("pixel_bounds") or view is None or ax is None:
+            return None
+        c0, c1, r0, r1 = [int(v) for v in template.get("pixel_bounds")]
+        arr_obj = view.get("arr")
+        if arr_obj is None:
+            return None
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return None
+        flip = self._use_relative_axes(view)
+        arr_disp = np.flipud(arr) if flip else arr
+        h, w = arr_disp.shape[:2]
+        if w <= 0 or h <= 0:
+            return None
+        bounds = self._pixel_bounds_to_axis_bounds(view, ax, w, h, c0, c1, r0, r1)
+        if not bounds:
+            return None
+        left, right, bottom, top = bounds
+        left, right = (left, right) if left <= right else (right, left)
+        bottom, top = (bottom, top) if bottom <= top else (top, bottom)
+        width = right - left
+        height = top - bottom
+        if width <= 0 or height <= 0:
+            return None
+        angle = float(template.get("rotate", 0.0) or 0.0)
+        return {
+            "left": float(left),
+            "right": float(right),
+            "bottom": float(bottom),
+            "top": float(top),
+            "width": float(width),
+            "height": float(height),
+            "cx": float((left + right) * 0.5),
+            "cy": float((bottom + top) * 0.5),
+            "angle": angle,
+            "pixel_bounds": (int(c0), int(c1), int(r0), int(r1)),
+            "arr_shape": (h, w),
+            "flip": flip,
+        }
+
+    def _fixed_crop_template_contains_point(self, xdata, ydata, geom):
+        if geom is None or xdata is None or ydata is None:
+            return False
+        rot = Affine2D().rotate_deg_around(geom["cx"], geom["cy"], float(geom.get("angle", 0.0) or 0.0))
+        inv = rot.inverted()
+        lx, ly = inv.transform((xdata, ydata))
+        return geom["left"] <= lx <= geom["right"] and geom["bottom"] <= ly <= geom["top"]
+
+    def _fixed_crop_template_handle_hit(self, event, view, ax):
+        if event is None or event.xdata is None or event.ydata is None:
+            return None
+        geom = self._fixed_crop_template_geometry(view, ax)
+        if geom is None:
+            return None
+        angle = float(geom.get("angle", 0.0) or 0.0)
+        rot = Affine2D().rotate_deg_around(geom["cx"], geom["cy"], angle)
+        inv = rot.inverted()
+        ev_world = np.array([event.xdata, event.ydata], dtype=float)
+        ev_px = ax.transData.transform(ev_world)
+
+        # Rotation handle (always rendered outward from the top edge in screen space)
+        _top_mid_world, handle_world = self._fixed_crop_rotate_handle_points(ax, geom)
+        handle_px = ax.transData.transform(handle_world)
+        if float(np.hypot(*(ev_px - handle_px))) <= 22.0:
+            return {"mode": "rotate", "geom": geom}
+
+        # Corner handles
+        corners = {
+            "resize_nw": (geom["left"], geom["top"]),
+            "resize_ne": (geom["right"], geom["top"]),
+            "resize_sw": (geom["left"], geom["bottom"]),
+            "resize_se": (geom["right"], geom["bottom"]),
+        }
+        for mode, pt in corners.items():
+            pt_px = ax.transData.transform(rot.transform(pt))
+            if float(np.hypot(*(ev_px - pt_px))) <= 18.0:
+                return {"mode": mode, "geom": geom}
+
+        lx, ly = inv.transform(ev_world)
+        if geom["left"] <= lx <= geom["right"] and geom["bottom"] <= ly <= geom["top"]:
+            return {"mode": "move", "geom": geom}
+        return None
+
+    def _update_fixed_crop_template_from_bounds(self, view, ax, left, right, bottom, top, angle=None):
+        if view is None or ax is None:
+            return False
+        arr_obj = view.get("arr")
+        if arr_obj is None:
+            return False
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return False
+        flip = self._use_relative_axes(view)
+        arr_disp = np.flipud(arr) if flip else arr
+        h, w = arr_disp.shape[:2]
+        left = float(left)
+        right = float(right)
+        bottom = float(bottom)
+        top = float(top)
+        left, right = (left, right) if left <= right else (right, left)
+        bottom, top = (bottom, top) if bottom <= top else (top, bottom)
+        c0 = self._axis_coord_to_pixel(view, left, w, 'x', ax=ax)
+        c1 = self._axis_coord_to_pixel(view, right, w, 'x', ax=ax)
+        r0 = self._axis_coord_to_pixel(view, bottom, h, 'y', ax=ax)
+        r1 = self._axis_coord_to_pixel(view, top, h, 'y', ax=ax)
+        if c1 < c0:
+            c0, c1 = c1, c0
+        if r1 < r0:
+            r0, r1 = r1, r0
+        bounds_data = self._pixel_bounds_to_axis_bounds(view, ax, w, h, c0, c1, r0, r1)
+        if not bounds_data:
+            return False
+        self._fixed_crop_template = {
+            "width": int(abs(c1 - c0) + 1),
+            "height": int(abs(r1 - r0) + 1),
+            "square": bool((self._fixed_crop_template or {}).get("square", False)),
+            "rotate": float(angle if angle is not None else (self._fixed_crop_template or {}).get("rotate", 0.0) or 0.0),
+            "pixel_bounds": (int(c0), int(c1), int(r0), int(r1)),
+        }
+        self._fixed_crop_template_bounds = bounds_data
+        self._fixed_crop_template_pixel_bounds = (int(c0), int(c1), int(r0), int(r1))
+        self._fixed_crop_template_view_key = self._outline_key(view)
+        self._fixed_crop_template_manual_dims = None
+        return True
+
+    def _begin_fixed_crop_template_drag(self, hit, event, view, ax):
+        if not hit or event is None or event.xdata is None or event.ydata is None:
+            return False
+        geom = hit.get("geom")
+        if geom is None:
+            return False
+        self._fixed_crop_template_drag = {
+            "mode": hit.get("mode"),
+            "view_key": self._outline_key(view),
+            "ax": ax,
+            "press": (float(event.xdata), float(event.ydata)),
+            "last": (float(event.xdata), float(event.ydata)),
+            "bounds_start": (geom["left"], geom["right"], geom["bottom"], geom["top"]),
+            "pixel_bounds_start": tuple(int(v) for v in (geom.get("pixel_bounds") or (0, 0, 0, 0))),
+            "arr_shape": tuple(geom.get("arr_shape") or (0, 0)),
+            "angle_start": float(geom.get("angle", 0.0) or 0.0),
+            "center_start": (geom["cx"], geom["cy"]),
+        }
+        if hit.get("mode") == "rotate":
+            cx, cy = geom["cx"], geom["cy"]
+            self._fixed_crop_template_drag["press_angle"] = math.degrees(math.atan2(event.ydata - cy, event.xdata - cx))
+        return True
+
+    def _update_fixed_crop_template_drag(self, event):
+        drag = self._fixed_crop_template_drag
+        if not drag or event is None or event.xdata is None or event.ydata is None:
+            return False
+        current = (float(event.xdata), float(event.ydata))
+        last = drag.get("last")
+        if last is not None:
+            if abs(current[0] - float(last[0])) < 1e-9 and abs(current[1] - float(last[1])) < 1e-9:
+                return False
+        drag["last"] = current
+        ax = drag.get("ax")
+        if event.inaxes is not ax:
+            return False
+        view = self._ax_view_map.get(ax)
+        if view is None or self._outline_key(view) != drag.get("view_key"):
+            return False
+        left0, right0, bottom0, top0 = drag["bounds_start"]
+        mode = drag.get("mode")
+        angle = float(drag.get("angle_start", 0.0) or 0.0)
+        press_x, press_y = drag.get("press", (event.xdata, event.ydata))
+
+        if mode == "move":
+            h, w = tuple(drag.get("arr_shape") or (0, 0))
+            c0s, c1s, r0s, r1s = tuple(drag.get("pixel_bounds_start") or (0, 0, 0, 0))
+            if h > 0 and w > 0 and c1s >= c0s and r1s >= r0s:
+                press_c = self._axis_coord_to_pixel_float(view, press_x, w, "x", ax=ax)
+                press_r = self._axis_coord_to_pixel_float(view, press_y, h, "y", ax=ax)
+                curr_c = self._axis_coord_to_pixel_float(view, event.xdata, w, "x", ax=ax)
+                curr_r = self._axis_coord_to_pixel_float(view, event.ydata, h, "y", ax=ax)
+                if None not in (press_c, press_r, curr_c, curr_r):
+                    width_px = max(1, int(c1s - c0s + 1))
+                    height_px = max(1, int(r1s - r0s + 1))
+                    dc = float(curr_c - press_c)
+                    dr = float(curr_r - press_r)
+                    start_c = float(c0s) + dc
+                    start_r = float(r0s) + dr
+                    max_c0 = max(0.0, float(w - width_px))
+                    max_r0 = max(0.0, float(h - height_px))
+                    c0 = int(round(np.clip(start_c, 0.0, max_c0)))
+                    r0 = int(round(np.clip(start_r, 0.0, max_r0)))
+                    c1 = int(c0 + width_px - 1)
+                    r1 = int(r0 + height_px - 1)
+                    bounds = self._pixel_bounds_to_axis_bounds(view, ax, w, h, c0, c1, r0, r1)
+                    if bounds:
+                        return self._update_fixed_crop_template_from_bounds(
+                            view, ax, bounds[0], bounds[1], bounds[2], bounds[3], angle=angle
+                        )
+            dx = float(event.xdata - press_x)
+            dy = float(event.ydata - press_y)
+            return self._update_fixed_crop_template_from_bounds(
+                view, ax, left0 + dx, right0 + dx, bottom0 + dy, top0 + dy, angle=angle
+            )
+
+        if mode == "rotate":
+            cx, cy = drag.get("center_start", ((left0 + right0) * 0.5, (bottom0 + top0) * 0.5))
+            press_angle = float(drag.get("press_angle", 0.0))
+            current = math.degrees(math.atan2(event.ydata - cy, event.xdata - cx))
+            delta = current - press_angle
+            return self._update_fixed_crop_template_from_bounds(
+                view, ax, left0, right0, bottom0, top0, angle=angle + delta
+            )
+
+        # Corner resize in the unrotated local frame.
+        cx, cy = drag.get("center_start", ((left0 + right0) * 0.5, (bottom0 + top0) * 0.5))
+        inv = Affine2D().rotate_deg_around(cx, cy, angle).inverted()
+        lx, ly = inv.transform((event.xdata, event.ydata))
+        min_span = 1e-9
+        left, right, bottom, top = left0, right0, bottom0, top0
+        if mode == "resize_nw":
+            left = min(lx, right0 - min_span)
+            top = max(ly, bottom0 + min_span)
+        elif mode == "resize_ne":
+            right = max(lx, left0 + min_span)
+            top = max(ly, bottom0 + min_span)
+        elif mode == "resize_sw":
+            left = min(lx, right0 - min_span)
+            bottom = min(ly, top0 - min_span)
+        elif mode == "resize_se":
+            right = max(lx, left0 + min_span)
+            bottom = min(ly, top0 - min_span)
+        else:
+            return False
+
+        if bool((self._fixed_crop_template or {}).get("square", False)):
+            side = min(max(right - left, min_span), max(top - bottom, min_span))
+            if mode == "resize_nw":
+                left = right - side
+                top = bottom + side
+            elif mode == "resize_ne":
+                right = left + side
+                top = bottom + side
+            elif mode == "resize_sw":
+                left = right - side
+                bottom = top - side
+            elif mode == "resize_se":
+                right = left + side
+                bottom = top - side
+
+        return self._update_fixed_crop_template_from_bounds(view, ax, left, right, bottom, top, angle=angle)
+
+    def _finish_fixed_crop_template_drag(self):
+        self._fixed_crop_template_drag = None
+
+    def _register_crop_entry(self, view, bounds_data, pixel_bounds, square, angle=0.0, update_size=True):
         key = self._outline_key(view)
         if key is None:
             return None
@@ -5990,7 +9268,9 @@ class MultiPreviewCanvas(FigureCanvas):
             "data_bounds": bounds_data,
             "pixel_bounds": pixel_bounds,
             "sequence": seq,
+            "visible": True,
             "square": bool(square),
+            "rotate": float(angle or 0.0),
             "real_size": real_size,
             "unit": real_unit,
             "color": self._crop_color_for_seq(seq),
@@ -6003,6 +9283,8 @@ class MultiPreviewCanvas(FigureCanvas):
             self._fixed_crop_template_bounds = bounds_data
             self._fixed_crop_template_pixel_bounds = pixel_bounds
             self._fixed_crop_template_view_key = key
+            if self._fixed_crop_template is not None:
+                self._fixed_crop_template["rotate"] = float(angle or 0.0)
         if len(self._fixed_crop_history) > _FIXED_CROP_HISTORY_LIMIT:
             self._fixed_crop_history.pop(0)
         self._emit_fixed_crop_history_update()
@@ -6011,26 +9293,27 @@ class MultiPreviewCanvas(FigureCanvas):
     def _render_history_entry(self, ax, entry, show_label=True):
         if not entry or ax is None:
             return
-        data_bounds = entry.get("data_bounds")
-        if not data_bounds:
+        if not bool(entry.get("visible", True)):
             return
-        x0, x1, y0, y1 = data_bounds
-        left, right = min(x0, x1), max(x0, x1)
-        bottom, top = min(y0, y1), max(y0, y1)
-        width = right - left
-        height = top - bottom
-        if width <= 0 or height <= 0:
+        geom = self._history_entry_geometry(entry)
+        if geom is None:
             return
+        left = geom["left"]
+        right = geom["right"]
+        bottom = geom["bottom"]
+        top = geom["top"]
+        width = geom["width"]
+        height = geom["height"]
+        corners = geom["corners"]
         seq = entry.get("sequence")
         is_active = seq is not None and seq == self._fixed_crop_history_highlight_seq
         edge_color = entry.get("color") or ('#ff66ff' if is_active else '#ffd166')
         line_width = 2.3 if is_active else 1.8
         alpha = 1.0 if is_active else 0.6
         if is_active:
-            highlight_fill = patches.Rectangle(
-                (left, bottom),
-                width,
-                height,
+            highlight_fill = patches.Polygon(
+                corners,
+                closed=True,
                 linewidth=0,
                 edgecolor='none',
                 facecolor=edge_color,
@@ -6038,10 +9321,9 @@ class MultiPreviewCanvas(FigureCanvas):
                 zorder=17,
             )
             ax.add_patch(highlight_fill)
-        rect = patches.Rectangle(
-            (left, bottom),
-            width,
-            height,
+        rect = patches.Polygon(
+            corners,
+            closed=True,
             linewidth=line_width,
             edgecolor=edge_color,
             facecolor='none',
@@ -6051,10 +9333,9 @@ class MultiPreviewCanvas(FigureCanvas):
         )
         ax.add_patch(rect)
         if is_active:
-            highlight_outline = patches.Rectangle(
-                (left, bottom),
-                width,
-                height,
+            highlight_outline = patches.Polygon(
+                corners,
+                closed=True,
                 linewidth=max(line_width + 1.2, 3.0),
                 edgecolor='#ffffff',
                 facecolor='none',
@@ -6063,18 +9344,21 @@ class MultiPreviewCanvas(FigureCanvas):
                 zorder=19,
             )
             ax.add_patch(highlight_outline)
-            # handles
-            handle_size = max(width, height) * 0.02
-            for (cx, cy) in [(left, bottom), (left + width, bottom), (left, bottom + height), (left + width, bottom + height)]:
-                h_rect = patches.Rectangle((cx - handle_size/2, cy - handle_size/2), handle_size, handle_size,
-                                           facecolor=edge_color, edgecolor=edge_color, alpha=0.95, zorder=19)
-                ax.add_patch(h_rect)
+            ax.scatter(
+                corners[:, 0],
+                corners[:, 1],
+                s=24,
+                marker="s",
+                color=edge_color,
+                edgecolors="#ffffff",
+                linewidths=0.35,
+                alpha=0.9,
+                zorder=20,
+            )
         if not show_label or seq is None:
             return
-        label_offset_x = width * 0.02 if width > 0 else 0.0
-        label_offset_y = height * 0.02 if height > 0 else 0.0
-        label_x = left + label_offset_x
-        label_y = top - label_offset_y
+        label_x = float(geom["label_anchor"][0])
+        label_y = float(geom["label_anchor"][1])
         real_size = entry.get("real_size", (0.0, 0.0))
         unit = entry.get("unit") or self._fixed_crop_template_unit or "nm"
         pixel_bounds = entry.get("pixel_bounds")
@@ -6108,19 +9392,14 @@ class MultiPreviewCanvas(FigureCanvas):
         key = self._outline_key(view)
         if key is None:
             return
-        entries = [entry for entry in self._fixed_crop_history if entry.get("key") == key]
+        entries = [
+            entry for entry in self._fixed_crop_history
+            if entry.get("key") == key and bool(entry.get("visible", True))
+        ]
         if not entries:
             return
-        if self._fixed_crop_history_visible:
-            for entry in entries:
-                self._render_history_entry(ax, entry)
-        else:
-            highlight_seq = self._fixed_crop_history_highlight_seq
-            if highlight_seq is None:
-                return
-            entry = next((e for e in entries if e.get("sequence") == highlight_seq), None)
-            if entry:
-                self._render_history_entry(ax, entry, show_label=False)
+        for entry in entries:
+            self._render_history_entry(ax, entry)
 
     def _emit_fixed_crop_history_update(self):
         if callable(self._fixed_crop_history_callback):
@@ -6131,6 +9410,178 @@ class MultiPreviewCanvas(FigureCanvas):
 
     def set_fixed_crop_history_callback(self, cb):
         self._fixed_crop_history_callback = cb
+
+    def get_fixed_crop_history_entry(self, seq):
+        seq = int(seq) if seq is not None else None
+        if seq is None:
+            return None
+        for entry in self._fixed_crop_history:
+            if entry.get("sequence") == seq:
+                clone = dict(entry)
+                view_snapshot = entry.get("view_snapshot")
+                if isinstance(view_snapshot, dict):
+                    clone["view_snapshot"] = dict(view_snapshot)
+                return clone
+        return None
+
+    def import_fixed_crop_history_entry(self, entry, *, update_size=True):
+        if not isinstance(entry, dict):
+            return None
+        bounds_data = entry.get("data_bounds")
+        if not bounds_data or len(bounds_data) != 4:
+            return None
+        target_view, target_ax = self._fixed_crop_target_view()
+        if target_view is None or target_ax is None:
+            return None
+        source_key = entry.get("key") or ()
+        target_key = self._outline_key(target_view)
+        source_path = source_key[0] if isinstance(source_key, tuple) and source_key else None
+        target_path = target_key[0] if isinstance(target_key, tuple) and target_key else None
+        if source_path and target_path and str(source_path) != str(target_path):
+            return None
+        arr_obj = target_view.get("arr")
+        if arr_obj is None:
+            return None
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return None
+        h, w = arr.shape[:2]
+        left, right = min(bounds_data[0], bounds_data[1]), max(bounds_data[0], bounds_data[1])
+        bottom, top = min(bounds_data[2], bounds_data[3]), max(bounds_data[2], bounds_data[3])
+        c_left = self._axis_coord_to_pixel_float(target_view, left, w, "x", ax=target_ax)
+        c_right = self._axis_coord_to_pixel_float(target_view, right, w, "x", ax=target_ax)
+        r_bottom = self._axis_coord_to_pixel_float(target_view, bottom, h, "y", ax=target_ax)
+        r_top = self._axis_coord_to_pixel_float(target_view, top, h, "y", ax=target_ax)
+        if any(v is None for v in (c_left, c_right, r_bottom, r_top)):
+            return None
+        c0 = int(np.clip(math.floor(min(c_left, c_right)), 0, max(0, w - 1)))
+        c1 = int(np.clip(math.ceil(max(c_left, c_right)), 0, max(0, w - 1)))
+        r0 = int(np.clip(math.floor(min(r_bottom, r_top)), 0, max(0, h - 1)))
+        r1 = int(np.clip(math.ceil(max(r_bottom, r_top)), 0, max(0, h - 1)))
+        imported = self._register_crop_entry(
+            target_view,
+            tuple(float(v) for v in bounds_data),
+            (c0, c1, r0, r1),
+            bool(entry.get("square", False)),
+            angle=float(entry.get("rotate", 0.0) or 0.0),
+            update_size=update_size,
+        )
+        if imported is None:
+            return None
+        imported["visible"] = bool(entry.get("visible", True))
+        imported["real_size"] = tuple(entry.get("real_size") or imported.get("real_size") or (0.0, 0.0))
+        imported["unit"] = entry.get("unit") or imported.get("unit")
+        view_snapshot = entry.get("view_snapshot")
+        if isinstance(view_snapshot, dict):
+            snapshot = dict(view_snapshot)
+            if imported.get("sequence") is not None:
+                snapshot["crop_sequence"] = imported["sequence"]
+            imported["view_snapshot"] = snapshot
+        self._emit_fixed_crop_history_update()
+        self.draw_idle()
+        return imported
+
+    def build_view_from_fixed_crop_entry(self, base_view, entry, *, title_suffix=" [crop]"):
+        """Rebuild a cropped channel view using the geometry stored in crop history."""
+        if not isinstance(base_view, dict) or not isinstance(entry, dict):
+            return None
+        bounds_data = entry.get("data_bounds")
+        pixel_bounds = entry.get("pixel_bounds")
+        if not bounds_data or len(bounds_data) != 4 or not pixel_bounds or len(pixel_bounds) != 4:
+            return None
+        angle = float(entry.get("rotate", 0.0) or 0.0)
+        width_px = max(2, int(abs(pixel_bounds[1] - pixel_bounds[0]) + 1))
+        height_px = max(2, int(abs(pixel_bounds[3] - pixel_bounds[2]) + 1))
+        helper_ax = self.main_ax
+        if helper_ax is None:
+            fig = Figure(figsize=(1, 1))
+            helper_ax = fig.add_subplot(111)
+            extent = self._view_extent(base_view)
+            if extent is not None and len(extent) == 4:
+                try:
+                    helper_ax.set_xlim(float(extent[0]), float(extent[1]))
+                    helper_ax.set_ylim(float(extent[2]), float(extent[3]))
+                except Exception:
+                    pass
+        if abs(angle) <= 1e-9:
+            cropped_arr = self._extract_axis_aligned_crop(base_view, pixel_bounds)
+        else:
+            cropped_arr = self._extract_rotated_crop(base_view, helper_ax, bounds_data, width_px, height_px, angle)
+        if cropped_arr is None:
+            return None
+        new_view = dict(base_view)
+        try:
+            new_view["arr"] = np.array(cropped_arr, copy=True)
+        except Exception:
+            new_view["arr"] = cropped_arr
+        try:
+            finite = np.asarray(cropped_arr)[np.isfinite(cropped_arr)]
+            if finite.size:
+                lo = float(finite.min())
+                hi = float(finite.max())
+                if hi <= lo:
+                    hi = lo + 1e-12
+                new_view["clim"] = (lo, hi)
+            else:
+                new_view.pop("clim", None)
+        except Exception:
+            new_view.pop("clim", None)
+        crop_extent = tuple(float(v) for v in bounds_data)
+        new_view["extent_raw"] = crop_extent
+        display_extent = self._display_extent_for_view(new_view, crop_extent)
+        if display_extent is not None:
+            new_view["extent"] = display_extent
+        else:
+            new_view.pop("extent", None)
+        base_title = str(base_view.get("title") or "crop")
+        suffix = str(title_suffix or "")
+        new_view["title"] = base_title if not suffix or base_title.endswith(suffix.strip()) else f"{base_title}{suffix}"
+        try:
+            real_size = tuple(entry.get("real_size") or ())
+            if len(real_size) == 2:
+                new_view["_popup_image_size_override"] = {
+                    "width": float(real_size[0]),
+                    "height": float(real_size[1]),
+                    "unit": str(entry.get("unit") or self._guess_view_unit(base_view) or "nm"),
+                }
+        except Exception:
+            pass
+
+        seq = entry.get("sequence")
+        if seq is not None:
+            new_view["crop_sequence"] = seq
+        return new_view
+
+    def set_fixed_crop_history_entry_visible(self, seq, visible: bool):
+        seq = int(seq) if seq is not None else None
+        if seq is None:
+            return False
+        target = None
+        for entry in self._fixed_crop_history:
+            if entry.get("sequence") == seq:
+                target = entry
+                break
+        if target is None:
+            return False
+        visible = bool(visible)
+        if bool(target.get("visible", True)) == visible:
+            return False
+        target["visible"] = visible
+        if self._fixed_crop_history_highlight_seq == seq and not visible:
+            self._fixed_crop_history_highlight_seq = None
+        self._cleanup_highlight_artists()
+        self._emit_fixed_crop_history_update()
+        self._redraw()
+        return True
+
+    def is_fixed_crop_history_entry_visible(self, seq):
+        seq = int(seq) if seq is not None else None
+        if seq is None:
+            return False
+        for entry in self._fixed_crop_history:
+            if entry.get("sequence") == seq:
+                return bool(entry.get("visible", True))
+        return False
 
     def _crop_color_for_seq(self, seq: int):
         palette = [
@@ -6151,7 +9602,7 @@ class MultiPreviewCanvas(FigureCanvas):
         arr = np.asarray(arr_obj)
         if arr.size == 0:
             return None
-        flip = bool(view.get("relative_axes"))
+        flip = self._use_relative_axes(view)
         arr_disp = np.flipud(arr) if flip else arr
         h, w = arr_disp.shape[:2]
         if w == 0 or h == 0:
@@ -6164,7 +9615,7 @@ class MultiPreviewCanvas(FigureCanvas):
         r0 = int(np.clip(int(round(cy - height / 2.0)), 0, max(0, h - height)))
         c1 = c0 + width - 1
         r1 = r0 + height - 1
-        bounds = self._pixel_bounds_to_axis_bounds(ax, w, h, c0, c1, r0, r1)
+        bounds = self._pixel_bounds_to_axis_bounds(view, ax, w, h, c0, c1, r0, r1)
         return bounds, (c0, c1, r0, r1)
 
     def _compute_pixels_for_real_size(self, view, ax, real_width, real_height):
@@ -6176,13 +9627,13 @@ class MultiPreviewCanvas(FigureCanvas):
         arr = np.asarray(arr_obj)
         if arr.size == 0:
             return None
-        extent = view.get("extent")
+        extent = self._view_extent(view)
         if not extent:
             return None
         x0, x1, y1, y0 = extent
         x_span = abs(x1 - x0)
         y_span = abs(y1 - y0)
-        flip = bool(view.get("relative_axes"))
+        flip = self._use_relative_axes(view)
         arr_disp = np.flipud(arr) if flip else arr
         h, w = arr_disp.shape[:2]
         if w == 0 or h == 0:
@@ -6206,6 +9657,8 @@ class MultiPreviewCanvas(FigureCanvas):
             "width": width,
             "height": height,
             "square": bool(entry.get("square", False)),
+            "rotate": float(entry.get("rotate", 0.0) or 0.0),
+            "pixel_bounds": tuple(pixel_bounds),
         }
         self._fixed_crop_template_bounds = entry.get("data_bounds")
         self._fixed_crop_template_pixel_bounds = pixel_bounds
@@ -6229,6 +9682,8 @@ class MultiPreviewCanvas(FigureCanvas):
                     "width": width,
                     "height": height,
                     "square": bool(self._fixed_crop_template.get("square", False)),
+                    "rotate": float(self._fixed_crop_template.get("rotate", 0.0) or 0.0),
+                    "pixel_bounds": tuple(pixel_bounds),
                 }
                 self._fixed_crop_template_bounds = bounds_data
                 self._fixed_crop_template_pixel_bounds = pixel_bounds
@@ -6248,6 +9703,8 @@ class MultiPreviewCanvas(FigureCanvas):
                     "width": pixel_bounds[1] - pixel_bounds[0] + 1,
                     "height": pixel_bounds[3] - pixel_bounds[2] + 1,
                     "square": bool(self._fixed_crop_template.get("square", False)),
+                    "rotate": float(self._fixed_crop_template.get("rotate", 0.0) or 0.0),
+                    "pixel_bounds": tuple(pixel_bounds),
                 }
                 self._fixed_crop_template_bounds = bounds_data
                 self._fixed_crop_template_pixel_bounds = pixel_bounds
@@ -6271,6 +9728,8 @@ class MultiPreviewCanvas(FigureCanvas):
             "width": width,
             "height": height,
             "square": bool(square),
+            "rotate": float((self._fixed_crop_template or {}).get("rotate", 0.0) or 0.0),
+            "pixel_bounds": tuple(pixel_bounds),
         }
         self._fixed_crop_template_bounds = bounds_data
         self._fixed_crop_template_pixel_bounds = pixel_bounds
@@ -6314,6 +9773,8 @@ class MultiPreviewCanvas(FigureCanvas):
             "width": px_width,
             "height": px_height,
             "square": bool(square),
+            "rotate": float((self._fixed_crop_template or {}).get("rotate", 0.0) or 0.0),
+            "pixel_bounds": tuple(pixel_bounds),
         }
         self._fixed_crop_template_bounds = bounds_data
         self._fixed_crop_template_pixel_bounds = pixel_bounds
@@ -6396,85 +9857,355 @@ class MultiPreviewCanvas(FigureCanvas):
         key = self._outline_key(view)
         if key != self._fixed_crop_template_view_key:
             return
-        x0, x1, y0, y1 = self._fixed_crop_template_bounds
-        left, right = min(x0, x1), max(x0, x1)
-        bottom, top = min(y0, y1), max(y0, y1)
-        width = right - left
-        height = top - bottom
-        if width <= 0 or height <= 0:
+        self._clear_fixed_crop_overlay_artists(ax=ax)
+        geom = self._fixed_crop_template_geometry(view, ax)
+        if geom is None:
             return
-        rect = patches.Rectangle(
-            (left, bottom),
-            width,
-            height,
-            linewidth=1.2,
-            edgecolor='#ff66ff',
-            facecolor='none',
-            alpha=0.85,
-            linestyle='--',
+        artists = []
+        left = float(geom["left"])
+        right = float(geom["right"])
+        bottom = float(geom["bottom"])
+        top = float(geom["top"])
+        width = float(geom["width"])
+        height = float(geom["height"])
+        cx = float(geom["cx"])
+        cy = float(geom["cy"])
+        angle = float(geom.get("angle", 0.0) or 0.0)
+        rot = Affine2D().rotate_deg_around(cx, cy, angle)
+
+        corners_local = np.array(
+            [
+                [left, bottom],
+                [right, bottom],
+                [right, top],
+                [left, top],
+            ],
+            dtype=float,
+        )
+        corners = rot.transform(corners_local)
+        frame = patches.Polygon(
+            corners,
+            closed=True,
+            linewidth=1.25,
+            edgecolor="#f46cff",
+            facecolor=(1.0, 0.58, 1.0, 0.025),
+            alpha=0.9,
+            linestyle="--",
             zorder=17,
         )
-        ax.add_patch(rect)
-        px_width = int(self._fixed_crop_template.get('width', int(width)))
-        px_height = int(self._fixed_crop_template.get('height', int(height)))
+        ax.add_patch(frame)
+        artists.append(frame)
+
+        px_width = int(self._fixed_crop_template.get("width", int(width)))
+        px_height = int(self._fixed_crop_template.get("height", int(height)))
         real_unit = self._fixed_crop_template_unit or "nm"
         real_label = ""
         if self._fixed_crop_template_bounds:
             bx0, bx1, by0, by1 = self._fixed_crop_template_bounds
             real_dx = abs(bx1 - bx0)
             real_dy = abs(by1 - by0)
-            real_label = f"{real_dx:.3g} {real_unit} × {real_dy:.3g} {real_unit}"
-        size_label = f"{real_label}\n({px_width}×{px_height} px)" if real_label else f"{px_width}×{px_height} px"
-        ax.text(
-            left + (width * 0.01),
-            top - (height * 0.02),
+            real_label = f"{real_dx:.3g} {real_unit} x {real_dy:.3g} {real_unit}"
+        size_label = f"{real_label}\n({px_width}x{px_height} px)" if real_label else f"{px_width}x{px_height} px"
+
+        label_anchor = rot.transform((left + (width * 0.015), top - (height * 0.02)))
+        lbl = ax.text(
+            float(label_anchor[0]),
+            float(label_anchor[1]),
             size_label,
-            color='#ff66ff',
+            color="#ff66ff",
             fontsize=7,
-            weight='medium',
-            verticalalignment='top',
-            horizontalalignment='left',
-            bbox=dict(facecolor='#111111', alpha=0.7, pad=1, edgecolor='none'),
+            weight="medium",
+            verticalalignment="top",
+            horizontalalignment="left",
+            bbox=dict(facecolor="#111111", alpha=0.7, pad=1, edgecolor="none"),
             zorder=18,
         )
+        artists.append(lbl)
 
-    def _apply_fixed_crop_quick(self, event, view, ax):
-        template = self._fixed_crop_template
-        if template is None or ax is None:
+        if self._fixed_crop_transform_mode:
+            corner_size = 58.0
+            corner_pts = ax.scatter(
+                corners[:, 0],
+                corners[:, 1],
+                s=corner_size,
+                marker="s",
+                color="#f46cff",
+                edgecolors="#ffe1ff",
+                linewidths=0.5,
+                zorder=19,
+            )
+            artists.append(corner_pts)
+            top_mid, rotate_pt = self._fixed_crop_rotate_handle_points(ax, geom)
+            handle_line = ax.plot(
+                [top_mid[0], rotate_pt[0]],
+                [top_mid[1], rotate_pt[1]],
+                linestyle="-",
+                linewidth=1.0,
+                color="#ff66ff",
+                alpha=0.9,
+                zorder=19,
+            )[0]
+            artists.append(handle_line)
+            rotate_marker = ax.scatter(
+                [rotate_pt[0]],
+                [rotate_pt[1]],
+                s=62,
+                marker="o",
+                color="#222222",
+                edgecolors="#f46cff",
+                linewidths=0.9,
+                zorder=20,
+            )
+            artists.append(rotate_marker)
+            rotate_lbl = ax.text(
+                float(rotate_pt[0]),
+                float(rotate_pt[1]),
+                "R",
+                color="#ff66ff",
+                fontsize=8,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                zorder=21,
+            )
+            artists.append(rotate_lbl)
+        self._fixed_crop_overlay_artists[ax] = artists
+
+    def _update_template_overlay_artists(self, ax, view, skip_label=False):
+        if ax is None or view is None:
             return False
-        arr = np.asarray(view.get("arr"))
-        if arr.size == 0:
+        artists = self._fixed_crop_overlay_artists.get(ax)
+        if not artists:
             return False
-        flip = bool(view.get("relative_axes"))
+        geom = self._fixed_crop_template_geometry(view, ax)
+        if geom is None:
+            return False
+
+        expected_len = 6 if self._fixed_crop_transform_mode else 2
+        if len(artists) != expected_len:
+            return False
+
+        left = float(geom["left"])
+        right = float(geom["right"])
+        bottom = float(geom["bottom"])
+        top = float(geom["top"])
+        width = float(geom["width"])
+        height = float(geom["height"])
+        cx = float(geom["cx"])
+        cy = float(geom["cy"])
+        angle = float(geom.get("angle", 0.0) or 0.0)
+        rot = Affine2D().rotate_deg_around(cx, cy, angle)
+
+        corners_local = np.array(
+            [
+                [left, bottom],
+                [right, bottom],
+                [right, top],
+                [left, top],
+            ],
+            dtype=float,
+        )
+        corners = rot.transform(corners_local)
+
+        frame = artists[0]
+        frame.set_xy(corners)
+
+        label_anchor = rot.transform((left + (width * 0.015), top - (height * 0.02)))
+        lbl = artists[1]
+        lbl.set_position((float(label_anchor[0]), float(label_anchor[1])))
+        if not skip_label:
+            px_width = int(self._fixed_crop_template.get("width", int(width)))
+            px_height = int(self._fixed_crop_template.get("height", int(height)))
+            real_unit = self._fixed_crop_template_unit or "nm"
+            real_label = ""
+            if self._fixed_crop_template_bounds:
+                bx0, bx1, by0, by1 = self._fixed_crop_template_bounds
+                real_dx = abs(bx1 - bx0)
+                real_dy = abs(by1 - by0)
+                real_label = f"{real_dx:.3g} {real_unit} x {real_dy:.3g} {real_unit}"
+            size_label = f"{real_label}\n({px_width}x{px_height} px)" if real_label else f"{px_width}x{px_height} px"
+            lbl.set_text(size_label)
+
+        if self._fixed_crop_transform_mode:
+            corner_pts = artists[2]
+            corner_pts.set_offsets(corners)
+            top_mid, rotate_pt = self._fixed_crop_rotate_handle_points(ax, geom)
+            handle_line = artists[3]
+            handle_line.set_data(
+                [float(top_mid[0]), float(rotate_pt[0])],
+                [float(top_mid[1]), float(rotate_pt[1])],
+            )
+            rotate_marker = artists[4]
+            rotate_marker.set_offsets(
+                np.array([[float(rotate_pt[0]), float(rotate_pt[1])]], dtype=float)
+            )
+            rotate_lbl = artists[5]
+            rotate_lbl.set_position((float(rotate_pt[0]), float(rotate_pt[1])))
+        return True
+
+    def _extract_rotated_crop(self, view, ax, bounds_data, width_px, height_px, angle_deg):
+        if view is None or ax is None or not bounds_data:
+            return None
+        arr_obj = view.get("arr")
+        if arr_obj is None:
+            return None
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return None
+        flip = self._use_relative_axes(view)
         arr_disp = np.flipud(arr) if flip else arr
         h, w = arr_disp.shape[:2]
-        if w == 0 or h == 0:
-            return False
-        width = min(max(2, int(template.get("width", 2))), w)
-        height = min(max(2, int(template.get("height", 2))), h)
-        if width <= 0 or height <= 0:
-            return False
-        cx = self._axis_coord_to_pixel(ax, event.xdata, w, 'x')
-        cy = self._axis_coord_to_pixel(ax, event.ydata, h, 'y')
-        max_c0 = max(0, w - width)
-        max_r0 = max(0, h - height)
-        c0 = int(np.clip(cx - width // 2, 0, max_c0))
-        r0 = int(np.clip(cy - height // 2, 0, max_r0))
-        c1 = c0 + width - 1
-        r1 = r0 + height - 1
-        cropped_disp = arr_disp[r0:r1 + 1, c0:c1 + 1]
-        if cropped_disp.size == 0:
-            return False
+        if h <= 0 or w <= 0:
+            return None
+        width_px = int(np.clip(int(width_px), 2, w))
+        height_px = int(np.clip(int(height_px), 2, h))
+        x0, x1, y0, y1 = [float(v) for v in bounds_data]
+        left, right = (x0, x1) if x0 <= x1 else (x1, x0)
+        bottom, top = (y0, y1) if y0 <= y1 else (y1, y0)
+        if right <= left or top <= bottom:
+            return None
+
+        xs = np.linspace(left, right, width_px, dtype=np.float64)
+        ys = np.linspace(bottom, top, height_px, dtype=np.float64)
+        gx, gy = np.meshgrid(xs, ys)
+
+        angle_deg = float(angle_deg or 0.0)
+        if abs(angle_deg) > 1e-9:
+            cx = (left + right) * 0.5
+            cy = (bottom + top) * 0.5
+            points = np.column_stack((gx.ravel(), gy.ravel()))
+            points = Affine2D().rotate_deg_around(cx, cy, angle_deg).transform(points)
+            gx = points[:, 0].reshape((height_px, width_px))
+            gy = points[:, 1].reshape((height_px, width_px))
+
+        extent = self._view_extent(view)
+        if extent is not None:
+            xlim0, xlim1 = float(extent[0]), float(extent[1])
+            ylim0, ylim1 = float(extent[2]), float(extent[3])
+        else:
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            xlim0, xlim1 = float(xlim[0]), float(xlim[1])
+            ylim0, ylim1 = float(ylim[0]), float(ylim[1])
+
+        def _coord_grid_to_index_grid(values, start, end, size):
+            if size <= 1 or abs(end - start) <= 1e-15:
+                return np.zeros_like(values, dtype=np.float64)
+            if end > start:
+                idx = (values - start) / (end - start)
+            else:
+                idx = (values - end) / (start - end)
+            idx = idx * float(size - 1)
+            return np.clip(idx, 0.0, float(size - 1))
+
+        cols = _coord_grid_to_index_grid(gx, xlim0, xlim1, w)
+        rows = _coord_grid_to_index_grid(gy, ylim0, ylim1, h)
+
+        if _HAS_SCIPY and ndimage is not None:
+            try:
+                sampled = ndimage.map_coordinates(
+                    arr_disp.astype(np.float64, copy=False),
+                    [rows, cols],
+                    order=1,
+                    mode="nearest",
+                )
+            except Exception:
+                sampled = None
+        else:
+            sampled = None
+        if sampled is None:
+            ri = np.clip(np.rint(rows).astype(np.int64), 0, h - 1)
+            ci = np.clip(np.rint(cols).astype(np.int64), 0, w - 1)
+            sampled = arr_disp[ri, ci]
+
+        if sampled.size == 0:
+            return None
+        cropped_disp = np.asarray(sampled).reshape((height_px, width_px))
         cropped_arr = np.flipud(cropped_disp) if flip else cropped_disp
-        crop_extent = self._compute_crop_extent(view, w, h, c0, c1, r0, r1)
-        bounds_data = self._pixel_bounds_to_axis_bounds(ax, w, h, c0, c1, r0, r1)
-        entry = self._register_crop_entry(view, bounds_data, (c0, c1, r0, r1), template.get("square", False), update_size=False)
+        return np.array(cropped_arr, copy=True)
+
+    def _extract_axis_aligned_crop(self, view, pixel_bounds):
+        if view is None or not pixel_bounds:
+            return None
+        arr_obj = view.get("arr")
+        if arr_obj is None:
+            return None
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return None
+        flip = self._use_relative_axes(view)
+        arr_disp = np.flipud(arr) if flip else arr
+        h, w = arr_disp.shape[:2]
+        if h <= 0 or w <= 0:
+            return None
+        try:
+            c0, c1, r0, r1 = [int(v) for v in pixel_bounds]
+        except Exception:
+            return None
+        left = max(0, min(c0, c1))
+        right = min(w - 1, max(c0, c1))
+        top = max(0, min(r0, r1))
+        bottom = min(h - 1, max(r0, r1))
+        if right < left or bottom < top:
+            return None
+        cropped_disp = arr_disp[top:bottom + 1, left:right + 1]
+        if cropped_disp.size == 0:
+            return None
+        cropped_arr = np.flipud(cropped_disp) if flip else cropped_disp
+        return np.array(cropped_arr, copy=True)
+
+    def _build_cropped_view_from_selection(
+        self,
+        view,
+        ax,
+        cropped_arr,
+        bounds_data,
+        pixel_bounds,
+        square=False,
+        angle=0.0,
+        update_size=False,
+        auto_virtual_copy=False,
+        prompt_virtual_copy=True,
+    ):
+        if view is None or ax is None:
+            return False
+        if cropped_arr is None:
+            return False
+        arr = np.asarray(cropped_arr)
+        if arr.ndim < 2 or arr.size == 0:
+            return False
+        entry = self._register_crop_entry(
+            view,
+            bounds_data,
+            pixel_bounds,
+            square,
+            angle=angle,
+            update_size=update_size,
+        )
         new_view = dict(view)
         try:
-            new_view["arr"] = np.array(cropped_arr, copy=True)
+            new_view["arr"] = np.array(arr, copy=True)
         except Exception:
-            new_view["arr"] = cropped_arr
-        if crop_extent is not None:
+            new_view["arr"] = arr
+        try:
+            finite = arr[np.isfinite(arr)]
+            if finite.size:
+                lo = float(finite.min())
+                hi = float(finite.max())
+                if hi <= lo:
+                    hi = lo + 1e-12
+                new_view["clim"] = (lo, hi)
+            else:
+                new_view.pop("clim", None)
+        except Exception:
+            new_view.pop("clim", None)
+        if not new_view.get("path"):
+            meta = new_view.get("meta") or {}
+            src_path = meta.get("path") or meta.get("file_path")
+            if src_path:
+                new_view["path"] = src_path
+        if bounds_data is not None:
+            crop_extent = tuple(float(v) for v in bounds_data)
             new_view["extent_raw"] = crop_extent
             display_extent = self._display_extent_for_view(new_view, crop_extent)
             if display_extent is not None:
@@ -6485,7 +10216,21 @@ class MultiPreviewCanvas(FigureCanvas):
             new_view.pop("extent", None)
             new_view.pop("extent_raw", None)
         new_view["title"] = f"{view.get('title') or 'crop'} [crop]"
+        if auto_virtual_copy:
+            new_view["_auto_virtual_copy"] = True
+        elif not prompt_virtual_copy:
+            new_view["_skip_virtual_copy_prompt"] = True
         if entry and entry.get("sequence") is not None:
+            try:
+                real_size = tuple(entry.get("real_size") or ())
+                if len(real_size) == 2:
+                    new_view["_popup_image_size_override"] = {
+                        "width": float(real_size[0]),
+                        "height": float(real_size[1]),
+                        "unit": str(entry.get("unit") or self._guess_view_unit(view) or "nm"),
+                    }
+            except Exception:
+                pass
             new_view["crop_sequence"] = entry["sequence"]
             entry["view_snapshot"] = dict(new_view)
         if callable(self._crop_callback):
@@ -6499,6 +10244,101 @@ class MultiPreviewCanvas(FigureCanvas):
             self._render_template_overlay(ax, view)
         self.draw_idle()
         return True
+
+    def _apply_fixed_crop_template(self, view, ax):
+        template = self._fixed_crop_template
+        if template is None or ax is None or view is None:
+            return False
+        geom = self._fixed_crop_template_geometry(view, ax)
+        if geom is None:
+            return False
+        width = int(template.get("width", 0) or 0)
+        height = int(template.get("height", 0) or 0)
+        if width < 2 or height < 2:
+            return False
+        angle = float(template.get("rotate", 0.0) or 0.0)
+        bounds_data = (geom["left"], geom["right"], geom["bottom"], geom["top"])
+        pixel_bounds = tuple(int(v) for v in (template.get("pixel_bounds") or geom.get("pixel_bounds") or (0, 0, 0, 0)))
+        if abs(angle) <= 1e-9:
+            cropped_arr = self._extract_axis_aligned_crop(view, pixel_bounds)
+        else:
+            cropped_arr = self._extract_rotated_crop(view, ax, bounds_data, width, height, angle)
+        if cropped_arr is None:
+            return False
+        ok = self._build_cropped_view_from_selection(
+            view=view,
+            ax=ax,
+            cropped_arr=cropped_arr,
+            bounds_data=bounds_data,
+            pixel_bounds=pixel_bounds,
+            square=bool(template.get("square", False)),
+            angle=angle,
+            update_size=False,
+            auto_virtual_copy=True,
+        )
+        if ok:
+            if self._fixed_crop_quick_mode:
+                self._fixed_crop_template_visible = True
+                self._fixed_crop_template_drag = None
+                self._fixed_crop_drag_last_ts = 0.0
+                self._notify_views_callback()
+                self._redraw()
+            else:
+                self.enable_fixed_crop_transform_mode(False)
+        return ok
+
+    def _apply_fixed_crop_quick(self, event, view, ax):
+        template = self._fixed_crop_template
+        if template is None or ax is None or event is None:
+            return False
+        if event.xdata is None or event.ydata is None:
+            return False
+        arr_obj = view.get("arr")
+        if arr_obj is None:
+            return False
+        arr = np.asarray(arr_obj)
+        if arr.ndim < 2 or arr.size == 0:
+            return False
+        flip = self._use_relative_axes(view)
+        arr_disp = np.flipud(arr) if flip else arr
+        h, w = arr_disp.shape[:2]
+        if w <= 0 or h <= 0:
+            return False
+        width = int(np.clip(int(template.get("width", 2) or 2), 2, w))
+        height = int(np.clip(int(template.get("height", 2) or 2), 2, h))
+        cx = self._axis_coord_to_pixel_float(view, event.xdata, w, "x", ax=ax)
+        cy = self._axis_coord_to_pixel_float(view, event.ydata, h, "y", ax=ax)
+        max_c0 = max(0, w - width)
+        max_r0 = max(0, h - height)
+        c0 = int(np.clip(int(round(cx - (width * 0.5))), 0, max_c0))
+        r0 = int(np.clip(int(round(cy - (height * 0.5))), 0, max_r0))
+        c1 = int(c0 + width - 1)
+        r1 = int(r0 + height - 1)
+        bounds_data = self._pixel_bounds_to_axis_bounds(view, ax, w, h, c0, c1, r0, r1)
+        if not bounds_data:
+            return False
+        angle = float(template.get("rotate", 0.0) or 0.0)
+        pixel_bounds = (c0, c1, r0, r1)
+        if abs(angle) <= 1e-9:
+            cropped_arr = self._extract_axis_aligned_crop(view, pixel_bounds)
+        else:
+            cropped_arr = self._extract_rotated_crop(view, ax, bounds_data, width, height, angle)
+        if cropped_arr is None:
+            return False
+        return self._build_cropped_view_from_selection(
+            view=view,
+            ax=ax,
+            cropped_arr=cropped_arr,
+            bounds_data=bounds_data,
+            pixel_bounds=pixel_bounds,
+            square=bool(template.get("square", False)),
+            angle=angle,
+            update_size=False,
+            auto_virtual_copy=False,
+            prompt_virtual_copy=False,
+        )
+
+
 class SafeFigureCanvas(FigureCanvas):
     def draw(self):
         try:
@@ -6506,3 +10346,4 @@ class SafeFigureCanvas(FigureCanvas):
         except np.linalg.LinAlgError:
             # Ignore transient singular transforms during layout updates.
             return
+

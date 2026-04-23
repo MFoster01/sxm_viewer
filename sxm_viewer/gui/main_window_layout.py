@@ -7,13 +7,32 @@ from .constants import UI_FONT_FAMILY
 from .styles import MAIN_SHORTCUTS_PANEL_STYLE, lower_control_frame_style, mode_selector_style
 
 
+def _configure_compact_control(widget):
+    try:
+        widget.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    except Exception:
+        pass
+    return widget
+
+
+def _add_menu_widget(menu, widget):
+    action = QtWidgets.QWidgetAction(menu)
+    action.setDefaultWidget(widget)
+    menu.addAction(action)
+    return action
+
+
 def create_lower_controls(viewer):
     frame = QtWidgets.QFrame()
     frame.setObjectName("lowerControlFrame")
     frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
-    layout = QtWidgets.QHBoxLayout(frame)
-    layout.setContentsMargins(8, 4, 8, 4)
-    layout.setSpacing(12)
+    layout = QtWidgets.QVBoxLayout(frame)
+    layout.setContentsMargins(8, 4, 8, 6)
+    layout.setSpacing(6)
+
+    top_row = QtWidgets.QHBoxLayout()
+    top_row.setContentsMargins(0, 0, 0, 0)
+    top_row.setSpacing(8)
 
     mode_widget = QtWidgets.QWidget(frame)
     mode_widget.setObjectName("modeSelector")
@@ -28,7 +47,7 @@ def create_lower_controls(viewer):
     mode_definitions = [
         (viewer.MODE_BROWSE, "Browse", "Ctrl+B"),
         (viewer.MODE_MEASURE, "Measure", "Ctrl+M"),
-        (viewer.MODE_SPECTRO, "Spectroscopy", "Ctrl+S"),
+        (viewer.MODE_SPECTRO, "Spectro", "Ctrl+Alt+S"),
     ]
     for mode, label, shortcut in mode_definitions:
         btn = QtWidgets.QToolButton(mode_widget)
@@ -42,20 +61,34 @@ def create_lower_controls(viewer):
         viewer.mode_button_group.addButton(btn, mode)
         viewer.mode_buttons[mode] = btn
         mode_layout.addWidget(btn)
-    layout.addWidget(mode_widget)
+    top_row.addWidget(mode_widget)
+    viewer.browse_molecules_btn = _configure_compact_control(QtWidgets.QToolButton(frame))
+    viewer.browse_molecules_btn.setObjectName("modeAccessoryButton")
+    viewer.browse_molecules_btn.setText("Molecules")
+    viewer.browse_molecules_btn.setCheckable(True)
+    viewer.browse_molecules_btn.setChecked(bool(getattr(viewer, "show_molecules", True)))
+    viewer.browse_molecules_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+    viewer.browse_molecules_btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+    viewer.browse_molecules_btn.setToolTip(
+        "Toggle molecule overlays. Use the arrow for load, recent, clear, and palette options. "
+        "Click a molecule, then use X/Y/Z to rotate; Shift+X/Y/Z rotates the opposite way."
+    )
+    viewer.browse_molecules_btn.toggled.connect(viewer.on_show_molecules_toggled)
+    viewer.browse_molecules_menu = QtWidgets.QMenu(viewer.browse_molecules_btn)
+    viewer.browse_molecules_menu.aboutToShow.connect(viewer._populate_browse_molecules_menu)
+    viewer.browse_molecules_btn.setMenu(viewer.browse_molecules_menu)
+    top_row.addWidget(viewer.browse_molecules_btn)
+    top_row.addStretch(1)
+    layout.addLayout(top_row)
 
     viewer.mode_stack = QtWidgets.QStackedWidget(frame)
     viewer.mode_stack.addWidget(build_browse_context_page(viewer))
     viewer.mode_stack.addWidget(build_measure_context_page(viewer))
     viewer.mode_stack.addWidget(build_spectro_context_page(viewer))
-    layout.addWidget(viewer.mode_stack, 1)
+    layout.addWidget(viewer.mode_stack)
 
     display_widget = build_display_widget(viewer, frame)
     layout.addWidget(display_widget)
-
-    layout.setStretch(0, 0)
-    layout.setStretch(1, 1)
-    layout.setStretch(2, 0)
 
     settings = QtCore.QSettings()
     saved_mode = str(settings.value("lowerPane/lastMode", "Browse"))
@@ -73,9 +106,9 @@ def build_browse_context_page(viewer):
     layout = QtWidgets.QHBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
-    viewer.add_view_btn = QtWidgets.QPushButton("+ Channel")
+    viewer.add_view_btn = _configure_compact_control(QtWidgets.QPushButton("+ View"))
     viewer.add_view_btn.setToolTip("Add the current channel as an extra preview")
-    viewer.clear_views_btn = QtWidgets.QPushButton("Clear views")
+    viewer.clear_views_btn = _configure_compact_control(QtWidgets.QPushButton("Clear views"))
     viewer.clear_views_btn.setToolTip("Remove extra previews and keep only the main view")
     for btn in (
         viewer.add_view_btn,
@@ -91,21 +124,21 @@ def build_measure_context_page(viewer):
     layout = QtWidgets.QHBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
-    viewer.measure_profile_btn = QtWidgets.QPushButton("Profile")
+    viewer.measure_profile_btn = _configure_compact_control(QtWidgets.QPushButton("Profile"))
     viewer.measure_profile_btn.setToolTip("Start or stop interactive profile measurement")
-    viewer.measure_angle_btn = QtWidgets.QPushButton("Angle")
+    viewer.measure_angle_btn = _configure_compact_control(QtWidgets.QPushButton("Angle"))
     viewer.measure_angle_btn.setToolTip("Start or stop angle measurement tool")
-    viewer.exit_profile_btn = QtWidgets.QPushButton("Exit")
-    viewer.exit_profile_btn.setToolTip("Exit the profile measurement mode")
-    viewer.clear_profile_btn = QtWidgets.QPushButton("Clear")
+    viewer.clear_profile_btn = _configure_compact_control(QtWidgets.QPushButton("Clear"))
     viewer.clear_profile_btn.setToolTip("Clear the current profile line and start fresh")
-    viewer.show_profile_window_btn = QtWidgets.QPushButton("Show")
+    viewer.show_profile_window_btn = _configure_compact_control(QtWidgets.QPushButton("Profiles"))
     viewer.show_profile_window_btn.setToolTip("Reopen the profile dialog with current measurements")
+    viewer.exit_profile_btn = _configure_compact_control(QtWidgets.QPushButton("Done"))
+    viewer.exit_profile_btn.setToolTip("Exit the profile measurement mode")
     layout.addWidget(viewer.measure_profile_btn)
     layout.addWidget(viewer.measure_angle_btn)
-    layout.addWidget(viewer.exit_profile_btn)
     layout.addWidget(viewer.clear_profile_btn)
     layout.addWidget(viewer.show_profile_window_btn)
+    layout.addWidget(viewer.exit_profile_btn)
     layout.addStretch(1)
     return page
 
@@ -115,24 +148,22 @@ def build_spectro_context_page(viewer):
     layout = QtWidgets.QHBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
-    viewer.show_spectra_cb = QtWidgets.QCheckBox("Show in preview")
-    viewer.show_spectra_cb.setChecked(getattr(viewer, "show_preview_spectra", True))
-    viewer.show_spectra_cb.setToolTip("Toggle spectroscopy overlays in the preview panel")
-    viewer.clear_spec_selection_btn = QtWidgets.QPushButton("Clear spec selection")
+    viewer.show_spectra_cb = None
+    viewer.clear_spec_selection_btn = _configure_compact_control(QtWidgets.QPushButton("Clear selection"))
     viewer.clear_spec_selection_btn.setToolTip("Clear the multi-selection of spectroscopy points")
-    viewer.grid_as_matrix_cb = QtWidgets.QCheckBox("Treat NxN singles as matrix")
-    viewer.grid_as_matrix_cb.setChecked(getattr(viewer, "spectro_single_grid_as_matrix", False))
-    viewer.grid_as_matrix_cb.setToolTip("Interpret square grids of single .dat spectra as matrix datasets")
-    viewer.force_single_cb = QtWidgets.QCheckBox("Force single mode")
-    viewer.force_single_cb.setChecked(getattr(viewer, "spectro_force_single_mode", False))
-    viewer.force_single_cb.setToolTip("Ignore matrix hints and treat all .dat as single spectra")
-    viewer.spec_selection_label = QtWidgets.QLabel("Spectra selected: 0")
+    viewer.grid_as_matrix_cb = None
+    viewer.force_single_cb = None
+    viewer.spectro_more_btn = None
+    viewer.spectro_more_menu = None
+    viewer.spec_selection_label = QtWidgets.QLabel("Selected: 0")
     font_small = QtGui.QFont(UI_FONT_FAMILY, 9)
     viewer.spec_selection_label.setFont(font_small)
-    layout.addWidget(viewer.show_spectra_cb)
+    viewer.spec_selection_label.setMinimumWidth(0)
+    viewer.spec_selection_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+    viewer.spectro_mode_hint_label = QtWidgets.QLabel("Display options live in the top toolbar `Spectroscopy` button.")
+    viewer.spectro_mode_hint_label.setFont(font_small)
+    layout.addWidget(viewer.spectro_mode_hint_label)
     layout.addWidget(viewer.clear_spec_selection_btn)
-    layout.addWidget(viewer.grid_as_matrix_cb)
-    layout.addWidget(viewer.force_single_cb)
     layout.addWidget(viewer.spec_selection_label)
     layout.addStretch(1)
     return page
@@ -142,51 +173,65 @@ def _ensure_display_menu(viewer):
     if getattr(viewer, "display_menu", None):
         return viewer.display_menu
     viewer.display_menu = QtWidgets.QMenu(viewer)
-    viewer.matrix_markers_act = viewer.display_menu.addAction("Matrix markers")
-    viewer.matrix_markers_act.setCheckable(True)
-    viewer.matrix_markers_act.setChecked(viewer.show_matrix_markers)
-    viewer.matrix_markers_act.setToolTip("Toggle matrix spectroscopy markers")
-    viewer.matrix_markers_act.toggled.connect(viewer.on_show_matrix_markers_toggled)
-    viewer.single_markers_act = viewer.display_menu.addAction("Single markers")
-    viewer.single_markers_act.setCheckable(True)
-    viewer.single_markers_act.setChecked(viewer.show_single_markers)
-    viewer.single_markers_act.setToolTip("Toggle single spectroscopy markers")
-    viewer.single_markers_act.toggled.connect(viewer.on_show_single_markers_toggled)
-    viewer.compact_markers_act = viewer.display_menu.addAction("Compact markers")
-    viewer.compact_markers_act.setCheckable(True)
-    viewer.compact_markers_act.setChecked(viewer.compact_markers)
-    viewer.compact_markers_act.setToolTip("Use compact marker rendering")
-    viewer.compact_markers_act.toggled.connect(viewer.on_compact_markers_toggled)
-    viewer.spectro_overlay_act = viewer.display_menu.addAction("Show spectroscopy overlays")
-    viewer.spectro_overlay_act.setCheckable(True)
-    viewer.spectro_overlay_act.setChecked(viewer.show_spectra)
-    viewer.spectro_overlay_act.setToolTip("Toggle spectroscopy overlays in thumbnails and preview")
-    viewer.spectro_overlay_act.toggled.connect(viewer.on_show_spectra_toggled)
+    viewer.display_units_si_act = viewer.display_menu.addAction("Show SI units")
+    viewer.display_units_si_act.setCheckable(True)
+    viewer.display_units_si_act.setChecked(bool(getattr(viewer, "display_units_si", False)))
+    viewer.display_units_si_act.setToolTip("Show SI units in preview annotations")
+    viewer.display_units_si_act.toggled.connect(viewer.on_unit_display_toggled)
+    viewer.display_units_relative_act = viewer.display_menu.addAction("Values relative to zero")
+    viewer.display_units_relative_act.setCheckable(True)
+    viewer.display_units_relative_act.setChecked(bool(getattr(viewer, "display_units_relative", False)))
+    viewer.display_units_relative_act.setToolTip("Display values relative to the current zero/reference")
+    viewer.display_units_relative_act.toggled.connect(viewer.on_unit_relative_toggled)
+    viewer.relative_axes_act = viewer.display_menu.addAction("Relative axes")
+    viewer.relative_axes_act.setCheckable(True)
+    viewer.relative_axes_act.setChecked(bool(getattr(viewer, "relative_axes", False)))
+    viewer.relative_axes_act.setToolTip("Use relative axes in the preview")
+    viewer.relative_axes_act.toggled.connect(viewer.on_relative_axes_toggled)
+    viewer.display_scale_bar_act = viewer.display_menu.addAction("Scale bar")
+    viewer.display_scale_bar_act.setCheckable(True)
+    viewer.display_scale_bar_act.setChecked(bool(getattr(viewer, "config", {}).get("show_scale_bar", False)))
+    viewer.display_scale_bar_act.setToolTip("Show the scale bar in preview and pop-outs")
+    viewer.display_scale_bar_act.toggled.connect(viewer.on_scale_bar_toggled)
+    viewer.display_menu.addSeparator()
     viewer.molecules_act = viewer.display_menu.addAction("Show molecules")
     viewer.molecules_act.setCheckable(True)
     viewer.molecules_act.setChecked(getattr(viewer, "show_molecules", True))
     viewer.molecules_act.setToolTip("Toggle molecular overlays in the preview")
     viewer.molecules_act.toggled.connect(viewer.on_show_molecules_toggled)
+    viewer.display_molecule_gizmo_act = viewer.display_menu.addAction("Molecule gizmo")
+    viewer.display_molecule_gizmo_act.setCheckable(True)
+    viewer.display_molecule_gizmo_act.setChecked(bool(getattr(viewer, "show_molecule_gizmo", False)))
+    viewer.display_molecule_gizmo_act.setToolTip("Show a small orientation gizmo for the active molecule")
+    viewer.display_molecule_gizmo_act.toggled.connect(
+        lambda checked: viewer._apply_canvas_display_options(
+            {
+                **viewer._canvas_display_state_from_canvas(getattr(viewer, "preview_canvas", None)),
+                "show_molecule_gizmo": bool(checked),
+            },
+            source_canvas=getattr(viewer, "preview_canvas", None),
+            persist=True,
+        )
+    )
     viewer.acquisition_overlay_act = viewer.display_menu.addAction("Show acquisition overlay")
     viewer.acquisition_overlay_act.setCheckable(True)
     viewer.acquisition_overlay_act.setChecked(getattr(viewer, "show_acquisition_overlay", False))
     viewer.acquisition_overlay_act.setToolTip("Show CC/CH acquisition parameters in the top-right of preview and pop-ups")
     viewer.acquisition_overlay_act.toggled.connect(viewer.on_show_acquisition_overlay_toggled)
-    viewer.fixed_crop_quick_act = viewer.display_menu.addAction("Quick crop mode")
+    viewer.fixed_crop_quick_act = viewer.display_menu.addAction("Crop template mode")
     viewer.fixed_crop_quick_act.setCheckable(True)
     viewer.fixed_crop_quick_act.setChecked(getattr(viewer, "quick_crop_mode", False))
-    viewer.fixed_crop_quick_act.setToolTip("Enable clicking to spawn fixed-size crops")
+    viewer.fixed_crop_quick_act.setToolTip("Enable clicking to spawn repeated crops from the current template")
     viewer.fixed_crop_quick_act.toggled.connect(viewer.on_fixed_crop_quick_toggled)
     viewer.crop_template_act = viewer.display_menu.addAction("Show crop template")
     viewer.crop_template_act.setCheckable(True)
     viewer.crop_template_act.setChecked(getattr(viewer, "show_crop_template_overlay", False))
-    viewer.crop_template_act.setToolTip("Overlay the reusable crop frame in the preview")
+    viewer.crop_template_act.setToolTip("Overlay the reusable crop template in the preview")
     viewer.crop_template_act.toggled.connect(viewer.on_show_crop_template_overlay_toggled)
     viewer.crop_history_act = viewer.display_menu.addAction("Show crop history")
     viewer.crop_history_act.setCheckable(True)
-    viewer.crop_history_act.setChecked(getattr(viewer, "show_crop_history_overlay", False))
-    viewer.crop_history_act.setToolTip("Draw markers/labels for each crop")
-    viewer.crop_history_act.toggled.connect(viewer.on_show_crop_history_overlay_toggled)
+    viewer.crop_history_act.setChecked(True)
+    viewer.crop_history_act.setVisible(False)
     viewer.display_menu.addSeparator()
     viewer.profile_label_menu = viewer.display_menu.addMenu("Profile labels")
     viewer.profile_label_group = QtWidgets.QActionGroup(viewer.profile_label_menu)
@@ -206,16 +251,6 @@ def _ensure_display_menu(viewer):
         viewer.profile_label_group.addAction(act)
         viewer.profile_label_actions[mode_key] = act
     viewer.display_menu.addSeparator()
-    
-    markers_menu = viewer.display_menu.addMenu("Marker Style")
-    if hasattr(viewer, "_populate_marker_style_menu"):
-        viewer._populate_marker_style_menu(markers_menu)
-    viewer.highlight_glow_act = viewer.display_menu.addAction("Spectro highlight glow")
-    viewer.highlight_glow_act.setCheckable(True)
-    viewer.highlight_glow_act.setChecked(getattr(viewer, "spectro_highlight_glow", True))
-    viewer.highlight_glow_act.setToolTip("Pulse the selected spectroscopy marker in thumbnails and preview")
-    viewer.highlight_glow_act.toggled.connect(viewer.on_toggle_highlight_glow)
-
     viewer.display_menu.addSeparator()
     viewer.detail_dark_act = viewer.display_menu.addAction("Detail dark background")
     viewer.detail_dark_act.setCheckable(True)
@@ -231,45 +266,102 @@ def _ensure_display_menu(viewer):
     reset_act = viewer.display_menu.addAction("Reset view")
     reset_act.setToolTip("Reset all display toggles to defaults")
     reset_act.triggered.connect(viewer._reset_display_options)
-    viewer.display_menu.addSeparator()
-    save_session_act = viewer.display_menu.addAction("Save session...")
-    save_session_act.setToolTip("Save the full viewer state (virtual copies, overlays, profiles, etc.)")
-    save_session_act.triggered.connect(viewer.on_save_session)
-    load_session_act = viewer.display_menu.addAction("Load session...")
-    load_session_act.setToolTip("Restore a previously saved viewer session")
-    load_session_act.triggered.connect(viewer.on_load_session)
-    arrange_act = viewer.display_menu.addAction("Arrange pop-outs")
-    arrange_act.setToolTip("Tile and align all open preview/spectroscopy/profile windows")
-    arrange_act.triggered.connect(viewer.on_arrange_popouts)
     return viewer.display_menu
+
+
+def _ensure_tools_menu(viewer):
+    if getattr(viewer, "tools_menu", None):
+        return viewer.tools_menu
+    viewer.tools_menu = QtWidgets.QMenu(viewer)
+
+    viewer.tools_load_molecule_act = viewer.tools_menu.addAction("Load molecule...")
+    viewer.tools_load_molecule_act.setToolTip("Load a molecular structure overlay onto the preview canvas")
+    viewer.tools_load_molecule_act.triggered.connect(viewer.on_load_molecule)
+    viewer.tools_menu.addSeparator()
+
+    viewer.tools_preview_detach_act = viewer.tools_menu.addAction("Float preview")
+    viewer.tools_preview_detach_act.setToolTip("Detach the preview pane into its own floating window")
+    viewer.tools_preview_detach_act.triggered.connect(viewer.on_toggle_preview_detach)
+    viewer.tools_preview_lock_act = viewer.tools_menu.addAction("Lock preview")
+    viewer.tools_preview_lock_act.setCheckable(True)
+    viewer.tools_preview_lock_act.setChecked(bool(getattr(viewer, "preview_locked", False)))
+    viewer.tools_preview_lock_act.setToolTip("Lock the preview inside the main window")
+    viewer.tools_preview_lock_act.toggled.connect(viewer.on_preview_lock_toggled)
+    viewer.tools_menu.addSeparator()
+
+    viewer.tools_reopen_window_act = viewer.tools_menu.addAction("Reopen closed window")
+    viewer.tools_reopen_window_act.setToolTip("Restore the most recently closed popup/tool window (up to 6 levels)")
+    viewer.tools_reopen_window_act.setShortcut(QtGui.QKeySequence("Ctrl+Z"))
+    viewer.tools_reopen_window_act.triggered.connect(viewer._restore_last_closed_window)
+
+    recovery_menu = viewer.tools_menu.addMenu("Recovery")
+    viewer.session_recovery_status_act = recovery_menu.addAction("Autosave recovery: --")
+    viewer.session_recovery_status_act.setEnabled(False)
+    viewer.session_recovery_enable_act = recovery_menu.addAction("Enable autosave recovery")
+    viewer.session_recovery_enable_act.setCheckable(True)
+    viewer.session_recovery_enable_act.toggled.connect(viewer.on_toggle_session_recovery)
+    interval_menu = recovery_menu.addMenu("Autosave interval")
+    interval_group = QtWidgets.QActionGroup(interval_menu)
+    viewer.session_recovery_interval_actions = {}
+    for minutes in (2, 5, 10, 15, 30):
+        act = interval_menu.addAction(f"{minutes} min")
+        act.setCheckable(True)
+        act.triggered.connect(lambda checked=False, m=minutes: viewer.on_set_session_recovery_interval(m))
+        interval_group.addAction(act)
+        viewer.session_recovery_interval_actions[int(minutes)] = act
+        if minutes == getattr(viewer, "_session_recovery_interval_min", 5):
+            act.setChecked(True)
+    recovery_menu.addSeparator()
+    viewer.session_recovery_open_act = recovery_menu.addAction("Recover latest autosave now")
+    viewer.session_recovery_open_act.triggered.connect(viewer.on_recover_latest_autosave)
+    viewer.session_recovery_discard_act = recovery_menu.addAction("Discard autosaved recovery")
+    viewer.session_recovery_discard_act.triggered.connect(viewer.on_discard_recovery_snapshot)
+    return viewer.tools_menu
 
 
 def build_display_widget(viewer, parent):
     container = QtWidgets.QWidget(parent)
-    layout = QtWidgets.QHBoxLayout(container)
+    layout = QtWidgets.QVBoxLayout(container)
     layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(6)
+    layout.setSpacing(4)
     _ensure_display_menu(viewer)
 
-    viewer.spectro_browser_btn = QtWidgets.QPushButton("Spectro Browser", container)
-    viewer.spectro_browser_btn.setToolTip("Open the spectroscopy browser")
-    viewer.spectro_browser_btn.clicked.connect(lambda: viewer.open_spectro_browser())
-    layout.addWidget(viewer.spectro_browser_btn)
+    viewer.spectro_section_title = QtWidgets.QLabel("Spectroscopy", container)
+    viewer.spectro_section_title.setFont(QtGui.QFont(UI_FONT_FAMILY, 10, QtGui.QFont.Bold))
+    viewer.spectro_section_title.setToolTip("Use the top toolbar `Spectroscopy` button for spectroscopy display controls and browser access")
+    layout.addWidget(viewer.spectro_section_title)
+    viewer.spectro_thumbnail_markers_cb = None
+    viewer.spectro_preview_markers_cb = None
+    viewer.spectro_miniatures_cb = None
+    viewer.spectro_browser_btn = None
 
-    layout.addStretch(1)
+    viewer.spectro_hint_label = QtWidgets.QLabel(
+        "Use the top toolbar `Spectroscopy` button to open the browser and control markers and miniatures.",
+        container,
+    )
+    hint_font = QtGui.QFont(UI_FONT_FAMILY, 9)
+    viewer.spectro_hint_label.setFont(hint_font)
+    viewer.spectro_hint_label.setWordWrap(True)
+    viewer.spectro_hint_label.setToolTip("Thumbnail markers and preview markers show point positions. Miniatures show spectroscopy traces as their own cards.")
+    layout.addWidget(viewer.spectro_hint_label)
+
     viewer.spectro_stats_label = QtWidgets.QLabel(
-        "Spectros: -- (Single: --, Matrix datasets: --)", container
+        "Spectroscopy pending load", container
     )
     stats_font = QtGui.QFont(UI_FONT_FAMILY, 9)
     viewer.spectro_stats_label.setFont(stats_font)
     viewer.spectro_stats_label.setToolTip("Summary of spectroscopy content for the loaded folder")
-    layout.addWidget(viewer.spectro_stats_label, 0, QtCore.Qt.AlignRight)
+    viewer.spectro_stats_label.setWordWrap(True)
+    viewer.spectro_stats_label.setMinimumWidth(0)
+    viewer.spectro_stats_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+    layout.addWidget(viewer.spectro_stats_label)
     return container
 
 
 def apply_lower_control_theme(viewer):
     frame = getattr(viewer, "lower_control_frame", None)
     mode_widget = getattr(viewer, "mode_selector_widget", None)
+    molecules_btn = getattr(viewer, "browse_molecules_btn", None)
     if frame is None:
         return
     dark = bool(getattr(viewer, "dark_mode", False))
@@ -288,6 +380,19 @@ def apply_lower_control_theme(viewer):
     frame.setStyleSheet(lower_control_frame_style(border, bg))
     if mode_widget is not None:
         mode_widget.setStyleSheet(mode_selector_style(mode_border, mode_text, mode_checked))
+    if molecules_btn is not None:
+        molecules_btn.setStyleSheet(
+            "QToolButton#modeAccessoryButton {"
+            f" border: 1px solid {mode_border};"
+            " padding: 6px 12px;"
+            " background: transparent;"
+            f" color: {mode_text};"
+            "}"
+            "QToolButton#modeAccessoryButton:checked {"
+            f" background: {mode_checked};"
+            " color: #ffffff;"
+            "}"
+        )
 
 
 def create_shortcuts_panel(viewer):
