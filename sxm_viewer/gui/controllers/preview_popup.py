@@ -474,6 +474,13 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
         try:
             layout.activate()
             if force:
+                try:
+                    if dlg.isMaximized() or dlg.isFullScreen():
+                        canvas.updateGeometry()
+                        canvas.draw_idle()
+                        return
+                except Exception:
+                    pass
                 dlg.adjustSize()
                 dlg.setMinimumSize(0, 0)
                 _last_square_target["w"] = -1
@@ -570,14 +577,9 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
     canvas.set_views_callback(_on_popup_canvas_state_changed)
     canvas.set_crop_callback(lambda v, c=canvas: owner._on_preview_crop(v, c))
     canvas.set_virtual_copy_callback(lambda v: owner._create_virtual_copy_from_popup_view(v))
-    canvas.set_double_click_callback(
-        lambda v=None: spawn_preview_popup(
-            owner,
-            [owner._copy_view_for_popup(v)] if v else [],
-            title=owner._friendly_view_title(v, default="Preview copy") if v else "Preview copy",
-            source_canvas=canvas,
-        )
-    )
+    # Double-click on the popup canvas is disabled to prevent recursive
+    # popup-spawning (every double-click used to open yet another copy).
+    canvas.set_double_click_callback(None)
     canvas.set_filter_menu_callback(lambda menu, view, c=canvas: owner._populate_canvas_filter_menu(menu, c, view))
     canvas.set_histogram_dialog_callback(lambda c: owner._open_histogram_dialog(c))
     canvas.set_histogram_auto_callback(lambda c: owner._auto_contrast(c))
@@ -789,6 +791,8 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
             if event.type() == QtCore.QEvent.Wheel:
                 try:
                     if event.modifiers() & QtCore.Qt.ControlModifier:
+                        if dlg.isMaximized() or dlg.isFullScreen():
+                            return False
                         _schedule_resize(force=True)
                 except Exception:
                     pass
