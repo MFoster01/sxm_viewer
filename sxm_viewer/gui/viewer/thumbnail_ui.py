@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sip
+import time
 
 from ..._shared import (
     QtCore,
@@ -37,6 +38,13 @@ from ..._shared import (
 )
 from ...config import save_config
 from ..palettes import get_color_cycle, DEFAULT_COLOR_CYCLE
+from .. import theme as ui_theme
+
+
+def _thumb_frame_styles(viewer):
+    """Theme-aware card frame styles (borders only — never over the pixmap)."""
+    return ui_theme.thumb_frame_styles(getattr(viewer, "ui_theme", "light"))
+from ..thumbnail_render import array_to_qimage
 
 
 def _safe_set_property(widget, name, value):
@@ -83,62 +91,24 @@ def _thumb_render_cache_key(data_key, cmap_name, clim):
     return (data_key, cmap_name, clim)
 
 
-def _ensure_thumb_click_timer(viewer):
-    timer = getattr(viewer, "_thumb_click_timer", None)
-    if timer is not None:
-        return timer
-    parent = viewer if isinstance(viewer, QtCore.QObject) else None
-    timer = QtCore.QTimer(parent)
-    timer.setSingleShot(True)
-    timer.timeout.connect(lambda v=viewer: _flush_pending_thumb_click(v))
-    viewer._thumb_click_timer = timer
-    return timer
-
-
-def _cancel_pending_thumb_click(viewer):
-    timer = getattr(viewer, "_thumb_click_timer", None)
-    if timer is not None:
-        try:
-            timer.stop()
-        except Exception:
-            pass
-    viewer._pending_thumb_click = None
-
-
-def _run_plain_thumb_click(viewer, fp, ch_idx):
-    viewer._clear_thumb_multi_selection(update_styles=False)
-    viewer.on_thumbnail_clicked(fp, ch_idx)
-    viewer.last_thumb_anchor = str(fp)
+def _thumbnail_tooltip(viewer, file_key):
     try:
-        if not viewer.show_spectra:
-            return
-        entries = viewer.spectros_by_image.get(str(fp), [])
-        if not entries:
-            return
-        matrix_specs = [s for s in entries if s.get('matrix_index') is not None and 'matrix' in Path(s.get('path','')).name.lower()]
-        if matrix_specs:
-            viewer._open_matrix_explorer_for_file(str(fp))
-            return
-        viewer._open_spectro_summary_for_file(fp, show_mode="single", quiet=True)
+        name = Path(str(file_key)).name
     except Exception:
-        pass
-
-
-def _flush_pending_thumb_click(viewer):
-    payload = getattr(viewer, "_pending_thumb_click", None)
-    viewer._pending_thumb_click = None
-    if not payload:
-        return
-    fp = payload.get("file_path")
+        name = str(file_key)
+    tooltip = name
     try:
-        ch_idx = int(payload.get("channel_index") or 0)
+        label = viewer._thumbnail_filter_label(file_key)
+        steps = viewer._thumbnail_filter_steps(file_key)
+        details = viewer._filter_pipeline_tooltip(label, steps)
     except Exception:
-        ch_idx = 0
-    _run_plain_thumb_click(viewer, fp, ch_idx)
+        details = ""
+    if details:
+        tooltip = f"{tooltip}\n{details}"
+    return tooltip
 
 
-def _schedule_plain_thumb_click(viewer, label_widget, fp, ch_idx):
-    _cancel_pending_thumb_click(viewer)
+def _activate_plain_thumb_click(viewer, fp, ch_idx):
     viewer._clear_thumb_multi_selection(update_styles=False)
     viewer.selected_file_for_thumbs = str(fp)
     try:
@@ -146,13 +116,7 @@ def _schedule_plain_thumb_click(viewer, label_widget, fp, ch_idx):
     except Exception:
         pass
     viewer.last_thumb_anchor = str(fp)
-    viewer._pending_thumb_click = {
-        "file_path": fp,
-        "channel_index": int(ch_idx),
-        "label_widget": label_widget,
-    }
-    interval = max(0, int(QtWidgets.QApplication.doubleClickInterval()))
-    _ensure_thumb_click_timer(viewer).start(interval)
+    viewer.on_thumbnail_clicked(fp, ch_idx)
 
 def _thumb_dimensions(viewer):
     """Return (width, height) for thumbnails preserving 4:3 aspect ratio."""
@@ -208,11 +172,88 @@ def _spectro_display_channel(viewer, spec):
     available = set(_spectro_available_channels(spec))
     if override and override in available:
         return override
+    preferred = str(spec.get("channel_name") or "").strip()
+    if preferred and preferred in available:
+        return preferred
     default = getattr(viewer, "spectro_miniature_default_channel", "")
     if default and default in available:
         return default
     channels = _spectro_available_channels(spec)
     return channels[0] if channels else ""
+
+
+def _spectro_identity_key(spec):
+    path = str(spec.get("path") or "")
+    matrix_index = spec.get("matrix_index")
+    if matrix_index is not None:
+        return f"{path}#idx:{matrix_index}"
+    x_val = spec.get("x")
+    y_val = spec.get("y")
+    if x_val is not None or y_val is not None:
+        try:
+            return f"{path}#pos:{round(float(x_val), 6)}:{round(float(y_val), 6)}"
+        except Exception:
+            return f"{path}#pos:{x_val}:{y_val}"
+    order_idx = spec.get("order_idx")
+    if order_idx is not None:
+        return f"{path}#order:{order_idx}"
+    return path
+
+
+def _spectro_values_for_channel(spec, channel_name):
+    channel_name = str(channel_name or "").strip()
+    channels_map = spec.get("channels") or {}
+    if channel_name and channel_name in channels_map:
+        try:
+            return np.asarray(channels_map[channel_name], dtype=float)
+        except Exception:
+            pass
+    data_pair = spec.get("data")
+    preferred = str(spec.get("channel_name") or "").strip()
+    if channel_name and preferred and channel_name == preferred and isinstance(data_pair, (list, tuple)) and len(data_pair) >= 2:
+        try:
+            return np.asarray(data_pair[1], dtype=float)
+        except Exception:
+            pass
+    if channels_map:
+        for name, values in channels_map.items():
+            if str(name).strip().lower() == "bias":
+                continue
+            try:
+                return np.asarray(values, dtype=float)
+            except Exception:
+                continue
+    return np.asarray([], dtype=float)
+
+
+def _pick_spectro_thumbnail_spec(viewer, specs):
+    specs = [spec for spec in list(specs or []) if isinstance(spec, dict)]
+    if not specs:
+        return None
+    if len(specs) == 1:
+        return specs[0]
+    preferred = _spectro_display_channel(viewer, specs[0])
+    best_spec = specs[0]
+    best_score = None
+    for spec in specs:
+        channel_name = preferred or _spectro_display_channel(viewer, spec)
+        values = _spectro_values_for_channel(spec, channel_name)
+        score = None
+        try:
+            arr = np.asarray(values, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size >= 2:
+                span = float(np.nanmax(arr) - np.nanmin(arr))
+                variation = float(np.nanstd(arr))
+                score = (span, variation, arr.size)
+        except Exception:
+            score = None
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_spec = spec
+    return best_spec
 
 
 def _spectro_entry_time(viewer, spec):
@@ -283,14 +324,15 @@ def _spectro_entry_time(viewer, spec):
 def _refresh_spectro_thumb_selection_styles(viewer):
     sel = str(getattr(viewer, "selected_spectro_thumb_file", "") or "")
     multi = getattr(viewer, "spectro_thumb_multi_select", set())
+    styles = _thumb_frame_styles(viewer)
     for fp, w in list(getattr(viewer, "spectro_thumb_widgets", {}).items()):
         try:
             if str(fp) in multi:
-                w.setStyleSheet("QFrame { border: 2px solid #ff9c3a; border-radius: 10px; background-color: rgba(255,156,58,42); }")
+                w.setStyleSheet(styles["spectro_multi"])
             elif str(fp) == sel and sel:
-                w.setStyleSheet("QFrame { border: 2px solid #5f8dd3; border-radius: 10px; background-color: rgba(95,141,211,36); }")
+                w.setStyleSheet(styles["selected"])
             else:
-                w.setStyleSheet("QFrame { border: 1px solid rgba(255,184,77,170); border-radius: 10px; background-color: rgba(255,184,77,22); }")
+                w.setStyleSheet(styles["spectro_card"])
         except Exception:
             continue
 
@@ -344,13 +386,21 @@ def _set_thumbnail_selection_by_order(viewer, ordered_keys, start_key, end_key, 
 
 def _spectroscopy_miniature_pixmap(viewer, spec, width, height, channel_name=None):
     """Render a compact spectral preview for spectroscopy-only thumbnail cards."""
+    if not (spec.get("channels") or {}) and hasattr(viewer, "hydrate_spectro_entry"):
+        try:
+            viewer.hydrate_spectro_entry(spec)
+        except Exception:
+            pass
+    effective_channel = str(channel_name or "").strip()
+    if not effective_channel:
+        effective_channel = _spectro_display_channel(viewer, spec)
     try:
         cache_key = (
-            str(spec.get("path") or ""),
+            _spectro_identity_key(spec),
             spec.get("file_mtime") or spec.get("time") or "",
             int(width),
             int(height),
-            str(channel_name or ""),
+            effective_channel,
             str(getattr(viewer, "spectro_color_cycle", DEFAULT_COLOR_CYCLE)),
         )
         pix_cache = getattr(viewer, "_spectro_miniature_cache", None)
@@ -359,11 +409,6 @@ def _spectroscopy_miniature_pixmap(viewer, spec, width, height, channel_name=Non
     except Exception:
         cache_key = None
         pix_cache = None
-    if not (spec.get("channels") or {}) and hasattr(viewer, "hydrate_spectro_entry"):
-        try:
-            viewer.hydrate_spectro_entry(spec)
-        except Exception:
-            pass
     pix = QtGui.QPixmap(max(32, int(width)), max(32, int(height)))
     pix.fill(QtGui.QColor("#0d1220"))
     painter = QtGui.QPainter(pix)
@@ -376,13 +421,18 @@ def _spectroscopy_miniature_pixmap(viewer, spec, width, height, channel_name=Non
 
         channels_map = spec.get("channels") or {}
         channel_keys = _spectro_available_channels(spec)
-        if channel_name and channel_name in channels_map:
-            channel_keys = [channel_name]
+        if effective_channel and effective_channel in channels_map:
+            channel_keys = [effective_channel]
         elif channel_keys:
-            channel_name = _spectro_display_channel(viewer, spec)
-            if channel_name in channels_map:
-                channel_keys = [channel_name]
-        channels = [(name, channels_map[name]) for name in channel_keys if name in channels_map]
+            if effective_channel in channels_map:
+                channel_keys = [effective_channel]
+        channels = []
+        if effective_channel:
+            selected_values = _spectro_values_for_channel(spec, effective_channel)
+            if selected_values.size:
+                channels = [(effective_channel, selected_values)]
+        if not channels:
+            channels = [(name, channels_map[name]) for name in channel_keys if name in channels_map]
         if not channels:
             painter.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220), 1.0))
             painter.drawText(rect, QtCore.Qt.AlignCenter, "No channels")
@@ -452,7 +502,7 @@ def _spectroscopy_miniature_pixmap(viewer, spec, width, height, channel_name=Non
             y_min, y_max = -1.0, 1.0
         if not np.isfinite(y_min) or not np.isfinite(y_max) or y_max == y_min:
             y_min, y_max = -1.0, 1.0
-        pad_y = 0.08 * max(1e-9, (y_max - y_min))
+        pad_y = 0.08 * (y_max - y_min)
         y_min -= pad_y
         y_max += pad_y
 
@@ -479,8 +529,8 @@ def _spectroscopy_miniature_pixmap(viewer, spec, width, height, channel_name=Non
             painter.drawPolyline(QtGui.QPolygonF(pts))
 
         footer = axis_label or "Axis"
-        if channel_keys:
-            footer = f"{footer} · {channel_keys[0]}"
+        if channels:
+            footer = f"{footer} · {channels[0][0]}"
         if axis_unit:
             footer = f"{footer} ({axis_unit})"
         painter.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210, 180), 1.0))
@@ -499,7 +549,108 @@ def _spectroscopy_miniature_pixmap(viewer, spec, width, height, channel_name=Non
     return pix
 
 
+def _compute_thumbnail_file_order(viewer):
+    """Filter/sort/virtual-order viewer.files into the order that would be
+    shown for the current filter/sort combo settings - pure computation, no
+    widget creation, so it's safe to call speculatively from the cheap
+    resort/refilter fast path (see on_thumb_sort_changed/on_thumb_filter_changed)
+    to check whether a change actually alters the visible file set before
+    deciding whether a full populate_thumbnails_for_channel rebuild is
+    needed. Mirrors the file-order logic inside populate_thumbnails_for_channel
+    exactly; that function calls this helper too, so there is only one place
+    this logic lives."""
+    files_iter = list(viewer.files)
+
+    filt = (viewer.thumb_filter_combo.currentText() if hasattr(viewer, 'thumb_filter_combo') else 'All')
+    if filt == 'With spectroscopy' and not getattr(viewer, '_spectros_loaded', False):
+        # The filter needs spec-to-image assignments; force the lazy load the
+        # same way the spectro-miniatures path above does.
+        try:
+            log_status("Loading spectroscopy references for the 'With spectroscopy' filter...")
+            viewer.ensure_spectros_loaded(refresh=False)
+        except Exception:
+            pass
+    if filt and filt != 'All':
+        matrix_set = set(getattr(viewer, 'files_with_matrix', set()) or [])
+        spectra_set = set(getattr(viewer, 'files_with_spectra', set()) or [])
+        def include(path_str):
+            tag = effective_tag(viewer, path_str)
+            if filt == 'Starred':
+                return path_str in (getattr(viewer, 'starred', None) or set())
+            if filt == 'Constant height':
+                return tag == 'constant-height'
+            if filt == 'Constant current':
+                return tag == 'constant-current'
+            if filt == 'With spectroscopy':
+                return effective_spectra_key(viewer, path_str) in spectra_set
+            if filt == 'Untagged':
+                return tag is None
+            if filt == 'Matrix datasets':
+                return effective_spectra_key(viewer, path_str) in matrix_set
+            return True
+        files_iter = [t for t in files_iter if include(str(t))]
+
+    sort_mode = (viewer.thumb_sort_combo.currentText() if hasattr(viewer, 'thumb_sort_combo') else 'Name (A?Z)')
+    real_files_iter = [str(p) for p in files_iter if not viewer._is_processed_key(str(p))]
+    processed_files_iter = [str(p) for p in files_iter if viewer._is_processed_key(str(p))]
+    if sort_mode.startswith('Name'):
+        def _natural_key(name: str):
+            parts = re.split(r"(\d+)", name)
+            key = []
+            for part in parts:
+                if part.isdigit():
+                    try:
+                        key.append(int(part))
+                    except Exception:
+                        key.append(part)
+                else:
+                    key.append(part.lower())
+            return key
+        real_files_iter.sort(key=lambda p: _natural_key(Path(p).name))
+    elif 'Date (new' in sort_mode or 'Date (old' in sort_mode:
+        rev = ('new' in sort_mode)
+        def sort_key_date(p):
+            hdr = viewer.headers.get(str(p), (None, None))[0]
+            return viewer._parse_header_datetime(hdr, path=p)
+        real_files_iter.sort(key=sort_key_date, reverse=rev)
+    elif sort_mode.startswith('Tag'):
+        order = {'constant-height': 0, 'constant-current': 1, None: 2}
+        real_files_iter.sort(key=lambda p: (order.get(effective_tag(viewer, str(p)), 2), Path(p).name.lower()))
+
+    try:
+        files_iter = viewer._ordered_virtual_thumbnail_files(real_files_iter, processed_files_iter)
+    except Exception:
+        files_iter = list(real_files_iter) + list(processed_files_iter)
+    return files_iter
+
+
 def populate_thumbnails_for_channel(viewer, channel_idx:int):
+    _t0_populate = time.perf_counter()
+    preserve_scroll_state = None
+    scroll_widget = getattr(viewer, "scroll", None)
+    try:
+        if getattr(viewer, "_thumb_labels", None) and hasattr(viewer, "_capture_thumbnail_scroll_state"):
+            preserve_scroll_state = viewer._capture_thumbnail_scroll_state()
+    except Exception:
+        preserve_scroll_state = None
+    try:
+        if preserve_scroll_state and scroll_widget is not None:
+            scroll_widget.setUpdatesEnabled(False)
+    except Exception:
+        pass
+
+    def _finish_populate():
+        try:
+            if preserve_scroll_state and hasattr(viewer, "_restore_thumbnail_scroll_state"):
+                viewer._restore_thumbnail_scroll_state(preserve_scroll_state, delayed=True)
+        except Exception:
+            pass
+        try:
+            if preserve_scroll_state and scroll_widget is not None:
+                scroll_widget.setUpdatesEnabled(True)
+        except Exception:
+            pass
+
     if getattr(viewer, "show_spectro_miniatures", False) and not getattr(viewer, "_spectros_loaded", False):
         try:
             viewer.ensure_spectros_loaded(refresh=False)
@@ -521,59 +672,11 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
     cmap_name = getattr(viewer, "thumb_cmap", None) or viewer.thumb_cmap_combo.currentText()
     viewer._thumb_generation += 1
     generation = viewer._thumb_generation
-    files_iter = list(viewer.files)
+    files_iter = _compute_thumbnail_file_order(viewer)
     try:
         viewer.thumb_grid_columns = max_cols
     except Exception:
         viewer.thumb_grid_columns = 1
-
-    filt = (viewer.thumb_filter_combo.currentText() if hasattr(viewer, 'thumb_filter_combo') else 'All')
-    if filt and filt != 'All':
-        matrix_set = set(getattr(viewer, 'files_with_matrix', set()) or [])
-        def include(path_str):
-            tag = (viewer.tags.get(path_str, {}) or {}).get('tag', None)
-            if filt == 'Constant height':
-                return tag == 'constant-height'
-            if filt == 'Constant current':
-                return tag == 'constant-current'
-            if filt == 'Untagged':
-                return tag is None
-            if filt == 'Matrix datasets':
-                return path_str in matrix_set
-            return True
-        files_iter = [t for t in files_iter if include(str(t))]
-
-    sort_mode = (viewer.thumb_sort_combo.currentText() if hasattr(viewer, 'thumb_sort_combo') else 'Name (A?Z)')
-    real_files_iter = [str(p) for p in files_iter if not viewer._is_processed_key(str(p))]
-    processed_files_iter = [str(p) for p in files_iter if viewer._is_processed_key(str(p))]
-    if sort_mode.startswith('Name'):
-        def _natural_key(name: str):
-            parts = re.split(r"(\\d+)", name)
-            key = []
-            for part in parts:
-                if part.isdigit():
-                    try:
-                        key.append(int(part))
-                    except Exception:
-                        key.append(part)
-                else:
-                    key.append(part.lower())
-            return key
-        real_files_iter.sort(key=lambda p: _natural_key(Path(p).name))
-    elif 'Date (new' in sort_mode or 'Date (old' in sort_mode:
-        rev = ('new' in sort_mode)
-        def sort_key_date(p):
-            hdr = viewer.headers.get(str(p), (None, None))[0]
-            return viewer._parse_header_datetime(hdr, path=p)
-        real_files_iter.sort(key=sort_key_date, reverse=rev)
-    elif sort_mode.startswith('Tag'):
-        order = {'constant-height': 0, 'constant-current': 1, None: 2}
-        real_files_iter.sort(key=lambda p: (order.get((viewer.tags.get(str(p), {}) or {}).get('tag', None), 2), Path(p).name.lower()))
-
-    try:
-        files_iter = viewer._ordered_virtual_thumbnail_files(real_files_iter, processed_files_iter)
-    except Exception:
-        files_iter = list(real_files_iter) + list(processed_files_iter)
 
     viewer.current_thumb_files = [str(f) for f in files_iter]
     viewer._thumb_meta = {}
@@ -599,15 +702,19 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
                 "fds": fds,
             })
         spectro_entries = []
-        seen_paths = set()
+        grouped_specs = OrderedDict()
         for spec in list(getattr(viewer, "spectros", []) or []):
             try:
                 key = str(Path(spec.get("path", "")).resolve()).lower()
             except Exception:
                 key = str(spec.get("path", "")).lower()
-            if not key or key in seen_paths:
+            if not key:
                 continue
-            seen_paths.add(key)
+            grouped_specs.setdefault(key, []).append(spec)
+        for grouped in grouped_specs.values():
+            spec = _pick_spectro_thumbnail_spec(viewer, grouped)
+            if not spec:
+                continue
             spectro_entries.append({
                 "kind": "spectro",
                 "key": str(spec.get("path", "")),
@@ -644,6 +751,8 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
                     lbl.setProperty("thumb_dims", (thumb_w, thumb_h))
                     lbl.setProperty("drag_start", None)
                     lbl.setProperty("dragging", False)
+                    thumb_tooltip = _thumbnail_tooltip(viewer, key)
+                    lbl.setToolTip(thumb_tooltip)
                     placeholder = QtGui.QPixmap(thumb_w, thumb_h)
                     placeholder.fill(QtGui.QColor('#0b0b12'))
                     lbl.setPixmap(placeholder)
@@ -660,6 +769,7 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
                     vbox.addWidget(lbl)
                     cap = QtWidgets.QLabel(Path(t).name); cap.setAlignment(QtCore.Qt.AlignCenter); cap.setMaximumHeight(18)
                     cap.setFont(QtGui.QFont("Segoe UI", 9)); vbox.addWidget(cap)
+                    cap.setToolTip(thumb_tooltip)
                     cap.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
                     cap.customContextMenuRequested.connect(lambda pos, lb=lbl: viewer._on_thumb_context_menu(lb, pos))
                     card_layout.addLayout(vbox)
@@ -667,12 +777,13 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
                     viewer.thumb_widgets[key] = card
                     viewer._thumb_labels[key] = lbl
                     try:
+                        _card_styles = _thumb_frame_styles(viewer)
                         if key in getattr(viewer, 'thumb_multi_select', set()):
-                            card.setStyleSheet("QFrame { border: 2px solid #a36bff; border-radius: 10px; background-color: rgba(163,107,255,40); }")
+                            card.setStyleSheet(_card_styles["multi"])
                         elif key == str(getattr(viewer, 'selected_file_for_thumbs', None)):
-                            card.setStyleSheet("QFrame { border: 2px solid #5f8dd3; border-radius: 10px; background-color: rgba(95,141,211,40); }")
+                            card.setStyleSheet(_card_styles["selected"])
                         else:
-                            card.setStyleSheet("QFrame { border: 1px solid rgba(255,255,255,30); border-radius: 10px; background-color: transparent; }")
+                            card.setStyleSheet(_card_styles["default"])
                     except Exception:
                         pass
                     if fds and 0 <= thumb_channel_idx < len(fds):
@@ -715,7 +826,7 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
                     card = QtWidgets.QFrame()
                     card.setFrameShape(QtWidgets.QFrame.StyledPanel)
                     card.setLineWidth(0)
-                    card.setStyleSheet("QFrame { border: 1px solid rgba(255, 184, 77, 170); border-radius: 10px; background-color: rgba(255, 184, 77, 22); }")
+                    card.setStyleSheet(_thumb_frame_styles(viewer)["spectro_card"])
                     vbox = QtWidgets.QVBoxLayout(card)
                     vbox.setContentsMargins(4, 4, 4, 4)
                     vbox.setSpacing(4)
@@ -744,7 +855,7 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
                     viewer.spectro_thumb_widgets[key] = card
                     viewer._spectro_thumb_labels[key] = lbl
                     if key in getattr(viewer, "spectro_thumb_multi_select", set()):
-                        card.setStyleSheet("QFrame { border: 2px solid #ff9c3a; border-radius: 10px; background-color: rgba(255,156,58,42); }")
+                        card.setStyleSheet(_thumb_frame_styles(viewer)["spectro_multi"])
                 # Advance the grid once per entry so images and spectra stay in the same
                 # acquisition-order stream instead of collapsing into separate blocks.
                 col += 1
@@ -764,8 +875,32 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
             except Exception:
                 pass
             viewer._refresh_frame_map_pixmaps()
+            _finish_populate()
+            _total_ms = (time.perf_counter() - _t0_populate) * 1000
+            log_status(f"[Perf] populate_thumbnails_for_channel (spectro miniatures): total {_total_ms:.0f} ms | {len(display_entries)} entries")
             return
 
+    _t0_loop = time.perf_counter()
+    # Only do the (stat()-backed) cache-hit lookup for thumbnails that will
+    # actually be visible right after this rebuild - the same window
+    # _request_visible_thumbs() computes a few lines below. Every other file
+    # just gets a placeholder, with its data_key/cache lookup deferred until
+    # it's scrolled into view, instead of an unconditional per-file
+    # Path.stat() syscall (see _thumbnail_data_key) for the entire, often
+    # much larger, off-screen majority on every sort/filter/channel change -
+    # expensive on network-mounted data folders.
+    try:
+        vp = getattr(viewer, '_thumb_viewport', None)
+        scroll = getattr(viewer, 'scroll', None)
+        card_h = viewer._thumb_card_height
+        y0 = scroll.verticalScrollBar().value() if scroll else 0
+        vh = vp.height() if vp else card_h * 4
+        first_row = max(0, int(y0 // card_h) - 2)
+        last_row = int((y0 + vh) // card_h) + 2
+        visible_start_idx = max(0, first_row * max_cols)
+        visible_end_idx = min(len(files_iter), (last_row + 1) * max_cols)
+    except Exception:
+        visible_start_idx, visible_end_idx = 0, len(files_iter)
     for i, t in enumerate(files_iter):
         key = str(t)
         if key not in viewer.headers:
@@ -782,6 +917,8 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
         lbl.setProperty("thumb_dims", (thumb_w, thumb_h))
         lbl.setProperty("drag_start", None)
         lbl.setProperty("dragging", False)
+        thumb_tooltip = _thumbnail_tooltip(viewer, key)
+        lbl.setToolTip(thumb_tooltip)
         placeholder = QtGui.QPixmap(thumb_w, thumb_h)
         placeholder.fill(QtGui.QColor('#0b0b12'))
         lbl.setPixmap(placeholder)
@@ -798,6 +935,7 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
         vbox.addWidget(lbl)
         cap = QtWidgets.QLabel(Path(t).name); cap.setAlignment(QtCore.Qt.AlignCenter); cap.setMaximumHeight(18)
         cap.setFont(QtGui.QFont("Segoe UI", 9)); vbox.addWidget(cap)
+        cap.setToolTip(thumb_tooltip)
         cap.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         cap.customContextMenuRequested.connect(lambda pos, lb=lbl: viewer._on_thumb_context_menu(lb, pos))
         card_layout.addLayout(vbox)
@@ -805,12 +943,13 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
         viewer.thumb_widgets[key] = card
         viewer._thumb_labels[key] = lbl
         try:
+            _card_styles = _thumb_frame_styles(viewer)
             if key in getattr(viewer, 'thumb_multi_select', set()):
-                card.setStyleSheet("QFrame { border: 2px solid #a36bff; border-radius: 10px; background-color: rgba(163,107,255,40); }")
+                card.setStyleSheet(_card_styles["multi"])
             elif key == str(getattr(viewer, 'selected_file_for_thumbs', None)):
-                card.setStyleSheet("QFrame { border: 2px solid #5f8dd3; border-radius: 10px; background-color: rgba(95,141,211,40); }")
+                card.setStyleSheet(_card_styles["selected"])
             else:
-                card.setStyleSheet("QFrame { border: 1px solid rgba(255,255,255,30); border-radius: 10px; background-color: transparent; }")
+                card.setStyleSheet(_card_styles["default"])
         except Exception:
             pass
 
@@ -818,12 +957,13 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
             fd = fds[thumb_channel_idx]
             base_pix = None
             data_key = None
-            try:
-                data_key = viewer._thumbnail_data_key(key, thumb_channel_idx, fd, thumb_w, thumb_h)
-            except Exception:
-                data_key = None
-            if data_key:
-                base_pix = viewer.thumb_cache.get(_thumb_render_cache_key(data_key, entry_cmap_name, entry_clim))
+            if visible_start_idx <= i < visible_end_idx:
+                try:
+                    data_key = viewer._thumbnail_data_key(key, thumb_channel_idx, fd, thumb_w, thumb_h)
+                except Exception:
+                    data_key = None
+                if data_key:
+                    base_pix = viewer.thumb_cache.get(_thumb_render_cache_key(data_key, entry_cmap_name, entry_clim))
             if base_pix is not None:
                 pix = base_pix.copy()
                 crop_info = None
@@ -853,19 +993,149 @@ def populate_thumbnails_for_channel(viewer, channel_idx:int):
         if col >= max_cols:
             col = 0; row += 1
 
+    _loop_ms = (time.perf_counter() - _t0_loop) * 1000
     # kick off initial batch for visible thumbs
+    _t0_visible = time.perf_counter()
     try:
         viewer._request_visible_thumbs()
     except Exception:
         pass
+    _visible_ms = (time.perf_counter() - _t0_visible) * 1000
     viewer._refresh_frame_map_pixmaps()
+    _finish_populate()
+    _total_ms = (time.perf_counter() - _t0_populate) * 1000
+    log_status(f"[Perf] populate_thumbnails_for_channel: total {_total_ms:.0f} ms | widget loop {_loop_ms:.0f} ms ({len(files_iter)} files) | request_visible {_visible_ms:.0f} ms")
+
+
+def reflow_thumbnail_grid(viewer, channel_idx: int):
+    """Cheap re-layout for a pure viewport-width change (more/fewer columns
+    now fit) - e.g. the window being resized or maximized. The full
+    populate_thumbnails_for_channel() destroys and recreates every
+    thumbnail's QLabel/QFrame/QVBoxLayout/tooltip/event-handler/style-sheet
+    from scratch, which is where the "substantial delay on resize/maximize"
+    actually came from (measured: ~900ms-1.3s of an ~1s+ total for 224
+    files) - all to change row/col assignment, not any widget's content.
+    Existing card widgets are just repositioned in the grid instead
+    (QGridLayout.addWidget on an already-parented widget moves it in
+    place; it does not recreate anything). Falls back to a full rebuild if
+    there's nothing to reposition yet.
+    """
+    has_image_widgets = bool(getattr(viewer, "thumb_widgets", None))
+    has_spectro_widgets = bool(getattr(viewer, "spectro_thumb_widgets", None))
+    if not has_image_widgets and not has_spectro_widgets:
+        return populate_thumbnails_for_channel(viewer, channel_idx)
+    _t0 = time.perf_counter()
+    thumb_w, thumb_h = viewer._thumb_dimensions()
+    try:
+        vp = getattr(viewer, '_thumb_viewport', None)
+        avail_w = vp.width() if vp is not None else (viewer.thumb_container.width() if hasattr(viewer, 'thumb_container') else 800)
+    except Exception:
+        avail_w = 800
+    card_w = thumb_w + 24
+    max_cols = max(1, min(12, int(avail_w / card_w)))
+    if max_cols == getattr(viewer, "thumb_grid_columns", None):
+        return
+    viewer.thumb_grid_columns = max_cols
+    if getattr(viewer, "current_thumbnail_entries", None):
+        ordered_keys = [str(item.get("key", "")) for item in viewer.current_thumbnail_entries]
+    else:
+        ordered_keys = list(getattr(viewer, "current_thumb_files", []) or [])
+    image_widgets = getattr(viewer, "thumb_widgets", {}) or {}
+    spectro_widgets = getattr(viewer, "spectro_thumb_widgets", {}) or {}
+    row = col = 0
+    moved = 0
+    for key in ordered_keys:
+        card = image_widgets.get(key) or spectro_widgets.get(key)
+        if card is None:
+            continue
+        viewer.thumb_layout.addWidget(card, row, col)
+        moved += 1
+        col += 1
+        if col >= max_cols:
+            col = 0
+            row += 1
+    try:
+        viewer._request_visible_thumbs()
+    except Exception:
+        pass
+    elapsed_ms = (time.perf_counter() - _t0) * 1000
+    log_status(f"[Perf] reflow_thumbnail_grid: {elapsed_ms:.0f} ms | {moved} widgets repositioned, {max_cols} cols")
+
+
+def _try_cheap_thumbnail_resort(viewer, channel_idx):
+    """Attempt a cheap in-place reposition of the existing thumbnail cards
+    for a sort/filter combo change, instead of the full
+    populate_thumbnails_for_channel() rebuild (which destroys and recreates
+    every card's QLabel/QFrame/QVBoxLayout/tooltip/event-handler/style-sheet
+    from scratch - see reflow_thumbnail_grid's docstring for the same cost
+    measured on a resize: ~900ms-1.3s/224 files). Reuses that same
+    "reposition an already-parented widget in the QGridLayout" technique.
+
+    Only safe when the new filter/sort settings would show exactly the same
+    set of files as what's already on screen (a pure sort-order change, or a
+    filter change that happens not to alter the visible set) - anything else
+    (an actual filter change, spectro-miniature mode, no widgets yet) falls
+    back to the full rebuild by returning False, so this can never produce
+    an incorrect thumbnail grid, only skip the optimization."""
+    if getattr(viewer, "show_spectro_miniatures", False):
+        return False
+    if getattr(viewer, "spectro_thumb_widgets", None):
+        return False
+    image_widgets = getattr(viewer, "thumb_widgets", None) or {}
+    if not image_widgets:
+        return False
+    try:
+        new_order = _compute_thumbnail_file_order(viewer)
+    except Exception:
+        return False
+    new_keys = [str(f) for f in new_order]
+    if set(new_keys) != set(image_widgets.keys()):
+        return False
+
+    thumb_w, thumb_h = viewer._thumb_dimensions()
+    try:
+        vp = getattr(viewer, '_thumb_viewport', None)
+        avail_w = vp.width() if vp is not None else (viewer.thumb_container.width() if hasattr(viewer, 'thumb_container') else 800)
+    except Exception:
+        avail_w = 800
+    card_w = thumb_w + 24
+    max_cols = max(1, min(12, int(avail_w / card_w)))
+
+    row = col = 0
+    for key in new_keys:
+        card = image_widgets.get(key)
+        if card is None:
+            return False
+        viewer.thumb_layout.addWidget(card, row, col)
+        col += 1
+        if col >= max_cols:
+            col = 0
+            row += 1
+    viewer.thumb_grid_columns = max_cols
+    viewer.current_thumb_files = new_keys
+    try:
+        viewer._refresh_thumb_selection_styles()
+    except Exception:
+        pass
+    try:
+        viewer._request_visible_thumbs()
+    except Exception:
+        pass
+    return True
+
 
 def on_thumb_sort_changed(viewer, idx):
     try:
         viewer.config['thumb_sort'] = viewer.thumb_sort_combo.currentText(); save_config(viewer.config)
     except Exception:
         pass
-    viewer.populate_thumbnails_for_channel(viewer.channel_dropdown.currentIndex())
+    channel_idx = viewer.channel_dropdown.currentIndex()
+    try:
+        if _try_cheap_thumbnail_resort(viewer, channel_idx):
+            return
+    except Exception:
+        pass
+    viewer.populate_thumbnails_for_channel(channel_idx)
 
 
 def on_thumb_filter_changed(viewer, idx):
@@ -873,7 +1143,178 @@ def on_thumb_filter_changed(viewer, idx):
         viewer.config['thumb_filter'] = viewer.thumb_filter_combo.currentText(); save_config(viewer.config)
     except Exception:
         pass
-    viewer.populate_thumbnails_for_channel(viewer.channel_dropdown.currentIndex())
+    channel_idx = viewer.channel_dropdown.currentIndex()
+    try:
+        if _try_cheap_thumbnail_resort(viewer, channel_idx):
+            return
+    except Exception:
+        pass
+    viewer.populate_thumbnails_for_channel(channel_idx)
+
+
+def effective_tag(viewer, path_str):
+    """CH/CC tag for a thumbnail key. Virtual copies (processed keys) inherit
+    their source image's tag - a crop/copy of a constant-height scan is still
+    constant-height - so tag filters, badges, and tag-sorting treat them alike."""
+    key = str(path_str)
+    tag = (viewer.tags.get(key, {}) or {}).get('tag', None)
+    if tag is None and viewer._is_processed_key(key):
+        src = ((getattr(viewer, '_processed_views', {}) or {}).get(key) or {}).get('source')
+        if src:
+            tag = (viewer.tags.get(str(src), {}) or {}).get('tag', None)
+    return tag
+
+
+def effective_spectra_key(viewer, path_str):
+    """Key used for per-image spectroscopy lookups (files_with_spectra /
+    files_with_matrix, which are keyed by real image paths). Virtual copies
+    resolve to their source image, same rationale as effective_tag: a crop/copy
+    of an image with spectra is still that surface."""
+    key = str(path_str)
+    if viewer._is_processed_key(key):
+        src = ((getattr(viewer, '_processed_views', {}) or {}).get(key) or {}).get('source')
+        if src:
+            return str(src)
+    return key
+
+
+def set_thumb_filter_mode(viewer, label, *, toggle=False):
+    """Switch the thumbnail filter combo to `label` (the single source of truth
+    for filtering). With toggle=True, selecting the already-active mode goes
+    back to 'All' - so one shortcut both enters and leaves a filtered view."""
+    combo = getattr(viewer, 'thumb_filter_combo', None)
+    if combo is None:
+        return
+    target = label
+    if toggle and combo.currentText() == label:
+        target = 'All'
+    idx = combo.findText(target)
+    if idx >= 0 and idx != combo.currentIndex():
+        combo.setCurrentIndex(idx)
+
+
+def toggle_star_for_paths(viewer, paths, animate=True):
+    """Star/unstar thumbnails. If any target is unstarred, star them all;
+    otherwise unstar them all. Returns True when files were starred."""
+    paths = [str(p) for p in (paths or []) if p]
+    if not paths:
+        return False
+    stars = getattr(viewer, 'starred', None)
+    if stars is None:
+        stars = set()
+        viewer.starred = stars
+    make_starred = any(p not in stars for p in paths)
+    newly_starred = []
+    for p in paths:
+        if make_starred:
+            if p not in stars:
+                stars.add(p)
+                newly_starred.append(p)
+        else:
+            stars.discard(p)
+    try:
+        viewer.config['starred'] = sorted(stars)
+        save_config(viewer.config)
+    except Exception:
+        pass
+    filt = viewer.thumb_filter_combo.currentText() if hasattr(viewer, 'thumb_filter_combo') else 'All'
+    if filt == 'Starred' and not make_starred:
+        # Unstarred files must leave the filtered grid immediately.
+        viewer.populate_thumbnails_for_channel(viewer.channel_dropdown.currentIndex())
+    else:
+        redecorate_thumbnails(viewer, paths)
+        if animate and make_starred:
+            for p in newly_starred:
+                _animate_star_pop(viewer, p)
+    return make_starred
+
+
+def redecorate_thumbnails(viewer, keys):
+    """Re-render the decoration layer (tag borders, star/filter badges,
+    spectroscopy markers) of already-loaded thumbnails without re-reading data."""
+    labels = getattr(viewer, '_thumb_labels', {}) or {}
+    try:
+        cmap_name = viewer.thumb_cmap_combo.currentText()
+    except Exception:
+        cmap_name = None
+    if not cmap_name:
+        cmap_name = getattr(viewer, 'thumb_cmap', 'viridis')
+    for file_key in keys:
+        label = labels.get(str(file_key))
+        if label is None:
+            continue
+        try:
+            thumb_dims = label.property("thumb_dims") or (0, 0)
+            channel_idx = int(label.property("channel_index") or 0)
+        except Exception:
+            continue
+        if not thumb_dims or thumb_dims[0] <= 0 or thumb_dims[1] <= 0:
+            continue
+        base_pix = _thumbnail_pixmap_for_file(
+            viewer, file_key, channel_idx, thumb_dims[0], thumb_dims[1], cmap_name
+        )
+        if base_pix is None:
+            continue
+        pix = base_pix.copy()
+        header, fds = viewer.headers.get(str(file_key), (None, None))
+        crop_info = None
+        try:
+            if fds and 0 <= channel_idx < len(fds):
+                fd = fds[channel_idx]
+                data_key = viewer._thumbnail_data_key(str(file_key), channel_idx, fd, thumb_dims[0], thumb_dims[1])
+                with viewer._thumb_data_lock:
+                    crop_info = viewer._thumb_crop_cache.get(data_key)
+        except Exception:
+            crop_info = None
+        try:
+            markers = viewer._decorate_thumbnail_pixmap(pix, file_key, channel_idx, header, fds, thumb_crop=crop_info)
+        except Exception:
+            markers = []
+        label.setPixmap(pix)
+        label.setProperty("spec_markers", markers)
+        try:
+            label.setProperty("thumb_crop", crop_info)
+        except Exception:
+            pass
+
+
+def _animate_star_pop(viewer, key):
+    """Brief celebratory star that scales up and fades out over the card."""
+    card = (getattr(viewer, 'thumb_widgets', {}) or {}).get(str(key))
+    if card is None:
+        return
+    try:
+        if not card.isVisible():
+            return
+        star = QtWidgets.QLabel("★", card)
+        star.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        star.setAlignment(QtCore.Qt.AlignCenter)
+        star.setStyleSheet("color: #ffc83d; background: transparent; border: none;")
+        effect = QtWidgets.QGraphicsOpacityEffect(star)
+        star.setGraphicsEffect(effect)
+        star.resize(card.size())
+        star.show()
+        star.raise_()
+        anim = QtCore.QVariantAnimation(card)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(600)
+        anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+
+        def _step(t, star=star, effect=effect):
+            try:
+                font = star.font()
+                font.setPointSizeF(12.0 + 40.0 * float(t))
+                star.setFont(font)
+                effect.setOpacity(max(0.0, 1.0 - float(t) ** 2))
+            except Exception:
+                pass
+
+        anim.valueChanged.connect(_step)
+        anim.finished.connect(star.deleteLater)
+        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+    except Exception:
+        pass
 
 
 def _thumbnail_pixmap_for_file(viewer, file_key, channel_idx, width, height, cmap_name):
@@ -938,14 +1379,15 @@ def _thumbnail_pixmap_for_file(viewer, file_key, channel_idx, width, height, cma
 def _refresh_thumb_selection_styles(viewer):
     sel = str(getattr(viewer, 'selected_file_for_thumbs', '') or '')
     multi = getattr(viewer, 'thumb_multi_select', set())
+    styles = _thumb_frame_styles(viewer)
     for fp, w in list(getattr(viewer, 'thumb_widgets', {}).items()):
         try:
             if str(fp) in multi:
-                w.setStyleSheet("QFrame { border: 2px solid #a36bff; border-radius: 10px; background-color: rgba(163,107,255,40); }")
+                w.setStyleSheet(styles["multi"])
             elif str(fp) == sel and sel:
-                w.setStyleSheet("QFrame { border: 2px solid #5f8dd3; border-radius: 10px; background-color: rgba(95,141,211,40); }")
+                w.setStyleSheet(styles["selected"])
             else:
-                w.setStyleSheet("QFrame { border: 1px solid rgba(255,255,255,30); border-radius: 10px; background-color: transparent; }")
+                w.setStyleSheet(styles["default"])
         except Exception:
             continue
 
@@ -971,7 +1413,6 @@ def _clear_spectro_thumb_multi_selection(viewer, update_styles=True):
 def _handle_thumb_click(viewer, label_widget, event):
     if event.button() != QtCore.Qt.LeftButton:
         return
-    _cancel_pending_thumb_click(viewer)
     if viewer._handle_spec_marker_click(label_widget, event):
         return
     if getattr(viewer, '_highlighted_spec', None):
@@ -999,7 +1440,7 @@ def _handle_thumb_click(viewer, label_widget, event):
         viewer.last_thumb_anchor = str(fp)
         return
 
-    _schedule_plain_thumb_click(viewer, label_widget, fp, ch_idx)
+    _activate_plain_thumb_click(viewer, fp, ch_idx)
 
 
 def _make_thumb_press_handler(viewer, label_widget):
@@ -1087,7 +1528,6 @@ def _make_thumb_double_handler(viewer, label_widget):
             return
         if event.button() != QtCore.Qt.LeftButton:
             return
-        _cancel_pending_thumb_click(viewer)
         _safe_set_property(label_widget, "skip_release_click", True)
         fp = label_widget.property("file_path")
         ch_idx = int(label_widget.property("channel_index") or 0)

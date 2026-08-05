@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from .compact_histogram import CompactHistogramWidget
 from .constants import UI_FONT_FAMILY
 from .styles import MAIN_SHORTCUTS_PANEL_STYLE, lower_control_frame_style, mode_selector_style
+from . import theme as ui_theme
 
 
 def _configure_compact_control(widget):
@@ -78,6 +80,25 @@ def create_lower_controls(viewer):
     viewer.browse_molecules_menu.aboutToShow.connect(viewer._populate_browse_molecules_menu)
     viewer.browse_molecules_btn.setMenu(viewer.browse_molecules_menu)
     top_row.addWidget(viewer.browse_molecules_btn)
+
+    viewer.compact_histogram = CompactHistogramWidget(frame)
+    viewer.compact_histogram.climChanged.connect(viewer._on_compact_histogram_clim_changed)
+    viewer.compact_histogram.autoRequested.connect(viewer._on_compact_histogram_auto_requested)
+    viewer.compact_histogram.resetRequested.connect(viewer._on_compact_histogram_reset_requested)
+    top_row.addWidget(viewer.compact_histogram)
+
+    viewer.let_the_robot_btn = _configure_compact_control(QtWidgets.QToolButton(frame))
+    viewer.let_the_robot_btn.setObjectName("letTheRobotButton")
+    viewer.let_the_robot_btn.setText("\U0001F916 Let the robot")
+    viewer.let_the_robot_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+    viewer.let_the_robot_btn.setToolTip(
+        "Diagnose the current image (tilt, incomplete scan, glitched lines, spikes, "
+        "noise, contrast) and apply whichever fixes apply, as visible/editable steps "
+        "in the normal filter pipeline."
+    )
+    viewer.let_the_robot_btn.clicked.connect(lambda: viewer._on_let_the_robot_clicked(viewer.preview_canvas))
+    top_row.addWidget(viewer.let_the_robot_btn)
+
     top_row.addStretch(1)
     layout.addLayout(top_row)
 
@@ -98,6 +119,13 @@ def create_lower_controls(viewer):
         mode = viewer.MODE_BROWSE
     viewer._apply_mode(mode, remember=False)
     viewer._apply_lower_control_theme()
+    try:
+        # Keep the lower pane sized from its live sizeHint so wrapped
+        # spectroscopy text can reflow without pinning the preview to a stale
+        # geometry.
+        frame.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+    except Exception:
+        pass
     return frame
 
 
@@ -143,12 +171,54 @@ def build_measure_context_page(viewer):
     return page
 
 
+def build_spec_selection_tray(viewer):
+    """Small pill-shaped bar under the thumbnails that appears while spectroscopy
+    markers are Shift+click-selected: "N spectra selected - Compare | Clear".
+    Replaces the old behavior of auto-opening the comparison window as soon as a
+    second spectrum was selected."""
+    tray = QtWidgets.QFrame()
+    tray.setObjectName("specSelectionTray")
+    tray.setStyleSheet(
+        "#specSelectionTray {"
+        " border-radius: 12px;"
+        " background-color: rgba(255, 170, 60, 0.16);"
+        " border: 1px solid rgba(255, 190, 90, 0.65);"
+        "}"
+    )
+    row = QtWidgets.QHBoxLayout(tray)
+    row.setContentsMargins(10, 3, 6, 3)
+    row.setSpacing(8)
+    viewer.spec_selection_tray_label = QtWidgets.QLabel("")
+    viewer.spec_selection_tray_label.setStyleSheet("font-weight: 600; background: transparent; border: none;")
+    row.addWidget(viewer.spec_selection_tray_label)
+    row.addStretch(1)
+    viewer.spec_selection_tray_compare_btn = _configure_compact_control(QtWidgets.QPushButton("Compare"))
+    viewer.spec_selection_tray_compare_btn.setToolTip("Open the selected spectra together in a comparison window")
+    viewer.spec_selection_tray_compare_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+    viewer.spec_selection_tray_compare_btn.clicked.connect(
+        lambda: viewer.spectro_compare_controller.open_multi_popup()
+    )
+    row.addWidget(viewer.spec_selection_tray_compare_btn)
+    viewer.spec_selection_tray_clear_btn = _configure_compact_control(QtWidgets.QPushButton("Clear"))
+    viewer.spec_selection_tray_clear_btn.setToolTip("Clear the spectroscopy selection")
+    viewer.spec_selection_tray_clear_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+    viewer.spec_selection_tray_clear_btn.clicked.connect(viewer.on_clear_spec_selection)
+    row.addWidget(viewer.spec_selection_tray_clear_btn)
+    tray.setVisible(False)
+    viewer.spec_selection_tray = tray
+    return tray
+
+
 def build_spectro_context_page(viewer):
     page = QtWidgets.QWidget()
     layout = QtWidgets.QHBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
     viewer.show_spectra_cb = None
+    viewer.open_current_site_btn = _configure_compact_control(QtWidgets.QPushButton("Current position"))
+    viewer.open_current_site_btn.setToolTip("Open the position summary for the currently highlighted or selected spectroscopy point")
+    viewer.review_low_conf_btn = _configure_compact_control(QtWidgets.QPushButton("Review low conf"))
+    viewer.review_low_conf_btn.setToolTip("Open the spectroscopy browser focused on low-confidence image assignments")
     viewer.clear_spec_selection_btn = _configure_compact_control(QtWidgets.QPushButton("Clear selection"))
     viewer.clear_spec_selection_btn.setToolTip("Clear the multi-selection of spectroscopy points")
     viewer.grid_as_matrix_cb = None
@@ -160,9 +230,11 @@ def build_spectro_context_page(viewer):
     viewer.spec_selection_label.setFont(font_small)
     viewer.spec_selection_label.setMinimumWidth(0)
     viewer.spec_selection_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-    viewer.spectro_mode_hint_label = QtWidgets.QLabel("Display options live in the top toolbar `Spectroscopy` button.")
+    viewer.spectro_mode_hint_label = QtWidgets.QLabel("Toolbar `Spectroscopy` controls markers and miniatures. Use `Current position` and `Review low conf` to inspect linked spectra.")
     viewer.spectro_mode_hint_label.setFont(font_small)
     layout.addWidget(viewer.spectro_mode_hint_label)
+    layout.addWidget(viewer.open_current_site_btn)
+    layout.addWidget(viewer.review_low_conf_btn)
     layout.addWidget(viewer.clear_spec_selection_btn)
     layout.addWidget(viewer.spec_selection_label)
     layout.addStretch(1)
@@ -173,6 +245,79 @@ def _ensure_display_menu(viewer):
     if getattr(viewer, "display_menu", None):
         return viewer.display_menu
     viewer.display_menu = QtWidgets.QMenu(viewer)
+    viewer.display_menu.setToolTipsVisible(True)
+    viewer.display_filter_menu = viewer.display_menu.addMenu("Show only")
+    viewer.display_filter_menu.setToolTipsVisible(True)
+    viewer.display_filter_group = QtWidgets.QActionGroup(viewer.display_filter_menu)
+    viewer.display_filter_group.setExclusive(True)
+    viewer.display_filter_actions = {}
+    for text, filt_label, shortcut, tip in (
+        ("All images", "All", None, "Show every image in the folder"),
+        ("Starred ★", "Starred", "Ctrl+Alt+F", "Show only starred favourites (press again to show all)"),
+        ("Constant height (CH)", "Constant height", "Ctrl+Alt+H", "Show only constant-height images (press again to show all)"),
+        ("Constant current (CC)", "Constant current", "Ctrl+Alt+C", "Show only constant-current images (press again to show all)"),
+        ("With spectroscopy", "With spectroscopy", "Ctrl+Alt+P", "Show only images with linked spectroscopy points (press again to show all)"),
+    ):
+        act = viewer.display_filter_menu.addAction(text)
+        act.setCheckable(True)
+        act.setToolTip(tip)
+        if shortcut:
+            act.setShortcut(QtGui.QKeySequence(shortcut))
+            act.setShortcutContext(QtCore.Qt.ApplicationShortcut)
+        act.triggered.connect(lambda checked, lab=filt_label: viewer.set_thumb_filter_mode(lab, toggle=True))
+        viewer.display_filter_group.addAction(act)
+        viewer.display_filter_actions[filt_label] = act
+        # Register on the window so the shortcut fires while the menu is closed.
+        viewer.addAction(act)
+
+    def _show_view_filter_help():
+        QtWidgets.QMessageBox.information(
+            viewer,
+            "Favourites & view filters",
+            "<h3>Starring favourites</h3>"
+            "<p>Select one or more thumbnails and press <b>S</b>, or right-click and choose "
+            "<b>★ Star</b>. A gold star badge marks starred images and a short star "
+            "animation plays when you star one.</p>"
+            "<p><b>Removing a star works the same way</b>: press <b>S</b> again on starred "
+            "images (S always toggles), or right-click → <b>Remove star</b>.</p>"
+            "<p>Stars are remembered across sessions — reopen the folder later and your "
+            "favourites are still marked.</p>"
+            "<h3>Showing only certain images</h3>"
+            "<p><b>Ctrl+Alt+F</b> shows only starred images, <b>Ctrl+Alt+H</b> only "
+            "constant-height (CH) images, <b>Ctrl+Alt+C</b> only constant-current (CC) "
+            "images, and <b>Ctrl+Alt+P</b> only images with linked spectroscopy points. "
+            "Pressing the same shortcut a second time shows all images again.</p>"
+            "<p>The CH/CC views use the CH/CC tags — set them manually with the "
+            "<b>Tag as CH / Tag as CC</b> buttons, or enable <b>Auto CH/CC</b> to detect "
+            "them automatically.</p>"
+            "<p>This <i>Show only</i> menu, the <b>Filter</b> dropdown above the thumbnails, "
+            "and the shortcuts all control the same filter, so you can use whichever is "
+            "most comfortable. The active filter is restored the next time you open the app.</p>"
+            "<h3>Virtual copies</h3>"
+            "<p>Virtual copies follow the image they came from: a copy of a CH/CC-tagged "
+            "image counts as CH/CC too (and shows the same border badge), and a copy of a "
+            "starred image starts out starred. So copies created while a filter is active "
+            "stay visible in that view, and you can still star/unstar each copy "
+            "independently afterwards.</p>",
+        )
+
+    viewer.display_filter_menu.addSeparator()
+    viewer.display_filter_help_act = viewer.display_filter_menu.addAction("How favourites && filters work...")
+    viewer.display_filter_help_act.setToolTip("Explains starring favourites, removing stars, and the view-filter shortcuts")
+    viewer.display_filter_help_act.triggered.connect(_show_view_filter_help)
+
+    def _sync_display_filter_actions():
+        combo = getattr(viewer, "thumb_filter_combo", None)
+        current = combo.currentText() if combo is not None else "All"
+        for lab, act in viewer.display_filter_actions.items():
+            act.blockSignals(True)
+            act.setChecked(lab == current)
+            act.blockSignals(False)
+
+    viewer._sync_display_filter_actions = _sync_display_filter_actions
+    viewer.display_menu.aboutToShow.connect(_sync_display_filter_actions)
+    _sync_display_filter_actions()
+    viewer.display_menu.addSeparator()
     viewer.display_units_si_act = viewer.display_menu.addAction("Show SI units")
     viewer.display_units_si_act.setCheckable(True)
     viewer.display_units_si_act.setChecked(bool(getattr(viewer, "display_units_si", False)))
@@ -193,6 +338,16 @@ def _ensure_display_menu(viewer):
     viewer.display_scale_bar_act.setChecked(bool(getattr(viewer, "config", {}).get("show_scale_bar", False)))
     viewer.display_scale_bar_act.setToolTip("Show the scale bar in preview and pop-outs")
     viewer.display_scale_bar_act.toggled.connect(viewer.on_scale_bar_toggled)
+    viewer.reset_cmap_favorites_act = viewer.display_menu.addAction("Reset colormap defaults")
+    viewer.reset_cmap_favorites_act.setToolTip(
+        "Forget the favourite colormaps/color cycle saved with the ★ buttons "
+        "(preview, thumbnails, grid map, reports) and go back to the built-in defaults")
+    viewer.reset_cmap_favorites_act.triggered.connect(viewer.clear_colormap_favorites)
+    viewer.extra_cmaps_status_act = viewer.display_menu.addAction("Extra colormaps...")
+    viewer.extra_cmaps_status_act.setToolTip(
+        "Status of the optional 'colormaps' package (pratiman-91) — when "
+        "installed, its colormaps appear in every colormap picker")
+    viewer.extra_cmaps_status_act.triggered.connect(viewer.on_extra_colormaps_status)
     viewer.display_menu.addSeparator()
     viewer.molecules_act = viewer.display_menu.addAction("Show molecules")
     viewer.molecules_act.setCheckable(True)
@@ -365,7 +520,17 @@ def apply_lower_control_theme(viewer):
     if frame is None:
         return
     dark = bool(getattr(viewer, "dark_mode", False))
-    if dark:
+    amber = ui_theme.is_amber(viewer)
+    mode_checked_text = "#ffffff"
+    if amber:
+        t = ui_theme.AMBER
+        border = t["border"]
+        bg = t["panel_bg"]
+        mode_border = t["border"]
+        mode_text = t["text_primary"]
+        mode_checked = t["selection_bg"]
+        mode_checked_text = t["amber_bright"]
+    elif dark:
         border = "#4c4c4c"
         bg = "#2d2d2d"
         mode_border = "#5a5a5a"
@@ -379,7 +544,9 @@ def apply_lower_control_theme(viewer):
         mode_checked = "#3d7dd8"
     frame.setStyleSheet(lower_control_frame_style(border, bg))
     if mode_widget is not None:
-        mode_widget.setStyleSheet(mode_selector_style(mode_border, mode_text, mode_checked))
+        mode_widget.setStyleSheet(
+            mode_selector_style(mode_border, mode_text, mode_checked, mode_checked_text)
+        )
     if molecules_btn is not None:
         molecules_btn.setStyleSheet(
             "QToolButton#modeAccessoryButton {"
@@ -390,7 +557,7 @@ def apply_lower_control_theme(viewer):
             "}"
             "QToolButton#modeAccessoryButton:checked {"
             f" background: {mode_checked};"
-            " color: #ffffff;"
+            f" color: {mode_checked_text};"
             "}"
         )
 

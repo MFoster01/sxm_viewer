@@ -27,6 +27,14 @@ from PyQt5.QtWidgets import QDialog, QVBoxLayout, QCheckBox, QPushButton, QLabel
 
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from .._shared import log_status, log_emitter
+from .. import cmap_registry
+from .qt_helpers import set_silent, set_many_silent
+from .activity_log import ActivityLog
+from . import drift_animation
+from . import virtual_copies
+from . import main_window_state
+from .debounce import ACCUMULATE, LATEST, Debouncer
+from ..geometry import spec_mapping
 from ..app_meta import APP_NAME, apply_window_icon
 from ..config import (
     CONFIG_PATH,
@@ -36,31 +44,23 @@ from ..config import (
     FILTERED_CACHE_LIMIT,
     load_config,
     save_config,
+    flush_pending_config_save,
     load_header_cache,
     save_header_cache,
+    flush_pending_header_cache_save,
+    load_collections_index,
 )
 from ..data.matrix import MatrixDataset, parse_matrix_filename
 from ..data.io import parse_header, read_channel_file, normalize_unit_and_data
 
-RECENT_FOLDER_LIMIT = 30
-RECENT_SESSION_LIMIT = 30
 from ..data.spectroscopy import is_matrix_file_entry
 from ..processing.filters import (
-    flatten_remove_median,
-    subtract_best_fit_plane,
-    subtract_2nd_order_plane,
-    line_flatten_image,
-    gaussian_filter_image,
-    highpass_filter,
-    laplacian_filter_image,
-    log_filter_image,
-    histogram_equalize_image,
-    clahe_filter_image,
     FILTER_DEFINITIONS,
     _gaussian_available,
     _filter_signature,
 )
-from ..processing.detection import _find_topography_channel, _sample_channel_values_for_tagging
+from ..processing import auto_enhance as _auto_enhance
+from ..processing.detection import _find_topography_channel
 from ..utils.units import (
     _NUMERIC_RE,
     _UNIT_DISPLAY_CHOICES,
@@ -68,52 +68,57 @@ from ..utils.units import (
     _auto_display_unit,
     _safe_float,
 )
-from .thumbnail_render import _ThumbnailJob, _colormap_icon, _value_in_nm, apply_adjustment_spec
-from .thumbnail_render import _ThumbnailJob, _colormap_icon, _value_in_nm, apply_adjustment_spec, convert_to_si
+from .thumbnail_render import _ThumbnailJob, _colormap_icon, _value_in_nm, apply_adjustment_spec, convert_to_si, detect_valid_scan_region, resample_geometry, robust_limits
+from .colormap_gallery import ColormapGalleryDialog
+from .colormap_manager import ColormapManager
+from ..cmap_sorting import ColormapSorter, DEFAULT_STRATEGY
 from .minimap import FrameMiniMap
-from .detail_panels import (
-    BatchExportSignals,
-    BatchExportWorker,
-    CustomFilterDialog,
-    ImageAdjustDialog,
-    ImageAdjustPreviewPanel,
-    MatrixFitDialog,
-    MatrixFitWorker,
+from .workers.batch_export import BatchExportSignals, BatchExportWorker
+from .dialogs.collection_browser import CollectionBrowserDialog
+from .dialogs.image_adjust import ImageAdjustDialog, ImageAdjustPreviewPanel
+from .dialogs.matrix_fit import MatrixFitDialog, MatrixFitWorker
+from .dialogs.profile_dialog import ProfileDialog
+from .dialogs.spectroscopy_dialogs import (
     MatrixSpectroViewer,
-    MultiPreviewCanvas,
-    ProfileDialog,
-    SafeFigureCanvas,
-    SingleFilterDialog,
     SpectroscopyCompareDialog,
     SpectroscopyPopup,
     _SpectroFitWorker,
 )
+from .canvases.detail_preview import MultiPreviewCanvas, SafeFigureCanvas
 from .spectroscopy.summary_dialog import SpectroSummaryDialog
 from .viewer import measurement as viewer_measurement
 from .viewer import thumbnails as viewer_thumbnails
 from .controllers.preview_popup import spawn_preview_popup
 from .controllers.histogram import open_histogram_dialog
 from .controllers.quick_crop import QuickCropController
-from .controllers.collection import CollectionController
+from .controllers.collection import CollectionController, RECENT_COLLECTION_LIMIT
 from .controllers.thumbnail_controller import ThumbnailController
 from .controllers.spectro_compare import SpectroCompareController
 from .controllers.session import SessionController
+from .controllers.filter_controller import FilterController
+from .controllers.recent_files_controller import RecentFilesController
+from .controllers.report import ReportController
 from .viewer import loader as viewer_loader
 from .viewer import preview as viewer_preview
-from .viewer.state import ViewerState
 from .plot_typography import add_font_menu_action, normalize_font_family, set_matplotlib_font_family
 from .canvases.molecular_overlay import available_atom_palettes
+from .ppt_bridge import powerpoint_support_status, send_pixmap_to_ppt, _bridge as _ppt_bridge
 from .spectroscopy import controller as spectro_controller
+from .spectroscopy import details as spectro_details
+from .spectroscopy import loading as spectro_loading
 from .spectroscopy import overlays as spectro_overlays
+from .spectroscopy import overrides as spectro_overrides
 from .spectroscopy import popups as spectro_popups
 from .viewer import thumbnail_ui as viewer_thumb_ui
 from .viewer import export as viewer_export
 from .canvases.canvas_window import ExperimentalCanvasWindow
 from .palettes import DEFAULT_COLOR_CYCLE
 from .system_open import add_source_file_menu
+from . import theme as ui_theme
 
 # Tolerance for deciding constant-height images; allow a slightly larger spread than strict equality
 CH_RANGE_TOL_NM = max(CH_EQUALITY_TOL_NM, 0.02)  # ~20 pm default floor
+AUTO_TAG_CACHE_VERSION = 1
 VIRTUAL_COPY_INSERT_START = "__virtual_copy_start__"
 
 
@@ -315,6 +320,35 @@ from .constants import (
     UI_FONT_SIZE,
 )
 
+
+class _SpectroScanWorkerSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object, object)  # (specs, spec_stats)
+    failed = QtCore.pyqtSignal(str)
+
+
+class _SpectroScanWorker(QtCore.QObject):
+    """Runs viewer._scan_spectros() (-> viewer_loader._scan_spectros: file
+    I/O, parsing, matrix anchoring, all audited to contain no Qt widget/GUI-
+    object access) off the GUI thread, so the deferred post-folder-load scan
+    no longer freezes the whole window. See _run_pending_spectro_load_async
+    in SXMGridViewer."""
+
+    def __init__(self, viewer, folder):
+        super().__init__()
+        self.viewer = viewer
+        self.folder = folder
+        self.signals = _SpectroScanWorkerSignals()
+        self.finished = self.signals.finished
+        self.failed = self.signals.failed
+
+    def run(self):
+        try:
+            specs, spec_stats = self.viewer._scan_spectros(self.folder)
+            self.signals.finished.emit(specs, spec_stats)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+
+
 class SXMGridViewer(QtWidgets.QWidget):
     SpectroSummaryDialog = SpectroSummaryDialog
     FRAME_ZOOM_SLIDER_MIN = 0
@@ -329,395 +363,30 @@ class SXMGridViewer(QtWidgets.QWidget):
         self.setAcceptDrops(True)
         log_status("Initializing SXM Viewer...")
         self._app_start_ts = time.perf_counter()
+        # Kick off the header-cache JSON load (pure I/O + parsing, no
+        # dependency on anything else in __init__) on a background thread as
+        # early as possible, so it overlaps with the Qt widget construction
+        # below instead of blocking it. In particular, the very first widget
+        # requiring text rendering pays a one-time ~400-500ms Qt font-
+        # subsystem warm-up cost on Windows (measured directly: unrelated to
+        # this app's code, present even for a bare QLineEdit in an empty
+        # script) - previously that cost was paid strictly *after* this load
+        # finished; now the two run concurrently.
+        self._header_cache_bg_result = {}
+        def _load_header_cache_bg():
+            self._header_cache_bg_result["cache"] = load_header_cache()
+        self._header_cache_thread = threading.Thread(target=_load_header_cache_bg, daemon=True)
+        self._header_cache_thread.start()
         self.setWindowTitle(APP_NAME)
         apply_window_icon(self)
         self.resize(*MAIN_WINDOW_SIZE)
 
-        log_status("Loading configuration...")
-        self.config = load_config()
-        time_source = self.config.get("image_time_source", "mtime")
-        if time_source not in ("mtime", "header"):
-            time_source = "mtime"
-        self.image_time_source = time_source
-        if self.config.get("image_time_source") != time_source:
-            self.config["image_time_source"] = time_source
-            save_config(self.config)
-        self.last_dir = Path(self.config.get("last_dir", str(Path.cwd())))
-        raw_recents = self.config.get("recent_dirs", [])
-        self.recent_dirs = []
-        for entry in raw_recents:
-            if not entry:
-                continue
-            try:
-                self.recent_dirs.append(str(Path(entry)))
-            except Exception:
-                continue
-        raw_session_recents = self.config.get("recent_session_paths", self.config.get("recent_session_dirs", []))
-        self.recent_session_paths = []
-        for entry in raw_session_recents:
-            if not entry:
-                continue
-            try:
-                self.recent_session_paths.append(str(Path(entry)))
-            except Exception:
-                continue
-        self._normalize_recent_session_history(persist=True)
-        last_collection_dir = self.config.get("last_collection_dir")
-        try:
-            self._last_collection_dir = Path(last_collection_dir) if last_collection_dir else Path(self.last_dir)
-        except Exception:
-            self._last_collection_dir = Path(self.last_dir)
-        config_changed = False
-        if "session_recovery_enabled" not in self.config:
-            self.config["session_recovery_enabled"] = True
-            config_changed = True
-        if "session_recovery_interval_min" not in self.config:
-            self.config["session_recovery_interval_min"] = 5
-            config_changed = True
-        if config_changed:
-            save_config(self.config)
-        self._current_session_path = None
-        self._closed_window_history = []
-        self._closed_window_history_limit = 6
-        self._suspend_window_history = False
-        self._autosave_busy = False
-        self._session_recovery_enabled = bool(self.config.get("session_recovery_enabled", True))
-        try:
-            self._session_recovery_interval_min = max(1, int(self.config.get("session_recovery_interval_min", 5) or 5))
-        except Exception:
-            self._session_recovery_interval_min = 5
-        self._workspace_window_shutdown = False
-        self.last_channel_index = int(self.config.get("last_channel_index", 0))
-        default_cmap = "Blues_r"
-        thumb_cfg = self.config.get("thumbnail_cmap")
-        preview_cfg = self.config.get("preview_cmap")
-        config_changed = False
-        if not thumb_cfg and not preview_cfg:
-            thumb_cfg = preview_cfg = default_cmap
-            self.config['thumbnail_cmap'] = thumb_cfg
-            self.config['preview_cmap'] = preview_cfg
-            config_changed = True
-        elif not thumb_cfg:
-            thumb_cfg = preview_cfg or default_cmap
-            self.config['thumbnail_cmap'] = thumb_cfg
-            config_changed = True
-        elif not preview_cfg:
-            preview_cfg = thumb_cfg or default_cmap
-            self.config['preview_cmap'] = preview_cfg
-            config_changed = True
-        self.thumb_cmap = thumb_cfg or default_cmap
-        self.preview_cmap = preview_cfg or self.thumb_cmap
-        if config_changed:
-            save_config(self.config)
-        self.spec_folder_path = Path(self.config.get("spectra_folder", str(self.last_dir)))
-        self.show_spectra = bool(self.config.get("show_spectra", True))
-        self.show_spectro_miniatures = bool(self.config.get("show_spectro_miniatures", False))
-        self.spectro_share_overlapping_repeats = bool(self.config.get("spectro_share_overlapping_repeats", False))
-        self.spectro_miniature_default_channel = str(self.config.get("spectro_miniature_default_channel", "") or "")
-        self.spectro_thumb_channel_by_path = dict(self.config.get("spectro_thumb_channel_by_path", {}) or {})
-        self.spectro_highlight_glow = bool(self.config.get("spectro_highlight_glow", True))
-        preview_cfg = self.config.get("show_preview_spectra")
-        if preview_cfg is None:
-            preview_cfg = self.show_spectra
-        self.show_preview_spectra = bool(preview_cfg)
-        # Defaults: disable tag auto-detection and allow users to re-enable via config
-        self.auto_detect_tags = bool(self.config.get("auto_detect_tags", False))
-        # Allow skipping Nanonis scan conversion if cache already exists
-        self.convert_nanonis_enabled = bool(self.config.get("convert_nanonis_enabled", True))
-        # Enable persistent spectroscopy disk cache (per-folder) by default
-        self.spectro_disk_cache_enabled = bool(self.config.get("spectro_disk_cache_enabled", True))
-        self.spectro_manifest_cache_enabled = bool(self.config.get("spectro_manifest_cache_enabled", True))
-        self.spectro_lazy_payload_enabled = bool(self.config.get("spectro_lazy_payload_enabled", True))
-        # Lazily load spectroscopies (defer until requested) to speed up initial folder loads
-        self.lazy_spectros_enabled = bool(self.config.get("lazy_spectros_enabled", True))
-        self.thumb_size_px = int(self.config.get("thumb_size_px", 160))
-        self.thumb_grid_columns = 1
-        self.display_units_si = bool(self.config.get("display_units_si", False))
-        self.display_units_relative = bool(self.config.get("display_units_relative", False))
-        self.relative_axes = bool(self.config.get("relative_axes", False))
-        self.preserve_profiles_on_channel_change = bool(
-            self.config.get("preserve_profiles_on_channel_change", True)
-        )
-        self.tags = self.config.get("tags", {})  # persistent tags: {path: {"tag":"constant-height","abs_z_pm":int,...}}
-        if not self.auto_detect_tags:
-            self.tags = {
-                str(key): value
-                for key, value in dict(self.tags or {}).items()
-                if not (isinstance(value, dict) and value.get("auto") and not value.get("manual"))
-            }
-            self.config["tags"] = self.tags
-            save_config(self.config)
-        self.session_controller = SessionController(self)
-        self.collection_controller = CollectionController(self)
-        self.frame_map_entries = []
-        self.show_shortcuts_panel = bool(self.config.get("show_shortcuts_panel", False))
-        self.hidden_frame_keys = set()
-        self.frame_real_view = False
-        self.show_matrix_markers = bool(self.config.get("show_matrix_markers", True))
-        # default to showing single markers so spectroscopies are visible by default
-        self.show_single_markers = bool(self.config.get("show_single_markers", True))
-        self.compact_markers = bool(self.config.get("compact_markers", True))
-        self.spectro_single_grid_as_matrix = bool(self.config.get("spectro_single_grid_as_matrix", False))
-        self.spectro_force_single_mode = bool(self.config.get("spectro_force_single_mode", False))
-        self.dark_mode = bool(self.config.get('dark_mode', False))
-        self.detail_dark_view = bool(self.config.get('detail_dark_view', self.dark_mode))
-        self._detail_theme_follows_dark_mode = bool(self.config.get('detail_theme_follows_dark_mode', True))
-        self.detail_grid_view = bool(self.config.get('detail_grid_view', False))
-        self.show_molecules = bool(self.config.get('show_molecules', True))
-        self.show_molecule_gizmo = bool(self.config.get("show_molecule_gizmo", False))
-        self.show_acquisition_overlay = bool(self.config.get("show_acquisition_overlay", False))
-        self.profile_label_mode = str(self.config.get("profile_label_mode", "length") or "length").strip().lower()
-        if self.profile_label_mode not in {"length", "full", "hidden"}:
-            self.profile_label_mode = "length"
-        self.canvas_display_options = dict(self.config.get("canvas_display_options", {}))
-        molecule_style = self.config.get("molecule_default_style") if isinstance(self.config.get("molecule_default_style"), dict) else {}
-        self.molecule_palette = str(
-            self.config.get("molecule_palette", molecule_style.get("palette", "avogadro")) or "avogadro"
-        ).lower()
-        self.recent_molecules = list(self.config.get("recent_molecules", []))
-        self.quick_crop_mode = bool(self.config.get("quick_crop_mode", False))
-        self.quick_crop_aspect_mode = str(self.config.get("quick_crop_aspect_mode", "free") or "free").strip().lower()
-        if self.quick_crop_aspect_mode not in {"free", "keep", "square"}:
-            self.quick_crop_aspect_mode = "free"
-        # Keep crop template editor opt-in at startup for cleaner preview/popup canvases.
-        self.show_crop_template_overlay = False
-        self.show_crop_history_overlay = True
-        self._collection_item_snapshots = {}
-        self._collection_source = None
-        self._current_collection_mode = None
-        self._workspace_kind = "folder"
-        self._display_defaults = {
-            'show_matrix_markers': True,
-            'show_single_markers': True,
-            'compact_markers': True,
-            'detail_dark_view': bool(self.dark_mode),
-            'detail_grid_view': False,
-            'show_molecules': True,
-            'show_molecule_gizmo': False,
-            'show_acquisition_overlay': False,
-            'profile_label_mode': "length",
-            'show_crop_template_overlay': False,
-            'show_crop_history_overlay': True,
-        }
-        self._popup_canvases = []
-        self._active_preview_popup = None
-        self._active_preview_canvas = None
-        c_single = self.config.get('spectro_marker_color_single')
-        if c_single:
-            self.spectro_marker_color_single = QtGui.QColor(c_single)
-        else:
-            self.spectro_marker_color_single = QtGui.QColor(255, 20, 147, 255)
-        c_matrix = self.config.get('spectro_marker_color_matrix')
-        if c_matrix:
-            self.spectro_marker_color_matrix = QtGui.QColor(c_matrix)
-        else:
-            self.spectro_marker_color_matrix = QtGui.QColor(64, 200, 255, 200)
-        self.spectro_color_cycle = self.config.get('spectro_color_cycle', DEFAULT_COLOR_CYCLE)
-        self.spectro_marker_symbol = self.config.get('spectro_marker_symbol', 'circle')
-        self.spectro_marker_size = float(self.config.get('spectro_marker_size', 5.0))
-        self.frame_entry_pixmaps = {}
-        self._frame_real_pixmap_cache = {}
-        self._processed_views = {}
-        self.molecule_overlays = {}
-        self._temp_reveal = set()
-        self.spectro_dock = None
-        self._spectro_browser_entries = []
-        self._highlight_phase = 0.0
-        self._highlight_pulse_strength = 1.0
-        self._highlight_timer = QtCore.QTimer(self)
-        # Debounced marker refresh to avoid repaint storms
-        self._marker_refresh_timer = QtCore.QTimer(self)
-        self._marker_refresh_timer.setSingleShot(True)
-        self._marker_refresh_timer.timeout.connect(self._refresh_thumbnail_markers)
-        self._thumbnail_render_state_timer = QtCore.QTimer(self)
-        self._thumbnail_render_state_timer.setSingleShot(True)
-        self._thumbnail_render_state_timer.timeout.connect(self._flush_thumbnail_render_state_refresh)
-        self._thumbnail_render_state_pending_paths = set()
-        self._spectro_manifest_save_timer = QtCore.QTimer(self)
-        self._spectro_manifest_save_timer.setSingleShot(True)
-        self._spectro_manifest_save_timer.timeout.connect(self._flush_spectro_manifest_save)
-        self._spectro_manifest_save_inflight = False
-        self._spectro_manifest_save_pending = False
-        self._left_sidebar_min_width = 300
-        self._left_sidebar_target_width = 340
-        self._left_sidebar_soft_max_width = 380
-        self._left_sidebar_rebalance_timer = QtCore.QTimer(self)
-        self._left_sidebar_rebalance_timer.setSingleShot(True)
-        self._left_sidebar_rebalance_timer.timeout.connect(self._rebalance_main_splitter)
-        # Preview docking state
-        self.preview_detached = False
-        self.preview_locked = bool(self.config.get("preview_locked", False))
-        self._preview_dialog = None
-        self._highlight_timer.setInterval(350)
-        self._highlight_timer.timeout.connect(self._on_highlight_tick)
-        self._highlighted_spec = None
-
-        self.files = []
-        self.headers = {}
-        self.thumb_cache = {}
-        self._thumb_data_cache = {}
-        self._thumb_crop_cache = {}
-        self._topo_stats_cache = {}
-        self._channel_data_cache = OrderedDict()
-        self._channel_cache_lock = threading.Lock()
-        self._filtered_channel_cache = OrderedDict()
-        self._filtered_cache_lock = threading.Lock()
-        self._thumb_labels = {}
-        self._thumb_generation = 0
-        self._thumb_data_lock = threading.Lock()
-        self._thumb_threadpool = QtCore.QThreadPool()
-        self._thumb_meta = {}
-        self._thumb_loaded = set()
-        self._thumb_inflight = set()
-        self._thumb_card_height = None
-        try:
-            self._thumb_threadpool.setMaxThreadCount(max(2, min(6, QtCore.QThreadPool.globalInstance().maxThreadCount())))
-        except Exception:
-            pass
-        self._pending_profile_enable = False
-        self._pending_angle_enable = False
-        self._last_profile_payload = None
-
-        self.per_file_channel_cmap = {}
-        self.per_file_channel_clim = {}
-        self.last_preview = None
-        self.spectros = []
-        self.matrix_spectros = []
-        self.files_with_matrix = set()
-        self.spectros_by_image = defaultdict(list)
-        self._spectros_loaded = False
-        self._spectros_loading = False
-        self._spectros_pending = False
-        self._spectro_cache = {}
-        self._spectro_manifest_entries = {}
-        self._spectro_deferred = set()
-        self._spectro_miniature_cache = OrderedDict()
-        self._spectro_autoload_timer = QtCore.QTimer(self)
-        self._spectro_autoload_timer.setSingleShot(True)
-        self._spectro_autoload_timer.timeout.connect(self._run_pending_spectro_load)
-        # spectro_eager_limit: 0 means no deferral; otherwise parse at most N spectroscopy files eagerly
-        limit_cfg = int(self.config.get("spectro_eager_limit", 300))
-        self.spectro_eager_limit = max(0, limit_cfg)
-        self.image_time_index = {}
-        self._spectro_popups = []
-        self._popup_refs = []
-        self._deferred_popup_entries = []
-        self._deferred_popup_serial = 0
-        self._multi_spectro_popups = []
-        self._multi_single_popup_anchor = None
-        self._last_clicked_spec = None
-        self._popup_counter = 0  # used to stagger dialog positions
-        self._multi_spec_selection = []
-        self._multi_spec_selection_keys = set()
-        self._workspace_loading = False
-        self.spectro_compare_controller = SpectroCompareController(self)
-        from .controllers.image_compare import ImageCompareController
-
-        self.image_compare_controller = ImageCompareController(self)
-        self.thumb_multi_select = set()
-        self.spectro_thumb_multi_select = set()
-        self.current_spectro_thumb_files = []
-        self.selected_spectro_thumb_file = None
-        self._canvas_display_syncing = False
-        self._last_canvas_display_options = {}
-        self._profile_dialogs = []
-        self._clipboard_export_dir = None
-        self._clipboard_copy_worker = None
-        self._clipboard_copy_total = 0
-        self._toast_registry = {}
-        self._batch_export_progress = None
-        self._batch_export_worker = None
-        self.virtual_copies = {}
-        self.virtual_copy_order = []
-        self.thumbnail_filters = {}
-        self.image_adjustments = defaultdict(dict)
-        self._last_base_array = None
-        self._last_base_extent = None
-        self._last_base_unit = None
-        self._spectro_hist_cache = {}
-        self.matrix_datasets = {}
-        log_status("Loading header cache...")
-        self.header_cache = load_header_cache()
-        self._header_cache_dirty = False
-        self.state = ViewerState.from_viewer(self)
-        # Deprecated: previously stored concrete arrays for extra views
-        # self.added_views kept for backward compatibility but not used for rendering
-        self.added_views = []
-        # New: store extra view specifications to rebuild per selected file
-        # Each spec: { 'caption': str, 'index': int, 'cmap': str }
-        self.extra_view_specs = []
-        # Thumbnail helpers: mapping from file path -> container widget for selection styling
-        self.thumb_widgets = {}
-        self.selected_file_for_thumbs = None
-
-        # Plot typography defaults are shared across preview, popups and dialogs.
-        self._plot_font_family = normalize_font_family(self.config.get("plot_font_family", UI_FONT_FAMILY), UI_FONT_FAMILY)
-        self._plot_font_bold = bool(self.config.get("plot_font_bold", False))
-        self._plot_font_italic = bool(self.config.get("plot_font_italic", False))
-        self._plot_font_underline = bool(self.config.get("plot_font_underline", False))
-        set_matplotlib_font_family(self._plot_font_family)
-        # fonts
-        base_font = QtGui.QFont(UI_FONT_FAMILY, UI_FONT_SIZE)
+        # Phase 1: all non-widget state (config, defaults, caches,
+        # timers). See gui/main_window_state.py.
+        main_window_state.init_state(self)
+        # Fonts used by the widgets built below.
         bold_font = QtGui.QFont(UI_FONT_FAMILY, UI_FONT_BOLD_SIZE, QtGui.QFont.Bold)
         meta_font = QtGui.QFont(META_FONT_FAMILY, META_FONT_SIZE)
-        try:
-            app = QtWidgets.QApplication.instance()
-            if app is not None:
-                app.setFont(base_font)
-        except Exception:
-            pass
-
-        self.toolbar_open_act = None
-        self.toolbar_export_png_act = None
-        self.toolbar_export_xyz_act = None
-        self.toolbar_load_session_act = None
-        self.toolbar_load_session_btn = None
-        self.toolbar_load_session_menu = None
-        self.toolbar_save_session_act = None
-        self.toolbar_popups_raise_act = None
-        self.toolbar_popups_btn = None
-        self.toolbar_popups_menu = None
-        self.toolbar_adjust_act = None
-        self.toolbar_dark_btn = None
-        self.toolbar_display_btn = None
-        self.toolbar_image_btn = None
-        self.toolbar_image_menu = None
-        self.toolbar_tools_btn = None
-        self.toolbar_tools_menu = None
-        self.toolbar_load_mol_btn = None
-        self.toolbar_spectro_btn = None
-        self.toolbar_spectro_menu = None
-        self.toolbar_spectro_markers_act = None
-        self.toolbar_spectro_preview_act = None
-        self.toolbar_spectro_miniatures_act = None
-        self.toolbar_spectro_matrix_markers_act = None
-        self.toolbar_spectro_single_markers_act = None
-        self.toolbar_spectro_compact_markers_act = None
-        self.toolbar_spectro_highlight_act = None
-        self.toolbar_spectro_grid_as_matrix_act = None
-        self.toolbar_spectro_force_single_act = None
-        self.toolbar_spectro_thumb_btn = None
-        self.toolbar_spectro_preview_btn = None
-        self.toolbar_spectro_miniatures_btn = None
-        self.preview_spectra_toggle_btn = None
-        self.browse_molecules_btn = None
-        self.browse_molecules_menu = None
-        self.preview_molecules_toggle_btn = None
-        self.display_molecule_gizmo_act = None
-        self.preview_grid_toggle_btn = None
-        self.preview_adjust_btn = None
-        self._canvas_window = None
-        self._session_activity_strip = None
-        self._session_activity_title = None
-        self._session_activity_detail = None
-        self._session_activity_progress = None
-        self._session_activity_hide_timer = QtCore.QTimer(self)
-        self._session_activity_hide_timer.setSingleShot(True)
-        self._session_activity_hide_timer.timeout.connect(self._hide_session_activity)
-        self._activity_log_pending = []
-        self._activity_log_flush_timer = QtCore.QTimer(self)
-        self._activity_log_flush_timer.setSingleShot(True)
-        self._activity_log_flush_timer.timeout.connect(self._flush_activity_log_pending)
 
         # UI: left controls + meta + inspector; middle thumbs; right preview
         left_v = QtWidgets.QVBoxLayout(); left_v.setSpacing(LEFT_PANEL_SPACING)
@@ -781,11 +450,14 @@ class SXMGridViewer(QtWidgets.QWidget):
         self.channel_next_btn.setToolTip("Next channel")
         self.thumb_cmap_combo = QtWidgets.QComboBox(); self.preview_cmap_combo = QtWidgets.QComboBox()
         
-        # populate colormap combos with all available matplotlib colormaps and icons
-        try:
-            cmap_list = sorted(colormaps.keys())
-        except Exception:
-            cmap_list = ['viridis','plasma','inferno','magma','cividis','gray','hot','coolwarm','turbo']
+        # Populate colormap combos from the central registry (registers the
+        # custom amber cmap and any optional extra-package cmaps first, so
+        # every picker in the app sees the same set). Featured names first,
+        # then the rest alphabetically.
+        cmap_registry.ensure_registered()
+        _featured = cmap_registry.featured_cmap_names("general")
+        cmap_list = _featured + [n for n in cmap_registry.all_cmap_names()
+                                 if n not in set(_featured)]
         for m in cmap_list:
             try:
                 icon = _colormap_icon(m, width=96, height=14)
@@ -800,8 +472,6 @@ class SXMGridViewer(QtWidgets.QWidget):
         controls_h.addWidget(self.channel_dropdown, 1)
         controls_h.addWidget(self.channel_next_btn)
 
-        # Dark mode handled via toolbar toggle; placeholder kept for compatibility
-        self.dark_mode_cb = None
         left_v.addWidget(essentials_group)
 
         self.collection_group = QtWidgets.QGroupBox("Current Collection")
@@ -894,15 +564,12 @@ class SXMGridViewer(QtWidgets.QWidget):
         self.activity_log_box.setReadOnly(True)
         self.activity_log_box.setMaximumHeight(140)
         self.activity_log_box.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        try:
-            self.activity_log_box.document().setMaximumBlockCount(500)
-        except Exception:
-            pass
         activity_layout.addWidget(self.activity_log_box)
         details_layout.addWidget(self.activity_group)
-        self._activity_log_entries = []
+        # ActivityLog owns the batching/flush state and the block-count cap.
+        self.activity_log = ActivityLog(self.activity_log_box, parent=self)
         self.activity_group.toggled.connect(self.activity_log_box.setVisible)
-        self.activity_clear_btn.clicked.connect(self._on_clear_activity_log)
+        self.activity_clear_btn.clicked.connect(self.activity_log.clear)
         self.meta_box.setVisible(True)
         details_group.toggled.connect(self.meta_box.setVisible)
 
@@ -1006,7 +673,10 @@ class SXMGridViewer(QtWidgets.QWidget):
         except Exception:
             pass
 
-        tag_h = QtWidgets.QHBoxLayout()
+        tag_h = QtWidgets.QGridLayout()
+        tag_h.setContentsMargins(0, 0, 0, 0)
+        tag_h.setHorizontalSpacing(6)
+        tag_h.setVerticalSpacing(4)
         self.tag_ch_btn = QtWidgets.QPushButton("Tag as CH")
         self.tag_cc_btn = QtWidgets.QPushButton("Tag as CC")
         self.untag_btn = QtWidgets.QPushButton("Untag")
@@ -1016,8 +686,16 @@ class SXMGridViewer(QtWidgets.QWidget):
         
         # Purge config button
         self.purge_config_btn = QtWidgets.QPushButton('Purge config')
-        tag_h.addWidget(self.purge_config_btn)
-        tag_h.addWidget(self.tag_ch_btn); tag_h.addWidget(self.tag_cc_btn); tag_h.addWidget(self.untag_btn); tag_h.addWidget(self.auto_tag_cb)
+        for btn in (self.purge_config_btn, self.tag_ch_btn, self.tag_cc_btn, self.untag_btn):
+            btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        tag_h.addWidget(self.purge_config_btn, 0, 0)
+        tag_h.addWidget(self.tag_ch_btn, 0, 1)
+        tag_h.addWidget(self.tag_cc_btn, 0, 2)
+        tag_h.addWidget(self.untag_btn, 1, 0)
+        tag_h.addWidget(self.auto_tag_cb, 1, 1, 1, 2)
+        tag_h.setColumnStretch(0, 1)
+        tag_h.setColumnStretch(1, 1)
+        tag_h.setColumnStretch(2, 1)
         left_v.addLayout(tag_h)
 
         # NOTE:
@@ -1059,7 +737,7 @@ class SXMGridViewer(QtWidgets.QWidget):
         thumbs_toolbar.addSpacing(8)
         thumbs_toolbar.addWidget(QtWidgets.QLabel('Filter:'))
         self.thumb_filter_combo = QtWidgets.QComboBox()
-        self.thumb_filter_combo.addItems(['All', 'Constant height', 'Constant current', 'Untagged', 'Matrix datasets'])
+        self.thumb_filter_combo.addItems(['All', 'Starred', 'Constant height', 'Constant current', 'With spectroscopy', 'Untagged', 'Matrix datasets'])
         thumbs_toolbar.addWidget(self.thumb_filter_combo)
         self.clear_thumb_list_btn = QtWidgets.QPushButton("Clear thumbnails")
         self.clear_thumb_list_btn.setToolTip("Remove the current thumbnail session and start fresh")
@@ -1077,7 +755,7 @@ class SXMGridViewer(QtWidgets.QWidget):
             " border: 1px solid rgba(120, 200, 255, 0.65); font-weight: 600;"
             "}"
         )
-        self.matrix_summary_label.mousePressEvent = lambda event: self._focus_first_matrix_dataset()
+        self.matrix_summary_label.mousePressEvent = lambda event: self.open_spectro_browser()
         thumbs_toolbar.addWidget(self.matrix_summary_label)
         thumbs_toolbar.addStretch(1)
         self.unit_display_cb = QtWidgets.QCheckBox("SI")
@@ -1097,6 +775,7 @@ class SXMGridViewer(QtWidgets.QWidget):
         header_h.addStretch(1)
         thumbs_panel_layout.addLayout(header_h)
         thumbs_panel_layout.addWidget(self.scroll, 1)
+        thumbs_panel_layout.addWidget(main_window_layout.build_spec_selection_tray(self))
         thumbs_panel_layout.addLayout(thumbs_toolbar)
 
         # restore sort/filter from config if present
@@ -1186,12 +865,63 @@ class SXMGridViewer(QtWidgets.QWidget):
         self.toolbar_load_mol_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self._molecule_pixmap_size = QtCore.QSize(32, 18)
         self.toolbar_load_mol_btn.mousePressEvent = lambda event: self.on_load_molecule()
-        self.toolbar_dark_btn = QtWidgets.QPushButton("Dark")
-        self.toolbar_dark_btn.setCheckable(True)
-        self.toolbar_dark_btn.setToolTip("Toggle dark mode")
-        self.toolbar_dark_btn.setMinimumWidth(64)
+        # Theme selector (Light / Dark / Amber). Kept on the historical
+        # `toolbar_dark_btn` attribute so existing toolbar wiring still works.
+        self.toolbar_dark_btn = QtWidgets.QPushButton(ui_theme.theme_label(self.ui_theme))
+        self.toolbar_dark_btn.setToolTip("Choose UI theme (Light / Dark / Amber)")
+        self.toolbar_dark_btn.setMinimumWidth(72)
         self.toolbar_dark_btn.setFixedHeight(28)
-        self.toolbar_dark_btn.toggled.connect(self.on_dark_mode_toggled)
+        self.toolbar_theme_menu = QtWidgets.QMenu(self.toolbar_dark_btn)
+        self.toolbar_theme_group = QtWidgets.QActionGroup(self.toolbar_theme_menu)
+        self.toolbar_theme_group.setExclusive(True)
+        self.toolbar_theme_acts = {}
+        for _theme_name in ui_theme.THEMES:
+            _theme_act = self.toolbar_theme_menu.addAction(ui_theme.theme_label(_theme_name))
+            _theme_act.setCheckable(True)
+            _theme_act.setChecked(_theme_name == self.ui_theme)
+            _theme_act.triggered.connect(
+                lambda checked=False, n=_theme_name: self.set_ui_theme(n)
+            )
+            self.toolbar_theme_group.addAction(_theme_act)
+            self.toolbar_theme_acts[_theme_name] = _theme_act
+        self.toolbar_theme_menu.addSeparator()
+        # "Full amber imagery": only meaningful while the Amber theme is
+        # active; per-file colormap choices are preserved (display-time
+        # override only) and restored on toggle-off/theme switch.
+        self.amber_full_imagery_act = self.toolbar_theme_menu.addAction("Full amber imagery")
+        self.amber_full_imagery_act.setCheckable(True)
+        self.amber_full_imagery_act.setChecked(bool(self.amber_full_imagery))
+        self.amber_full_imagery_act.setEnabled(ui_theme.is_amber(self.ui_theme))
+        self.amber_full_imagery_act.setToolTip(
+            "Render all images with the amber phosphor colormap while the "
+            "Amber theme is active. Per-file colormap choices are kept and "
+            "restored when turned off. Exports keep the true colormaps.")
+        self.amber_full_imagery_act.toggled.connect(self.on_amber_full_imagery_toggled)
+        self.toolbar_theme_menu.addSeparator()
+        # Global UI font scale (percent of base, so it adapts to any monitor)
+        _scale_widget = QtWidgets.QWidget()
+        _scale_row = QtWidgets.QHBoxLayout(_scale_widget)
+        _scale_row.setContentsMargins(12, 4, 12, 4)
+        _scale_row.setSpacing(8)
+        _scale_row.addWidget(QtWidgets.QLabel("Font size"))
+        self.ui_font_scale_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.ui_font_scale_slider.setRange(60, 200)
+        self.ui_font_scale_slider.setSingleStep(5)
+        self.ui_font_scale_slider.setPageStep(10)
+        self.ui_font_scale_slider.setValue(self.ui_font_scale)
+        self.ui_font_scale_slider.setFixedWidth(140)
+        self.ui_font_scale_slider.setToolTip(
+            "Scale every UI font by this percentage (relative, so it adapts to your monitor)"
+        )
+        _scale_row.addWidget(self.ui_font_scale_slider)
+        self.ui_font_scale_value_label = QtWidgets.QLabel(f"{self.ui_font_scale}%")
+        self.ui_font_scale_value_label.setMinimumWidth(40)
+        _scale_row.addWidget(self.ui_font_scale_value_label)
+        self.ui_font_scale_slider.valueChanged.connect(self._on_ui_font_scale_slider)
+        _scale_act = QtWidgets.QWidgetAction(self.toolbar_theme_menu)
+        _scale_act.setDefaultWidget(_scale_widget)
+        self.toolbar_theme_menu.addAction(_scale_act)
+        self.toolbar_dark_btn.setMenu(self.toolbar_theme_menu)
         preview_workspace_layout.addLayout(preview_header)
 
         self.thumb_cmap_label = QtWidgets.QLabel("Thumb")
@@ -1204,14 +934,43 @@ class SXMGridViewer(QtWidgets.QWidget):
         self.preview_zero_cb.setChecked(self.display_units_relative)
         self.preview_zero_cb.setToolTip("Display values relative to the current zero/reference")
         self.preview_zero_cb.toggled.connect(self.on_unit_relative_toggled)
+        def _cmap_star_button(tooltip, on_click):
+            btn = QtWidgets.QToolButton()
+            btn.setText("★")
+            btn.setAutoRaise(True)
+            btn.setFixedWidth(22)
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(on_click)
+            return btn
+
+        self.thumb_cmap_star_btn = _cmap_star_button(
+            "Save the current thumbnail colormap as your default (used at startup and in reports). "
+            "Clear via Display → Reset colormap defaults.",
+            lambda: self.set_favorite_cmap('thumbnails', self.thumb_cmap_combo.currentText()))
+        self.preview_cmap_star_btn = _cmap_star_button(
+            "Save the current preview colormap as your default (used at startup and in reports). "
+            "Clear via Display → Reset colormap defaults.",
+            lambda: self.set_favorite_cmap('preview', self.preview_cmap_combo.currentText()))
+        self.preview_cmap_gallery_btn = QtWidgets.QToolButton()
+        self.preview_cmap_gallery_btn.setText("🎨")
+        self.preview_cmap_gallery_btn.setAutoRaise(True)
+        self.preview_cmap_gallery_btn.setFixedWidth(22)
+        self.preview_cmap_gallery_btn.setToolTip(
+            "Browse colormaps in a gallery with live preview. "
+            "Click 🔄 on any card to reverse it; sort by function, color, or usage. "
+            "Apply commits, Cancel restores.")
+        self.preview_cmap_gallery_btn.clicked.connect(self.on_open_colormap_gallery)
         preview_state_row = QtWidgets.QHBoxLayout()
         preview_state_row.setContentsMargins(0, 0, 0, 0)
         preview_state_row.setSpacing(8)
         preview_state_row.addWidget(self.thumb_cmap_label)
         preview_state_row.addWidget(self.thumb_cmap_combo)
+        preview_state_row.addWidget(self.thumb_cmap_star_btn)
         preview_state_row.addSpacing(8)
         preview_state_row.addWidget(self.preview_cmap_label)
         preview_state_row.addWidget(self.preview_cmap_combo)
+        preview_state_row.addWidget(self.preview_cmap_star_btn)
+        preview_state_row.addWidget(self.preview_cmap_gallery_btn)
         preview_state_row.addSpacing(8)
         preview_state_row.addWidget(self.preview_zero_cb)
         preview_state_row.addStretch(1)
@@ -1433,6 +1192,9 @@ class SXMGridViewer(QtWidgets.QWidget):
         preview_panel.setLayout(preview_panel_layout)
         self.preview_canvas.set_value_callback(self._on_preview_value)
         self.preview_canvas.set_spectra_click_callback(self._on_preview_spec_click)
+        self.preview_canvas.set_spectra_compare_all_callback(
+            lambda file_key: self.spectro_compare_controller.open_all_specs_popup(file_key)
+        )
         self.preview_canvas.set_crop_callback(lambda v, c=self.preview_canvas: self._on_preview_crop(v, c))
         self.preview_canvas.set_virtual_copy_callback(self._create_virtual_copy_from_popup_view)
         # Double-click popup disabled — opens redundant windows when preview is already visible
@@ -1448,6 +1210,11 @@ class SXMGridViewer(QtWidgets.QWidget):
         self.preview_canvas.set_histogram_dialog_callback(lambda c: self._open_histogram_dialog(c))
         self.preview_canvas.set_histogram_auto_callback(lambda c: self._auto_contrast(c))
         self.preview_canvas.set_histogram_reset_callback(lambda c: self._reset_contrast(c))
+        self.preview_canvas.set_display_relative_zero_menu_callback(
+            self.on_unit_relative_toggled,
+            state_cb=lambda: self.display_units_relative,
+            tooltip="Display values relative to the current zero/reference",
+        )
         self.preview_canvas.set_compare_menu_callback(
             lambda action, view, c=self.preview_canvas: self.on_compare_menu_action(action, view, c),
             state_cb=self.compare_menu_state,
@@ -1471,7 +1238,35 @@ class SXMGridViewer(QtWidgets.QWidget):
         except Exception:
             pass
         try:
+            if getattr(self, "recent_svg_molecules", None):
+                self.preview_canvas._recent_svg_molecule_paths = list(self.recent_svg_molecules)
+                MultiPreviewCanvas._RECENT_SVG_MOLECULES = list(self.recent_svg_molecules)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "last_svg_molecule_dir", None):
+                self.preview_canvas.set_last_svg_molecule_dir(self.last_svg_molecule_dir)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "svg_molecule_style_defaults", None):
+                MultiPreviewCanvas._SVG_MOLECULE_STYLE_DEFAULTS = dict(self.svg_molecule_style_defaults)
+        except Exception:
+            pass
+        try:
             self.preview_canvas.set_recent_molecule_callback(self._on_recent_molecules_updated)
+        except Exception:
+            pass
+        try:
+            self.preview_canvas.set_recent_svg_molecule_callback(self._on_recent_svg_molecules_updated)
+        except Exception:
+            pass
+        try:
+            self.preview_canvas.set_last_svg_molecule_dir_callback(self._on_last_svg_molecule_dir_updated)
+        except Exception:
+            pass
+        try:
+            self.preview_canvas.set_svg_molecule_style_defaults_callback(self._on_svg_molecule_style_defaults_updated)
         except Exception:
             pass
         self.preview_canvas.enable_scale_bar(self.scale_bar_cb.isChecked())
@@ -1598,7 +1393,7 @@ class SXMGridViewer(QtWidgets.QWidget):
         # repeated rebuilds while the user is dragging.
         self._thumbs_reflow_timer = QtCore.QTimer(self)
         self._thumbs_reflow_timer.setSingleShot(True)
-        self._thumbs_reflow_timer.timeout.connect(lambda: self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex()))
+        self._thumbs_reflow_timer.timeout.connect(lambda: viewer_thumb_ui.reflow_thumbnail_grid(self, self.channel_dropdown.currentIndex()))
         try:
             main_splitter.splitterMoved.connect(lambda pos, idx: self._thumbs_reflow_timer.start(150))
             main_splitter.splitterMoved.connect(lambda pos, idx: self._on_main_splitter_moved(pos, idx))
@@ -1668,6 +1463,10 @@ class SXMGridViewer(QtWidgets.QWidget):
             self.grid_as_matrix_cb.toggled.connect(self.on_spectro_grid_as_matrix_toggled)
         if getattr(self, "force_single_cb", None) is not None:
             self.force_single_cb.toggled.connect(self.on_spectro_force_single_toggled)
+        if getattr(self, "open_current_site_btn", None) is not None:
+            self.open_current_site_btn.clicked.connect(self.on_open_current_spectro_site)
+        if getattr(self, "review_low_conf_btn", None) is not None:
+            self.review_low_conf_btn.clicked.connect(self.on_review_low_conf_spectros)
         self.clear_spec_selection_btn.clicked.connect(self.on_clear_spec_selection)
         self.tag_ch_btn.clicked.connect(lambda: self.on_manual_tag('constant-height'))
         self.tag_cc_btn.clicked.connect(lambda: self.on_manual_tag('constant-current'))
@@ -1678,9 +1477,21 @@ class SXMGridViewer(QtWidgets.QWidget):
             self.purge_config_btn.clicked.connect(self._on_purge_config)
         except Exception:
             pass
-        # apply initial dark mode palette
+        # apply initial UI font scale, then theme (theme QSS embeds the scale)
         try:
-            self._apply_dark_mode(self.dark_mode)
+            self._apply_ui_font_scale()
+        except Exception:
+            pass
+        try:
+            self._apply_ui_theme(self.ui_theme)
+        except Exception:
+            pass
+        # keep native title bars of every window (popups, dialogs) in sync
+        try:
+            self._titlebar_themer = ui_theme.TitleBarThemer(self)
+            _app = QtWidgets.QApplication.instance()
+            if _app is not None:
+                _app.installEventFilter(self._titlebar_themer)
         except Exception:
             pass
         self._update_toolbar_actions(False)
@@ -1693,6 +1504,14 @@ class SXMGridViewer(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         try:
+            # The manifest save is debounced on a QTimer that never fires while
+            # the UI thread is busy; without this flush, closing right after a
+            # long hydration pass silently drops the manifest and the next
+            # session re-parses every spectroscopy file from scratch.
+            self._flush_spectro_manifest_save()
+        except Exception:
+            pass
+        try:
             self._save_recovery_snapshot(reason="close")
         except Exception:
             pass
@@ -1704,6 +1523,18 @@ class SXMGridViewer(QtWidgets.QWidget):
             window = getattr(self, "collection_tray_window", None)
             if window is not None:
                 window.hide()
+        except Exception:
+            pass
+        try:
+            # save_config() is debounced the same way the spectro manifest
+            # is (see the comment above); flush last, after every other
+            # closeEvent step that might itself call save_config, so this
+            # captures the truly final state before quitting.
+            flush_pending_config_save()
+        except Exception:
+            pass
+        try:
+            flush_pending_header_cache_save()
         except Exception:
             pass
         super().closeEvent(event)
@@ -1735,12 +1566,135 @@ class SXMGridViewer(QtWidgets.QWidget):
         if has_images:
             self.load_folder(folder)
 
-    def _apply_dark_mode(self, enabled: bool):
+    def set_ui_theme(self, name: str):
+        """Switch the named UI theme (light/dark/amber) and persist it."""
+        name = ui_theme.normalize(name)
+        self.ui_theme = name
+        self.dark_mode = ui_theme.is_dark_theme(name)
+        btn = getattr(self, 'toolbar_dark_btn', None)
+        if btn is not None:
+            try:
+                btn.setText(ui_theme.theme_label(name))
+            except Exception:
+                pass
+        for theme_name, act in (getattr(self, 'toolbar_theme_acts', {}) or {}).items():
+            set_silent(act, checked=theme_name == name)
+        # An explicit theme choice re-couples the plot/detail background to
+        # the theme (a stale detail_dark_view override otherwise leaves the
+        # preview plot white under dark/amber).
+        self._set_detail_dark_view_state(self.dark_mode, follow_dark_mode=True, persist=False)
+        self.config['ui_theme'] = name
+        self.config['dark_mode'] = self.dark_mode  # legacy key, kept in sync
+        self.config['detail_dark_view'] = self.detail_dark_view
+        self.config['detail_theme_follows_dark_mode'] = bool(
+            getattr(self, "_detail_theme_follows_dark_mode", True)
+        )
+        save_config(self.config)
+        self._apply_ui_theme(name)
+        # Full-amber imagery is only meaningful under the Amber theme: keep
+        # the menu action's enabled state in sync, and if the effective
+        # override changed with this switch (e.g. Amber+toggle -> Dark),
+        # re-render cached imagery (the preview re-render below runs anyway).
+        set_silent(getattr(self, 'amber_full_imagery_act', None),
+                   enabled=ui_theme.is_amber(name))
+        if self._sync_forced_cmap():
+            self._refresh_all_imagery(include_preview=False)
+        if getattr(self, "last_preview", None):
+            # Re-render the preview (metadata HTML colors, canvas chrome)
+            # without destroying an open profile measurement: the redraw
+            # only preserves profiles when preserve_profiles_on_channel_change
+            # is set, so force it for this one same-path refresh.
+            saved_pref = getattr(self, "preserve_profiles_on_channel_change", False)
+            if getattr(self, "_profile_dialog", None) is not None:
+                self.preserve_profiles_on_channel_change = True
+            try:
+                self.show_file_channel(self.last_preview[0], self.last_preview[1])
+            finally:
+                self.preserve_profiles_on_channel_change = saved_pref
+
+    def _sync_forced_cmap(self):
+        """Point the registry's display-time colormap override at the amber
+        cmap when (Amber theme AND full-amber toggle), else clear it.
+        Returns True when the effective override changed."""
+        force = ui_theme.is_amber(self.ui_theme) and bool(getattr(self, 'amber_full_imagery', False))
+        prev = cmap_registry.forced_cmap_name()
+        cmap_registry.set_forced_cmap(cmap_registry.AMBER_CMAP_NAME if force else None)
+        return prev != cmap_registry.forced_cmap_name()
+
+    def on_amber_full_imagery_toggled(self, checked):
+        self.amber_full_imagery = bool(checked)
+        self.config['amber_full_imagery'] = self.amber_full_imagery
+        save_config(self.config)
+        if self._sync_forced_cmap():
+            self._refresh_all_imagery()
+
+    def _refresh_all_imagery(self, include_preview=True):
+        """Invalidate every cached rendering of image data and re-render.
+
+        Needed when a display-time override (full-amber imagery) changes:
+        nothing in any per-file state or cache key changes, so the pixmap
+        caches would otherwise happily keep serving the old colors."""
+        try:
+            self._invalidate_thumbnail_cache()
+        except Exception:
+            pass
+        try:
+            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
+        except Exception:
+            pass
+        if include_preview and getattr(self, 'last_preview', None):
+            try:
+                self.show_file_channel(self.last_preview[0], self.last_preview[1])
+            except Exception:
+                pass
+        for canv in list(getattr(self, '_popup_canvases', []) or []):
+            try:
+                canv._redraw()
+            except Exception:
+                continue
+        # Publication-canvas tiles rebuild their pixmaps through
+        # canvas_rendering (which resolves via effective_cmap).
+        try:
+            win = self._canvas_window_ref()
+            if win is not None and getattr(win, 'scene', None) is not None:
+                from .canvases.canvas_items import CanvasImageItem
+                for item in win.scene.items():
+                    if isinstance(item, CanvasImageItem):
+                        item._update_rendered_pixmap()
+        except Exception:
+            pass
+        # Open grid maps / plot dialogs re-render their image layers.
+        try:
+            self._retheme_open_plot_windows()
+        except Exception:
+            pass
+
+    def _apply_ui_theme(self, name: str):
+        """Apply a named theme to the application chrome.
+
+        Only chrome is themed here (palette + control stylesheets).
+        Scientific imagery — thumbnails, previews, canvas tiles,
+        colorbars — renders through the user-selected colormap and is
+        deliberately untouched by every branch below.
+        """
         app = QtWidgets.QApplication.instance()
         if app is None:
             return
-        if enabled:
+        name = ui_theme.normalize(name)
+        ui_theme.set_current_theme(name)
+        if name == ui_theme.THEME_AMBER:
             app.setStyle('Fusion')
+            app.setPalette(ui_theme.amber_palette())
+            # Chrome-only stylesheet generated from the amber tokens.
+            app.setStyleSheet(ui_theme.amber_app_qss(getattr(self, 'ui_font_scale', 100)))
+            try:
+                if hasattr(self, 'left_w') and self.left_w is not None:
+                    self.left_w.setStyleSheet(ui_theme.amber_left_panel_qss())
+            except Exception:
+                pass
+        elif name == ui_theme.THEME_DARK:
+            app.setStyle('Fusion')
+            app.setStyleSheet("")
             palette = QtGui.QPalette()
             palette.setColor(QtGui.QPalette.Window, QtGui.QColor(53,53,53))
             palette.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
@@ -1762,6 +1716,7 @@ class SXMGridViewer(QtWidgets.QWidget):
             except Exception:
                 pass
         else:
+            app.setStyleSheet("")
             app.setPalette(app.style().standardPalette())
             try:
                 if hasattr(self, 'left_w') and self.left_w is not None:
@@ -1771,8 +1726,23 @@ class SXMGridViewer(QtWidgets.QWidget):
                 pass
         try:
             win = self._canvas_window_ref()
-            if win is not None and hasattr(win, "set_dark_mode"):
-                win.set_dark_mode(bool(enabled))
+            if win is not None:
+                if hasattr(win, "set_ui_theme"):
+                    win.set_ui_theme(name)
+                elif hasattr(win, "set_dark_mode"):
+                    win.set_dark_mode(ui_theme.is_dark_theme(name))
+        except Exception:
+            pass
+        try:
+            self._apply_main_toolbar_theme()
+        except Exception:
+            pass
+        # Native title bars: dark for dark/amber, default for light.
+        try:
+            dark_tb = ui_theme.is_dark_theme(name)
+            for tlw in QtWidgets.QApplication.topLevelWidgets():
+                if tlw.isWindow():
+                    ui_theme.apply_native_titlebar(tlw, dark_tb)
         except Exception:
             pass
         if hasattr(self, 'shortcuts_label'):
@@ -1790,19 +1760,141 @@ class SXMGridViewer(QtWidgets.QWidget):
             self._apply_preview_workspace_theme()
         except Exception:
             pass
+        # Re-style existing thumbnail card frames (borders only; the pixmaps
+        # themselves are untouched and keep their user-selected colormaps).
+        try:
+            self._refresh_thumb_selection_styles()
+            self._refresh_spectro_thumb_selection_styles()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "compact_histogram", None) is not None:
+                self.compact_histogram.refresh_theme()
+        except Exception:
+            pass
+        try:
+            self._retheme_open_plot_windows()
+        except Exception:
+            pass
+
+    def _retheme_open_plot_windows(self):
+        """Live-retheme already-open plot windows (Spectrum popups, profile
+        dialogs, compare/Z-series, grid maps, KPFM trends) after a theme
+        switch — their chrome is applied at redraw time, so without this
+        they keep the previous theme until something replots them."""
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        dark = bool(self.dark_mode)
+        for tlw in app.topLevelWidgets():
+            if tlw is self or not tlw.isVisible():
+                continue
+            try:
+                # Follow the app theme with each dialog's own Dark plot
+                # toggle (users can still flip it back per-window).
+                for attr in ("dark_bg_cb", "dark_bg_toggle"):
+                    btn = getattr(tlw, attr, None)
+                    if btn is not None:
+                        btn.setChecked(dark)
+                if hasattr(tlw, "_apply_toggle_button_styles"):
+                    tlw._apply_toggle_button_styles()
+                if hasattr(tlw, "_apply_plot_theme"):
+                    tlw._apply_plot_theme()
+                elif hasattr(tlw, "_request_plot_update"):
+                    tlw._request_plot_update(delay_ms=20)
+                elif hasattr(tlw, "_draw_image_layer"):
+                    tlw._draw_image_layer()
+                    if hasattr(tlw, "_update_curve_plot"):
+                        tlw._update_curve_plot()
+                elif hasattr(tlw, "_update_plot"):
+                    tlw._update_plot()
+            except Exception:
+                continue
+
+    def _apply_ui_font_scale(self):
+        """Scale the application-wide font by ui_font_scale percent.
+
+        Percent-of-base rather than absolute points, so the same setting
+        adapts across monitors of different resolutions/DPI."""
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        scale = max(60, min(200, int(getattr(self, 'ui_font_scale', 100) or 100)))
+        self.ui_font_scale = scale
+        base = getattr(self, '_ui_base_font_pt', None)
+        if base is None:
+            f0 = app.font()
+            base = f0.pointSizeF() if f0.pointSizeF() > 0 else 11.0
+            self._ui_base_font_pt = base
+        f = app.font()
+        f.setPointSizeF(max(6.0, base * scale / 100.0))
+        app.setFont(f)
+        # Amber's chrome QSS pins its own font-size; regenerate it scaled.
+        if ui_theme.is_amber(self):
+            app.setStyleSheet(ui_theme.amber_app_qss(scale))
+
+    def set_ui_font_scale(self, percent, persist: bool = True):
+        try:
+            self.ui_font_scale = max(60, min(200, int(percent)))
+        except Exception:
+            return
+        if persist:
+            self.config['ui_font_scale'] = self.ui_font_scale
+            save_config(self.config)
+        self._apply_ui_font_scale()
+        label = getattr(self, 'ui_font_scale_value_label', None)
+        if label is not None:
+            try:
+                label.setText(f"{self.ui_font_scale}%")
+            except Exception:
+                pass
+
+    def _on_ui_font_scale_slider(self, value):
+        label = getattr(self, 'ui_font_scale_value_label', None)
+        if label is not None:
+            try:
+                label.setText(f"{int(value)}%")
+            except Exception:
+                pass
+        # Debounce: re-fonting the whole widget tree on every tick is choppy.
+        timer = getattr(self, '_font_scale_apply_timer', None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(
+                lambda: self.set_ui_font_scale(self.ui_font_scale_slider.value())
+            )
+            self._font_scale_apply_timer = timer
+        timer.start(200)
+
+    def _apply_main_toolbar_theme(self):
+        """Re-style main-toolbar accents that are set once at creation time."""
+        amber = ui_theme.is_amber(self)
+        btn = getattr(self, "toolbar_canvas_btn", None)
+        if btn is not None:
+            try:
+                from .styles import MAIN_TOOLBAR_CANVAS_BUTTON_STYLE
+                btn.setStyleSheet(
+                    ui_theme.amber_canvas_button_qss() if amber else MAIN_TOOLBAR_CANVAS_BUTTON_STYLE
+                )
+            except Exception:
+                pass
+        panel = getattr(self, "shortcuts_panel", None)
+        if panel is not None:
+            try:
+                from .styles import MAIN_SHORTCUTS_PANEL_STYLE
+                panel.setStyleSheet(
+                    ui_theme.amber_shortcuts_panel_qss() if amber else MAIN_SHORTCUTS_PANEL_STYLE
+                )
+            except Exception:
+                pass
 
     def _set_detail_dark_view_state(self, enabled: bool, *, follow_dark_mode=None, persist: bool = True):
         self.detail_dark_view = bool(enabled)
         if follow_dark_mode is not None:
             self._detail_theme_follows_dark_mode = bool(follow_dark_mode)
-        act = getattr(self, "detail_dark_act", None)
-        if act is not None:
-            try:
-                act.blockSignals(True)
-                act.setChecked(self.detail_dark_view)
-                act.blockSignals(False)
-            except Exception:
-                pass
+        set_silent(getattr(self, "detail_dark_act", None),
+                   checked=self.detail_dark_view)
         if persist:
             self.config["detail_dark_view"] = self.detail_dark_view
             self.config["detail_theme_follows_dark_mode"] = bool(
@@ -1821,32 +1913,49 @@ class SXMGridViewer(QtWidgets.QWidget):
 
     def _apply_preview_workspace_theme(self):
         dark = bool(getattr(self, "dark_mode", False))
+        amber = ui_theme.is_amber(self)
+        t = ui_theme.AMBER
         frame = getattr(self, "preview_workspace_frame", None)
         if frame is not None:
-            if dark:
+            if amber:
+                border = t["border"]
+                bg = t["panel_bg"]
+                radius = "2px"
+            elif dark:
                 border = "#4c4c4c"
                 bg = "#2a2a2a"
+                radius = "8px"
             else:
                 border = "#d8dce5"
                 bg = "#f6f8fb"
+                radius = "8px"
             frame.setStyleSheet(
                 f"""
 QFrame#previewWorkspaceFrame {{
     border: 1px solid {border};
-    border-radius: 8px;
+    border-radius: {radius};
     background-color: {bg};
 }}
 """
             )
-        combo_style = (
-            "QComboBox { background-color: #1f1f1f; border: 1px solid #444444; color: #f0f0f0; padding: 4px; border-radius: 4px; }"
-            if dark else
-            ""
-        )
+        if amber:
+            combo_style = (
+                f"QComboBox {{ background-color: {t['input_bg']}; border: 1px solid {t['border']};"
+                f" color: {t['text_primary']}; padding: 4px; border-radius: 2px; }}"
+            )
+        elif dark:
+            combo_style = "QComboBox { background-color: #1f1f1f; border: 1px solid #444444; color: #f0f0f0; padding: 4px; border-radius: 4px; }"
+        else:
+            combo_style = ""
         for combo in (getattr(self, "thumb_cmap_combo", None), getattr(self, "preview_cmap_combo", None)):
             if combo is not None:
                 combo.setStyleSheet(combo_style)
-        label_style = "color: #f0f0f0; font-weight: 600;" if dark else "color: #202020; font-weight: 600;"
+        if amber:
+            label_style = f"color: {t['text_primary']}; font-weight: 600;"
+        elif dark:
+            label_style = "color: #f0f0f0; font-weight: 600;"
+        else:
+            label_style = "color: #202020; font-weight: 600;"
         for label in (
             getattr(self, "preview_title_label", None),
             getattr(self, "channel_label", None),
@@ -1857,21 +1966,24 @@ QFrame#previewWorkspaceFrame {{
                 label.setStyleSheet(label_style)
         btn = getattr(self, "toolbar_dark_btn", None)
         if btn is not None:
-            if dark:
+            if amber:
+                button_style = (
+                    f"QPushButton {{ padding: 4px 10px; border: 1px solid {t['border']};"
+                    f" border-radius: 2px; background-color: {t['panel_bg']}; color: {t['text_primary']}; }}"
+                    f"QPushButton:hover {{ background-color: {t['hover_bg']}; border-color: {t['amber_secondary']}; }}"
+                    f"QPushButton:focus {{ border-color: {t['border_active']}; }}"
+                )
+            elif dark:
                 button_style = (
                     "QPushButton { padding: 4px 10px; border: 1px solid #5a5a5a; border-radius: 6px; background-color: #343434; color: #f0f0f0; }"
-                    "QPushButton:checked { background-color: #2b6cb0; border-color: #2b6cb0; color: #ffffff; font-weight: 600; }"
                 )
             else:
                 button_style = (
                     "QPushButton { padding: 4px 10px; border: 1px solid #c8cfdb; border-radius: 6px; background-color: #ffffff; color: #202020; }"
-                    "QPushButton:checked { background-color: #2b6cb0; border-color: #2b6cb0; color: #ffffff; font-weight: 600; }"
                 )
             btn.setStyleSheet(button_style)
             try:
-                btn.blockSignals(True)
-                btn.setChecked(self.dark_mode)
-                btn.blockSignals(False)
+                btn.setText(ui_theme.theme_label(getattr(self, "ui_theme", "light")))
             except Exception:
                 pass
 
@@ -1879,7 +1991,13 @@ QFrame#previewWorkspaceFrame {{
         btn = getattr(self, "toolbar_load_mol_btn", None)
         if btn is None:
             return
-        if getattr(self, "dark_mode", False):
+        if ui_theme.is_amber(self):
+            t = ui_theme.AMBER
+            base = t["panel_bg"]
+            hover = t["hover_bg"]
+            border = t["border"]
+            color = QtGui.QColor(t["text_primary"])
+        elif getattr(self, "dark_mode", False):
             base = "#343434"
             hover = "#3d3d3d"
             border = "#5a5a5a"
@@ -1923,60 +2041,12 @@ QLabel:hover {{
             btn.setText("Mol")
 
     def _append_activity_log(self, message: str):
-        box = getattr(self, "activity_log_box", None)
-        if box is None:
-            return
-        try:
-            self._activity_log_pending.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-            if not self._activity_log_flush_timer.isActive():
-                self._activity_log_flush_timer.start(60)
-        except Exception:
-            entry = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
-            box.appendPlainText(entry)
-            box.verticalScrollBar().setValue(box.verticalScrollBar().maximum())
-
-    def _flush_activity_log_pending(self):
-        box = getattr(self, "activity_log_box", None)
-        if box is None:
-            self._activity_log_pending = []
-            return
-        pending = list(getattr(self, "_activity_log_pending", []) or [])
-        if not pending:
-            return
-        self._activity_log_pending = []
-        try:
-            box.appendPlainText("\n".join(pending))
-            box.verticalScrollBar().setValue(box.verticalScrollBar().maximum())
-        except Exception:
-            for entry in pending:
-                try:
-                    box.appendPlainText(entry)
-                except Exception:
-                    pass
-        try:
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents, 5)
-        except Exception:
-            pass
-
-    def _on_clear_activity_log(self):
-        if hasattr(self, "activity_log_box"):
-            self.activity_log_box.clear()
-        self._activity_log_pending = []
+        """Delegates to ActivityLog; kept as the signal slot target."""
+        if self.activity_log is not None:
+            self.activity_log.append(message)
 
     def _create_lower_controls(self):
         return main_window_layout.create_lower_controls(self)
-
-    def _build_browse_context_page(self):
-        return main_window_layout.build_browse_context_page(self)
-
-    def _build_measure_context_page(self):
-        return main_window_layout.build_measure_context_page(self)
-
-    def _build_spectro_context_page(self):
-        return main_window_layout.build_spectro_context_page(self)
-
-    def _build_display_widget(self, parent):
-        return main_window_layout.build_display_widget(self, parent)
 
     def _apply_lower_control_theme(self):
         return main_window_layout.apply_lower_control_theme(self)
@@ -2009,9 +2079,7 @@ QLabel:hover {{
         self.current_mode = mode
         btn = getattr(self, 'mode_buttons', {}).get(mode)
         if btn and not btn.isChecked():
-            btn.blockSignals(True)
-            btn.setChecked(True)
-            btn.blockSignals(False)
+            set_silent(btn, checked=True)
         if remember:
             settings = QtCore.QSettings()
             settings.setValue("lowerPane/lastMode", self._mode_name(mode))
@@ -2163,13 +2231,31 @@ QLabel:hover {{
             self.ensure_spectros_loaded(refresh=False)
         return main_window_spectro.open_spectro_summary_for_file(self, file_key, show_mode=show_mode, quiet=quiet)
 
-    def _open_matrix_explorer_for_file(self, file_key):
+    def _open_spectro_summary_for_site(self, spec, file_key="", quiet=False):
         if not self._spectros_loaded:
             self.ensure_spectros_loaded(refresh=False)
-        image_specs = [s for s in self.spectros_by_image.get(str(file_key), []) if s.get('matrix_index') is not None]
+        return main_window_spectro.open_spectro_summary_for_site(self, spec, file_key=file_key, quiet=quiet)
+
+    def reveal_spectroscopy_source(self, spec, image_key=None):
+        return main_window_spectro.reveal_spectroscopy_source(self, spec, image_key=image_key)
+
+    def _show_spectro_marker_legend(self):
+        return spectro_overlays.show_marker_legend_dialog(self)
+
+    def _open_matrix_explorer_for_file(self, file_key, dataset_key=None):
+        if not self._spectros_loaded:
+            self.ensure_spectros_loaded(refresh=False)
+        all_image_specs = list(self.spectros_by_image.get(str(file_key), []))
+        image_specs = [s for s in all_image_specs if s.get('matrix_index') is not None]
         dataset_specs = list(image_specs)
         dataset = None
-        dataset_key = image_specs[0].get('matrix_dataset') if image_specs else None
+        # An image can host several distinct grids at once (e.g. repeated
+        # .3ds scans of the same region) - without an explicit dataset_key,
+        # this arbitrarily picked whichever grid happened to be first in
+        # image_specs. The spectroscopy browser now opens a specific grid
+        # by its dataset key directly (one browser row per .3ds file), so
+        # honor that when given instead of guessing.
+        dataset_key = dataset_key or (image_specs[0].get('matrix_dataset') if image_specs else None)
         if dataset_key:
             dataset = self.matrix_datasets.get(dataset_key)
             full = [spec for spec in self.matrix_spectros if spec.get('matrix_dataset') == dataset_key]
@@ -2178,6 +2264,26 @@ QLabel:hover {{
         if not dataset_specs:
             QtWidgets.QMessageBox.information(self, "Matrix explorer", "No matrix spectroscopies available for this image.")
             return
+
+        # dataset_specs may still be metadata-only (lazy payload: no
+        # 'channels'/'V' arrays) if this grid hasn't been individually
+        # opened/hydrated yet this session - without this, the map/plot/fit
+        # below silently has no per-pixel data to work with. All specs here
+        # share one .3ds file, so this is a single re-parse, not per-pixel.
+        if any(not spec.get("channels") for spec in dataset_specs):
+            self.hydrate_spectro_entries(dataset_specs)
+
+        # A Z-stack or a handful of single point spectra can be anchored to
+        # the same image as this grid (e.g. a few individually-taken
+        # spectra alongside a .3ds map). Surface them here too - previously
+        # they were silently excluded, which meant "Show all spectroscopy
+        # positions" had nothing distinct to toggle (this dialog's own
+        # per-pixel grid points were the only thing it was ever given) and
+        # co-located Z-stacks/singles were unreachable from the Grid Map
+        # Explorer entirely.
+        co_located_specs = [s for s in all_image_specs if s.get('matrix_index') is None]
+        if co_located_specs and any(not spec.get("channels") for spec in co_located_specs):
+            self.hydrate_spectro_entries(co_located_specs)
 
         entry = {'path': Path(file_key)}
         try:
@@ -2188,11 +2294,11 @@ QLabel:hover {{
         dlg = MatrixSpectroViewer(
             self,
             entry,
-            dataset_specs,
+            dataset_specs + co_located_specs,
             dataset=dataset,
             palette_name=getattr(self, "spectro_color_cycle", DEFAULT_COLOR_CYCLE),
         )
-        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        spectro_popups._prepare_popup_window(dlg, self)
         dlg.show()
         self._popup_refs.append(dlg)
         dlg.finished.connect(lambda _: self._popup_refs.remove(dlg) if dlg in self._popup_refs else None)
@@ -2325,7 +2431,7 @@ QLabel:hover {{
                 canvas._colorbar_orientation = orient if orient in ("vertical", "horizontal") else "vertical"
                 canvas._show_title = bool(display.get("show_title", getattr(canvas, "_show_title", True)))
                 canvas._show_acquisition_overlay = bool(display.get("show_acquisition_overlay", getattr(canvas, "_show_acquisition_overlay", False)))
-                canvas._show_shortcut_hint = bool(display.get("show_shortcut_hint", getattr(canvas, "_show_shortcut_hint", True)))
+                canvas._show_shortcut_hint = bool(display.get("show_shortcut_hint", getattr(canvas, "_show_shortcut_hint", False)))
                 canvas._show_profile_overlays = bool(display.get("show_profile_overlays", getattr(canvas, "_show_profile_overlays", True)))
                 canvas._show_angle_overlays = bool(display.get("show_angle_overlays", getattr(canvas, "_show_angle_overlays", True)))
                 canvas.show_molecules = bool(display.get("show_molecules", getattr(canvas, "show_molecules", True)))
@@ -2496,7 +2602,7 @@ QLabel:hover {{
             path = view.get("path") or (view.get("meta") or {}).get("path")
             if path:
                 if auto_virtual_copy:
-                    self._create_virtual_crop_view(view)
+                    virtual_copies.create_virtual_crop_view(self, view)
                 elif not skip_virtual_copy_prompt:
                     ret = QtWidgets.QMessageBox.question(
                         self,
@@ -2506,7 +2612,7 @@ QLabel:hover {{
                         QtWidgets.QMessageBox.No,
                     )
                     if ret == QtWidgets.QMessageBox.Yes:
-                        self._create_virtual_crop_view(view)
+                        virtual_copies.create_virtual_crop_view(self, view)
         except Exception:
             pass
         title = view.get("title") or "Cropped view"
@@ -2529,16 +2635,27 @@ QLabel:hover {{
     def _on_spectro_browser_selection(self, current, _prev):
         return main_window_spectro.on_spectro_browser_selection(self, current, _prev)
 
+    def _on_spectro_browser_activate(self, item, column=0):
+        return main_window_spectro.on_spectro_browser_activate(self, item, column)
+
+    def _on_spectro_browser_context_menu(self, pos):
+        return main_window_spectro.on_spectro_browser_context_menu(self, pos)
+
     def _shortcuts_html(self):
-        color = "#f0f4ff" if getattr(self, 'dark_mode', False) else "#203050"
+        if ui_theme.is_amber(self):
+            color = ui_theme.AMBER["text_primary"]
+        else:
+            color = "#f0f4ff" if getattr(self, 'dark_mode', False) else "#203050"
         return (
             "<ul style='margin:4px 12px;padding-left:12px;color:%s'>"
             "<li><b>Shift+Click</b> minimap frame = hide entry</li>"
             "<li><b>Show all frames</b> button resets minimap filters</li>"
             "<li><b>Ctrl+Wheel</b> over thumbnails = resize previews</li>"
-            "<li><b>Shift+Click</b> spectroscopy marker = multi-select</li>"
+            "<li><b>Shift+Click</b> spectroscopy marker = multi-select, then use the tray's <b>Compare</b> button under the thumbnails</li>"
             "<li><b>Ctrl+Drag</b> thumbnails = reorder export selection</li>"
             "<li><b>Ctrl+A</b> in thumbnails = select all visible thumbnails</li>"
+            "<li><b>S</b> in thumbnails = star/unstar the selected images (favourites, gold badge)</li>"
+            "<li><b>Ctrl+Alt+F/H/C/P</b> = show only starred / CH / CC / with-spectroscopy images; press the same shortcut again to show all</li>"
             "<li><b>Shift/Ctrl+Click</b> thumbnails + <b>Ctrl+C</b> = copy selected as separate PNG files</li>"
             "<li><b>Ctrl+C</b> over preview/popup = copy displayed PNG</li>"
             "<li><b>Popup canvas</b>: A auto contrast, 0 toggles relative-zero, Ctrl+Click profile, Ctrl+Alt+Click angle, click a molecule then X/Y/Z rotate it, Shift+X/Y/Z rotates opposite, Shift+drag rotates around Z, Ctrl+Shift+drag or middle-drag rotates in 3D, Ctrl+1/2/3 saved overlays</li>"
@@ -2828,6 +2945,7 @@ QLabel:hover {{
                     dataset=payload.get("dataset"),
                     palette_name=payload.get("palette_name") or DEFAULT_COLOR_CYCLE,
                 )
+                spectro_popups._prepare_popup_window(dlg, self)
                 self._apply_window_state_payload(dlg, payload)
                 dlg.show()
                 self._popup_refs.append(dlg)
@@ -2908,12 +3026,8 @@ QLabel:hover {{
             self._suspend_window_history = previous
 
     def _prepare_for_workspace_load(self, kind="workspace"):
-        self._workspace_window_shutdown = True
-        try:
-            self._clear_closed_window_history()
-            self._close_workspace_windows(record_history=False, include_canvas=True)
-        finally:
-            self._workspace_window_shutdown = False
+        self._clear_closed_window_history()
+        self._close_workspace_windows(record_history=False, include_canvas=True)
         self._current_session_path = None
 
     def _refresh_autosave_timer(self):
@@ -3048,14 +3162,8 @@ QLabel:hover {{
                 except Exception:
                     pass
         for attr in ("session_recovery_enable_act", "toolbar_session_recovery_enable_act"):
-            act = getattr(self, attr, None)
-            if act is not None:
-                try:
-                    act.blockSignals(True)
-                    act.setChecked(self._session_recovery_enabled)
-                    act.blockSignals(False)
-                except Exception:
-                    pass
+            set_silent(getattr(self, attr, None),
+                       checked=self._session_recovery_enabled)
         recovery_exists = self._session_recovery_path().exists()
         for attr in ("session_recovery_open_act", "toolbar_session_recovery_open_act", "session_recovery_discard_act", "toolbar_session_recovery_discard_act"):
             act = getattr(self, attr, None)
@@ -3066,12 +3174,16 @@ QLabel:hover {{
                     pass
         for minutes, act in dict(getattr(self, "session_recovery_interval_actions", {}) or {}).items():
             try:
-                act.blockSignals(True)
-                act.setChecked(int(minutes) == int(self._session_recovery_interval_min))
-                act.blockSignals(False)
+                is_current = int(minutes) == int(self._session_recovery_interval_min)
             except Exception:
-                pass
+                continue
+            set_silent(act, checked=is_current)
 
+    # NOTE: implemented but NOT wired to any menu, toolbar or
+    # shortcut - 'Save session' (Ctrl+S) and 'Load session' are,
+    # this is not. Kept deliberately: SessionController.
+    # save_session_as() works, it just has no way to be invoked.
+    # See docs/refactor/SHIM_CENSUS_SXMGridViewer.md.
     def on_save_session_as(self):
         self.session_controller.save_session_as()
 
@@ -3116,6 +3228,11 @@ QLabel:hover {{
                 pass
         try:
             if self.quick_crop_controller.undo_last_crop():
+                return
+        except Exception:
+            pass
+        try:
+            if self._undo_last_adjustment():
                 return
         except Exception:
             pass
@@ -3283,13 +3400,19 @@ QLabel:hover {{
                         del self._spectro_selection_before_drag
                     return True
 
-        # When the thumbnail viewport or container is resized, debounce and repopulate so
-        # the thumbnail grid recomputes columns responsively.
+        # Only reflow the thumbnail grid when the available viewport width changes.
+        # Height/content resizes happen constantly during lazy loading and should not
+        # rebuild the whole thumbnail panel.
         if obj in (getattr(self, '_thumb_viewport', None),
                    getattr(self, 'thumb_container', None),
                    getattr(self, 'scroll', None)) and event.type() == QtCore.QEvent.Resize:
             try:
-                self._thumbs_reflow_timer.start(150)
+                vp = getattr(self, '_thumb_viewport', None)
+                width = int(vp.width()) if vp is not None else int(getattr(obj, "width", lambda: 0)())
+                prev_width = int(getattr(self, "_last_thumb_reflow_width", 0) or 0)
+                if abs(width - prev_width) >= 2:
+                    self._last_thumb_reflow_width = width
+                    self._thumbs_reflow_timer.start(150)
             except Exception:
                 pass
         if obj in thumb_objects and event.type() in (QtCore.QEvent.Scroll, QtCore.QEvent.Wheel):
@@ -3328,6 +3451,17 @@ QLabel:hover {{
                 self._spawn_preview_popup([self._copy_view_for_popup(v) for v in views], title="Preview copy")
                 event.accept()
                 return
+        if key == QtCore.Qt.Key_S and not (mods & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.ShiftModifier)):
+            focus_widget = QtWidgets.QApplication.focusWidget()
+            if self._is_widget_in_thumbnail_area(focus_widget):
+                targets = set(str(p) for p in (self.thumb_multi_select or set()))
+                selected = getattr(self, 'selected_file_for_thumbs', None)
+                if selected:
+                    targets.add(str(selected))
+                if targets:
+                    self.toggle_star_for_paths(sorted(targets))
+                    event.accept()
+                    return
         if key in (
             QtCore.Qt.Key_Left,
             QtCore.Qt.Key_Right,
@@ -3564,7 +3698,7 @@ QLabel:hover {{
         except Exception:
             global_pos = QtGui.QCursor.pos()
         anchor_key = self._thumbnail_drop_insert_anchor(global_pos)
-        created = self._create_virtual_copy_from_drag_payload(payload, insert_after_key=anchor_key)
+        created = virtual_copies.create_virtual_copy_from_drag_payload(self, payload, insert_after_key=anchor_key)
         if created:
             event.acceptProposedAction()
         else:
@@ -4053,9 +4187,6 @@ QLabel:hover {{
             pass
         self._rebuild_popup_menu()
 
-    def _rebuild_deferred_popup_menu(self):
-        self._rebuild_popup_menu()
-
     def _refresh_deferred_popup_ui(self):
         self._refresh_popup_ui()
 
@@ -4147,27 +4278,6 @@ QLabel:hover {{
         except Exception:
             pass
 
-    def on_dark_mode_toggled(self, checked: bool):
-        self.dark_mode = bool(checked)
-        try:
-            if hasattr(self, 'toolbar_dark_btn'):
-                self.toolbar_dark_btn.blockSignals(True)
-                self.toolbar_dark_btn.setChecked(self.dark_mode)
-                self.toolbar_dark_btn.blockSignals(False)
-        except Exception:
-            pass
-        if getattr(self, "_detail_theme_follows_dark_mode", True):
-            self._set_detail_dark_view_state(self.dark_mode, follow_dark_mode=True, persist=False)
-        self.config['dark_mode'] = self.dark_mode
-        self.config['detail_dark_view'] = self.detail_dark_view
-        self.config['detail_theme_follows_dark_mode'] = bool(
-            getattr(self, "_detail_theme_follows_dark_mode", True)
-        )
-        save_config(self.config)
-        self._apply_dark_mode(self.dark_mode)
-        if self.last_preview:
-            self.show_file_channel(self.last_preview[0], self.last_preview[1])
-
     # ---------- folder load & auto-detection ----------
     def open_folder_dialog(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select data folder", str(self.last_dir))
@@ -4180,42 +4290,10 @@ QLabel:hover {{
             self.load_folder(p)
 
     def _refresh_recent_dirs_menu(self):
-        menu = getattr(self, "open_recent_menu", None)
-        if menu is None:
-            return
-        menu.clear()
-        recents = getattr(self, "recent_dirs", [])
-        if not recents:
-            act = menu.addAction("No recent folders")
-            act.setEnabled(False)
-            return
-        for path in recents:
-            act = menu.addAction(path)
-            act.setToolTip(path)
-            act.triggered.connect(lambda checked=False, p=path: self.load_folder(Path(p)))
-        menu.addSeparator()
-        clear_act = menu.addAction("Clear recent folders")
-        clear_act.triggered.connect(self._clear_recent_dirs)
+        return self.recent_files_controller._refresh_recent_dirs_menu()
 
     def _record_recent_dir(self, folder: Path):
-        folder_path = Path(folder)
-        folder_str = str(folder_path)
-        recents = []
-        for p in getattr(self, "recent_dirs", []):
-            if not p:
-                continue
-            try:
-                if Path(p).resolve() == folder_path.resolve():
-                    continue
-            except Exception:
-                if p == folder_str:
-                    continue
-            recents.append(p)
-        recents.insert(0, folder_str)
-        self.recent_dirs = recents[:RECENT_FOLDER_LIMIT]
-        self.config["recent_dirs"] = self.recent_dirs
-        save_config(self.config)
-        self._refresh_recent_dirs_menu()
+        return self.recent_files_controller._record_recent_dir(folder)
 
     def _record_collection_dir(self, folder: Path):
         try:
@@ -4226,128 +4304,108 @@ QLabel:hover {{
         self.config["last_collection_dir"] = str(folder_path)
         save_config(self.config)
 
-    def _clear_recent_dirs(self):
-        self.recent_dirs = []
-        self.config["recent_dirs"] = []
-        save_config(self.config)
-        self._refresh_recent_dirs_menu()
-
-    def _refresh_recent_session_dirs_menu(self):
-        menus = [
-            getattr(self, "load_session_recent_menu", None),
-            getattr(self, "toolbar_load_session_menu", None),
-        ]
-        for menu in menus:
-            if menu is None:
-                continue
-            menu.clear()
-            recents = getattr(self, "recent_session_paths", [])
-            if not recents:
-                act = menu.addAction("No recent sessions")
-                act.setEnabled(False)
-                continue
-            for path in recents:
-                try:
-                    session_path = Path(path)
-                except Exception:
-                    session_path = Path(str(path))
-                act = menu.addAction(str(session_path))
-                act.setToolTip(str(session_path))
-                act.triggered.connect(
-                    lambda checked=False, p=str(session_path): self.on_load_recent_session(Path(p))
-                )
-            menu.addSeparator()
-            clear_act = menu.addAction("Clear recent sessions")
-            clear_act.triggered.connect(self._clear_recent_session_dirs)
-
-    def _normalize_recent_session_history(self, persist=False):
-        recents = []
-        has_session_file = False
-        for p in getattr(self, "recent_session_paths", []):
-            if not p:
-                continue
-            try:
-                candidate = Path(p)
-            except Exception:
-                continue
-            if str(candidate) not in recents:
-                recents.append(str(candidate))
-            try:
-                if candidate.suffix.lower() == ".json":
-                    has_session_file = True
-            except Exception:
-                pass
-        if has_session_file:
-            recents = [p for p in recents if Path(p).suffix.lower() == ".json"]
-        recents = recents[:RECENT_SESSION_LIMIT]
-        changed = recents != list(getattr(self, "recent_session_paths", []))
-        self.recent_session_paths = recents
-        if persist and changed:
-            self.config["recent_session_paths"] = self.recent_session_paths
-            self.config.pop("recent_session_dirs", None)
+    def _record_current_collection(self, path, mode):
+        try:
+            self.config["current_collection_path"] = str(path) if path else ""
+            self.config["current_collection_mode"] = str(mode or "")
             save_config(self.config)
-        return changed
+        except Exception:
+            pass
 
-    def _record_recent_session(self, session_path: Path):
-        session_path = Path(session_path)
-        session_str = str(session_path)
+    def _notify_folder_collection_usage(self, folder):
+        """One-line awareness notice: does this folder already have files sorted into any
+        collection(s)? Not persistent, not clickable (the toast widget doesn't support click
+        targets) - just a nudge pointing at Browse Collections for the rest of the interaction."""
+        try:
+            folder_key = str(Path(folder))
+        except Exception:
+            folder_key = str(folder)
+        try:
+            index = load_collections_index()
+        except Exception:
+            return
+        folder_entry = index.get(folder_key)
+        if not folder_entry:
+            return
+        names = []
+        for coll_path in folder_entry.keys():
+            try:
+                names.append(self._collection_display_name(coll_path))
+            except Exception:
+                names.append(Path(coll_path).name)
+        if not names:
+            return
+        count = len(names)
+        label = "collection" if count == 1 else "collections"
+        shown = ", ".join(names[:3])
+        if count > 3:
+            shown += f" (+{count - 3} more)"
+        message = f"This folder has files in {count} {label}: {shown} - see Collections > Open a Collection..."
+        log_status(message)
+        try:
+            self._show_toast(message, duration_ms=6000, variant="default")
+        except Exception:
+            pass
+
+    def _record_recent_collection(self, path):
+        """Track a collection as recently-used, whether or not it becomes the current one."""
+        try:
+            collection_path = Path(path)
+        except Exception:
+            return
+        collection_str = str(collection_path)
         recents = []
-        for p in getattr(self, "recent_session_paths", []):
+        for p in getattr(self, "recent_collections", []) or []:
             if not p:
                 continue
             try:
-                if Path(p).resolve() == session_path.resolve():
+                if Path(p).resolve() == collection_path.resolve():
                     continue
             except Exception:
-                if p == session_str:
+                if p == collection_str:
                     continue
             recents.append(p)
-        recents.insert(0, session_str)
-        self.recent_session_paths = recents[:RECENT_SESSION_LIMIT]
-        self._normalize_recent_session_history(persist=False)
-        self.config["recent_session_paths"] = self.recent_session_paths
-        self.config.pop("recent_session_dirs", None)
-        save_config(self.config)
-        self._refresh_recent_session_dirs_menu()
-
-    def _clear_recent_session_dirs(self):
-        self.recent_session_paths = []
-        self.config["recent_session_paths"] = []
-        self.config.pop("recent_session_dirs", None)
-        save_config(self.config)
-        self._refresh_recent_session_dirs_menu()
-
-    def _resolve_recent_session_target(self, session_path: Path):
-        session_path = Path(session_path)
-        if session_path.is_file():
-            return session_path
-        if not session_path.is_dir():
-            return None
-        preferred = session_path / "sxm_session.json"
-        if preferred.exists():
-            return preferred
+        recents.insert(0, collection_str)
+        self.recent_collections = recents[:RECENT_COLLECTION_LIMIT]
         try:
-            json_files = sorted(
-                (p for p in session_path.glob("*.json") if p.is_file()),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
+            self.config["recent_collections"] = self.recent_collections
+            save_config(self.config)
         except Exception:
-            json_files = []
-        if json_files:
-            return json_files[0]
-        return None
+            pass
+        refresh = getattr(self, "_refresh_recent_collections_menu", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
 
-    def on_load_recent_session(self, session_path: Path):
-        session_path = Path(session_path)
-        resolved = self._resolve_recent_session_target(session_path)
-        if resolved is not None:
-            self.session_controller.load_session(session_path=resolved)
-            return
-        if session_path.exists() and session_path.is_dir():
-            self.session_controller.load_session(start_dir=session_path)
-            return
-        self.session_controller.load_session(session_path=session_path)
+    def _clear_recent_collections(self):
+        self.recent_collections = []
+        try:
+            self.config["recent_collections"] = []
+            save_config(self.config)
+        except Exception:
+            pass
+        refresh = getattr(self, "_refresh_recent_collections_menu", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+
+    def _refresh_recent_session_dirs_menu(self):
+        return self.recent_files_controller._refresh_recent_session_dirs_menu()
+
+    def _normalize_recent_session_history(self, persist=False):
+        # Called from main_window_state.init_state via self.* - note that
+        # neither a `viewer.X` scan nor a main_window.py-internal scan
+        # sees that call site, which is how deleting this shim slipped
+        # past static analysis and was caught only by the smoke test.
+        return self.recent_files_controller._normalize_recent_session_history(
+            persist=persist)
+
+    def _record_recent_session(self, session_path: Path):
+        return self.recent_files_controller._record_recent_session(session_path)
 
     def _on_recent_molecules_updated(self, paths):
         """Persist recent molecule file paths to config (up to 8)."""
@@ -4364,6 +4422,36 @@ QLabel:hover {{
         except Exception:
             pass
 
+    def _on_recent_svg_molecules_updated(self, paths):
+        try:
+            recent = []
+            for p in paths or []:
+                if p and p not in recent:
+                    recent.append(p)
+                if len(recent) >= 8:
+                    break
+            self.recent_svg_molecules = recent
+            self.config["recent_svg_molecules"] = recent
+            save_config(self.config)
+        except Exception:
+            pass
+
+    def _on_last_svg_molecule_dir_updated(self, path):
+        try:
+            self.last_svg_molecule_dir = str(path or "")
+            self.config["last_svg_molecule_dir"] = self.last_svg_molecule_dir
+            save_config(self.config)
+        except Exception:
+            pass
+
+    def _on_svg_molecule_style_defaults_updated(self, style: dict):
+        try:
+            self.svg_molecule_style_defaults = dict(style or {})
+            self.config["svg_molecule_style_defaults"] = self.svg_molecule_style_defaults
+            save_config(self.config)
+        except Exception:
+            pass
+
     def _load_recent_molecule(self, path):
         if not self.preview_canvas or not path:
             return
@@ -4371,6 +4459,14 @@ QLabel:hover {{
             self.preview_canvas.add_molecule(path)
             self.on_show_molecules_toggled(True)
             self._on_recent_molecules_updated(self.preview_canvas.get_recent_molecule_paths())
+        except Exception:
+            pass
+
+    def _load_recent_svg_molecule(self, path):
+        if not self.preview_canvas or not path:
+            return
+        try:
+            self.preview_canvas.add_svg_molecule(path)
         except Exception:
             pass
 
@@ -4384,6 +4480,14 @@ QLabel:hover {{
                 self.preview_canvas._clear_molecules()
             except Exception:
                 pass
+
+    def _clear_preview_svg_molecules(self):
+        if not self.preview_canvas:
+            return
+        try:
+            self.preview_canvas._clear_svg_molecules()
+        except Exception:
+            pass
 
     def _populate_browse_molecules_menu(self):
         menu = getattr(self, "browse_molecules_menu", None)
@@ -4420,6 +4524,25 @@ QLabel:hover {{
         clear_act = menu.addAction("Clear molecules")
         clear_act.setEnabled(bool(getattr(getattr(self, "preview_canvas", None), "molecules", []) or []))
         clear_act.triggered.connect(self._clear_preview_molecules)
+
+        menu.addSeparator()
+        load_svg_act = menu.addAction("Load 2D structure...")
+        load_svg_act.triggered.connect(lambda _checked=False: self.preview_canvas and self.preview_canvas._load_svg_molecule_dialog())
+        recent_svg = []
+        try:
+            if self.preview_canvas is not None:
+                recent_svg = list(self.preview_canvas.get_recent_svg_molecule_paths() or [])
+        except Exception:
+            recent_svg = list(getattr(self, "recent_svg_molecules", []) or [])
+        if recent_svg:
+            recent_svg_menu = menu.addMenu("Load recent 2D structure")
+            for path in recent_svg[:8]:
+                act = recent_svg_menu.addAction(Path(path).name)
+                act.setToolTip(str(path))
+                act.triggered.connect(lambda _checked=False, p=path: self._load_recent_svg_molecule(p))
+        clear_svg_act = menu.addAction("Clear 2D structures")
+        clear_svg_act.setEnabled(bool(getattr(getattr(self, "preview_canvas", None), "svg_molecules", []) or []))
+        clear_svg_act.triggered.connect(self._clear_preview_svg_molecules)
 
         palette_menu = menu.addMenu("Palette")
         palette_group = QtWidgets.QActionGroup(palette_menu)
@@ -4474,25 +4597,56 @@ QLabel:hover {{
             prange = float(np.nanmax(arr) - np.nanmin(arr))
             return {'tag': 'constant-current', 'rng_nm': prange, 'median_nm': median}
 
+    def _auto_tag_cache_signature(self, file_key: str, topo_idx: int, fd: dict) -> dict:
+        try:
+            header_mtime = float(Path(file_key).stat().st_mtime)
+        except Exception:
+            header_mtime = 0.0
+        file_name = str(fd.get("FileName") or "")
+        data_path = Path(file_key).parent / file_name if file_name else None
+        try:
+            data_mtime = float(data_path.stat().st_mtime) if data_path is not None else 0.0
+        except Exception:
+            data_mtime = 0.0
+        return {
+            "version": AUTO_TAG_CACHE_VERSION,
+            "header_mtime": header_mtime,
+            "data_mtime": data_mtime,
+            "topo_idx": int(topo_idx),
+            "file_name": file_name,
+        }
+
+    def _auto_tag_cache_matches(self, info: dict, signature: dict) -> bool:
+        if not isinstance(info, dict):
+            return False
+        cached = info.get("cache")
+        if not isinstance(cached, dict):
+            return False
+        if int(cached.get("version", -1)) != int(signature.get("version", -2)):
+            return False
+        if str(cached.get("file_name") or "") != str(signature.get("file_name") or ""):
+            return False
+        if int(cached.get("topo_idx", -1)) != int(signature.get("topo_idx", -2)):
+            return False
+        try:
+            if abs(float(cached.get("header_mtime", 0.0)) - float(signature.get("header_mtime", 0.0))) > 1e-6:
+                return False
+            if abs(float(cached.get("data_mtime", 0.0)) - float(signature.get("data_mtime", 0.0))) > 1e-6:
+                return False
+        except Exception:
+            return False
+        return True
+
     def _auto_preview_clim(self, arr, *, relative_zero: bool = False):
         """Compute color limits ignoring a dominant flat stripe (e.g., aborted scans)."""
         try:
-            data = np.asarray(arr, dtype=float)
-            finite = data[np.isfinite(data)]
-            if finite.size == 0:
-                return None
-            hist, edges = np.histogram(finite, bins=256)
-            idx_max = int(np.argmax(hist))
-            frac = hist[idx_max] / float(finite.size)
-            if frac > 0.5:
-                lo_edge, hi_edge = edges[idx_max], edges[idx_max + 1]
-                finite = finite[(finite < lo_edge) | (finite > hi_edge)]
+            vmin, vmax = robust_limits(arr, low_pct=1.0, high_pct=99.0)
+            if vmin is None or vmax is None:
+                _vmin, _vmax, finite = self._contrast_finite_values(arr)
                 if finite.size == 0:
-                    finite = data[np.isfinite(data)]
-            vmin = float(np.nanpercentile(finite, 1.0))
-            vmax = float(np.nanpercentile(finite, 99.0))
-            if relative_zero:
-                vmin = 0.0
+                    return None
+                vmin = float(np.nanpercentile(finite, 1.0))
+                vmax = float(np.nanpercentile(finite, 99.0))
             if vmin == vmax:
                 return None
             return (vmin, vmax)
@@ -4516,6 +4670,10 @@ QLabel:hover {{
                 self._auto_detect_tags_for_folder()
             except Exception:
                 pass
+        try:
+            self._notify_folder_collection_usage(folder)
+        except Exception:
+            pass
         return result
 
     def load_files(self, files, folder_hint: Path | None = None, *, append: bool = False, refresh_spectros: bool = True):
@@ -4574,16 +4732,14 @@ QLabel:hover {{
         self.current_spectro_thumb_files = []
         self.selected_spectro_thumb_file = None
         self.thumbnail_filters = {}
-        self.virtual_copies = {}
         self.virtual_copy_order = []
-        self.added_views = []
         self.extra_view_specs = []
         self.molecule_overlays = {}
+        self.svg_molecule_overlays = {}
         self.frame_entry_pixmaps = {}
         self._frame_real_pixmap_cache = {}
         self._processed_views = {}
         self._collection_item_snapshots = {}
-        self._workspace_kind = "folder"
         self._current_session_path = None
         self.matrix_datasets = {}
         self._spectro_hist_cache = {}
@@ -4593,7 +4749,13 @@ QLabel:hover {{
         self.spectros = []
         self.matrix_spectros = []
         self.spectros_by_image = defaultdict(list)
+        self.spectro_sites_by_image = defaultdict(list)
+        self.spectro_site_index = {}
+        self.spectro_groups_by_image = defaultdict(list)
+        self.spectro_group_index = {}
+        self._spec_extent_cache = {}
         self.files_with_matrix = set()
+        self.files_with_spectra = set()
         self._spectros_loaded = False
         self._spectros_pending = False
         self.spectro_thumb_channel_by_path = {}
@@ -4653,66 +4815,11 @@ QLabel:hover {{
         except Exception:
             pass
 
-    def _spectroscopy_metadata_lines(self, spec):
-        """Format spectroscopy metadata for the Details panel without dumping large arrays."""
-        if not spec:
-            return ["No spectroscopy metadata."]
-
-        def _fmt(value):
-            if value is None:
-                return "None"
-            if isinstance(value, (str, int, float, bool)):
-                return str(value)
-            if isinstance(value, Path):
-                return str(value)
-            if isinstance(value, dict):
-                return f"dict({len(value)})"
-            if isinstance(value, (list, tuple, set)):
-                return f"{type(value).__name__}({len(value)})"
-            if hasattr(value, "shape"):
-                try:
-                    arr = np.asarray(value)
-                    return f"array(shape={arr.shape}, dtype={arr.dtype})"
-                except Exception:
-                    return type(value).__name__
-            return str(value)
-
-        lines = ["Spectroscopy details", ""]
-        for key in ("path", "source", "time", "file_mtime", "image_key", "matrix_dataset", "matrix_index", "x", "y", "AxisLabel", "AxisUnit", "AltAxisLabel", "AltAxisUnit"):
-            if key in spec:
-                lines.append(f"{key}: {_fmt(spec.get(key))}")
-        channels = spec.get("channels") or {}
-        if channels:
-            lines.append("")
-            lines.append(f"Channels ({len(channels)}):")
-            for name, values in channels.items():
-                try:
-                    arr = np.asarray(values)
-                    shape = arr.shape
-                except Exception:
-                    shape = "?"
-                lines.append(f"  - {name}: shape={shape}")
-        axis_choices = spec.get("AxisChoices") or []
-        if axis_choices:
-            lines.append("")
-            lines.append(f"Axis choices ({len(axis_choices)}):")
-            for ax in axis_choices:
-                key = ax.get("key") or ax.get("label") or "Axis"
-                label = ax.get("label") or "Axis"
-                unit = ax.get("unit") or ""
-                lines.append(f"  - {key}: {label}" + (f" ({unit})" if unit else ""))
-        lines.append("")
-        lines.append("Raw fields:")
-        for key in sorted(spec.keys(), key=lambda s: str(s).lower()):
-            if key in {"channels", "AxisChoices"}:
-                continue
-            lines.append(f"  {key}: {_fmt(spec.get(key))}")
-        return lines
 
     def show_spectroscopy_details(self, spec):
         """Show a spectroscopy entry in the left Details panel."""
         try:
-            self.meta_box.setPlainText("\n".join(self._spectroscopy_metadata_lines(spec)))
+            self.meta_box.setPlainText("\n".join(spectro_details.metadata_lines(spec)))
         except Exception:
             pass
         try:
@@ -4849,6 +4956,7 @@ QLabel:hover {{
 
     def _auto_detect_tags_for_folder(self):
         """Auto-detect CH/CC (topography variance rule) for the current folder."""
+        changed = False
         for p in self.files:
             key = str(p)
             tag_info = self.tags.get(key, {})
@@ -4865,6 +4973,9 @@ QLabel:hover {{
                 continue
 
             fd = fds[topo_idx]
+            signature = self._auto_tag_cache_signature(key, topo_idx, fd)
+            if self._auto_tag_cache_matches(tag_info, signature):
+                continue
             try:
                 raw_arr = self._get_channel_array(key, topo_idx, hdr, fd)
             except Exception:
@@ -4873,14 +4984,21 @@ QLabel:hover {{
             tag_info = self._classify_topography_values(arr_nm)
             if not tag_info:
                 continue
-            info = {'tag': tag_info['tag'], 'auto': True, 'rng_nm': tag_info.get('rng_nm')}
+            info = {
+                'tag': tag_info['tag'],
+                'auto': True,
+                'rng_nm': tag_info.get('rng_nm'),
+                'cache': signature,
+            }
             if tag_info['tag'] == 'constant-height':
                 info['abs_z_pm'] = tag_info.get('abs_pm')
             self.tags[key] = info
+            changed = True
 
         # persist tags after the initial auto pass
-        self.config['tags'] = self.tags
-        save_config(self.config)
+        if changed:
+            self.config['tags'] = self.tags
+            save_config(self.config)
 
     # ---------- thumbnails population with badge overlay ----------
     def clear_thumbs(self):
@@ -4895,21 +5013,18 @@ QLabel:hover {{
     def _downsample_for_thumbnail(self, arr, thumb_w, thumb_h):
         return viewer_thumbnails._downsample_for_thumbnail(self, arr, thumb_w, thumb_h)
 
-    def _map_spec_to_pixels(self, spec, header, xpix, ypix, file_key=None):
-        return viewer_preview._map_spec_to_pixels(self, spec, header, xpix, ypix, file_key=file_key)
-
-    def _matrix_bbox_pixels(self, m_specs, header, xpix, ypix, w_scale, h_scale, file_key=None):
-        return viewer_preview._matrix_bbox_pixels(self, m_specs, header, xpix, ypix, w_scale, h_scale, file_key=file_key)
-
-    def _fallback_spec_coords(self, idx, xpix, ypix):
-        return viewer_preview._fallback_spec_coords(self, idx, xpix, ypix)
+    # NOTE: _map_spec_to_pixels / _matrix_bbox_pixels / _fallback_spec_coords
+    # were previously *also* defined here as shims delegating to
+    # viewer_preview.*, which defines none of them - they would have raised
+    # AttributeError if reached. They never were, because the real
+    # implementations later in this class body shadowed them. Removed; see
+    # docs/refactor/A6_SHADOWED.md and scripts/analysis/find_shadowed.py.
 
     def _decorate_thumbnail_pixmap(self, pix, file_key, channel_idx, header, fds, thumb_crop=None):
         """Draw tag borders, filter badges, and spectroscopy markers."""
         marker_defs = []
-        taginfo = self.tags.get(str(file_key), {})
-        if taginfo:
-            tag = taginfo.get('tag')
+        tag = viewer_thumb_ui.effective_tag(self, str(file_key))
+        if tag:
             painter = QtGui.QPainter(pix)
             pen = QtGui.QPen()
             pen.setWidth(4)
@@ -4928,14 +5043,49 @@ QLabel:hover {{
                 painter.setPen(QtGui.QColor(255, 255, 255))
                 painter.drawText(6, 18, "CC")
             painter.end()
+        if str(file_key) in (getattr(self, 'starred', None) or set()):
+            # Gold favourite star, top-left; shifted right when a CH/CC label occupies the corner.
+            cx = 36 if tag else 14
+            cy = 14
+            pts = []
+            for i in range(10):
+                ang = -math.pi / 2 + i * math.pi / 5
+                r = 10.0 if i % 2 == 0 else 4.2
+                pts.append(QtCore.QPointF(cx + r * math.cos(ang), cy + r * math.sin(ang)))
+            painter = QtGui.QPainter(pix)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setBrush(QtGui.QColor(255, 200, 61))
+            painter.setPen(QtGui.QPen(QtGui.QColor(120, 82, 0), 1.4))
+            painter.drawPolygon(QtGui.QPolygonF(pts))
+            painter.end()
         if file_key in self.thumbnail_filters:
+            steps = self._thumbnail_filter_steps(file_key)
+            badge_text = self._filter_badge_text(steps)
             painter = QtGui.QPainter(pix)
             painter.setBrush(QtGui.QColor(160, 16, 239, 220))
             painter.setPen(QtGui.QPen(QtGui.QColor('black')))
-            painter.drawEllipse(pix.width() - 24, 6, 18, 18)
+            badge_w = 22 if len(badge_text) == 1 else 28
+            painter.drawEllipse(pix.width() - (badge_w + 6), 6, badge_w, 18)
             painter.setPen(QtGui.QColor('white'))
             painter.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold))
-            painter.drawText(QtCore.QRect(pix.width() - 24, 6, 18, 18), QtCore.Qt.AlignCenter, "F")
+            painter.drawText(QtCore.QRect(pix.width() - (badge_w + 6), 6, badge_w, 18), QtCore.Qt.AlignCenter, badge_text)
+            painter.end()
+        try:
+            has_adjust = bool(self._get_adjust_spec(file_key, channel_idx))
+        except Exception:
+            has_adjust = False
+        if has_adjust:
+            # Amber "ADJ" chip, bottom-left: this image has live display
+            # adjustments (clip/gamma) applied — see Image > Crop/Rotate.
+            painter = QtGui.QPainter(pix)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            chip = QtCore.QRectF(6, pix.height() - 24, 34, 18)
+            painter.setBrush(QtGui.QColor(255, 176, 0, 225))
+            painter.setPen(QtGui.QPen(QtGui.QColor(90, 60, 0), 1.2))
+            painter.drawRoundedRect(chip, 5, 5)
+            painter.setPen(QtGui.QColor(30, 20, 0))
+            painter.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold))
+            painter.drawText(chip, QtCore.Qt.AlignCenter, "ADJ")
             painter.end()
         highlight_spec = None
         if getattr(self, '_highlighted_spec', None):
@@ -5034,6 +5184,9 @@ QLabel:hover {{
 
     def _request_visible_thumbs(self):
         """Schedule thumbnail rendering for currently visible rows (+margin)."""
+        _t0_rvt = time.perf_counter()
+        _prev_call_ts = getattr(self, "_last_request_visible_thumbs_ts", None)
+        self._last_request_visible_thumbs_ts = _t0_rvt
         if not getattr(self, 'current_thumb_files', None):
             return
         vp = getattr(self, '_thumb_viewport', None)
@@ -5050,6 +5203,9 @@ QLabel:hover {{
         start_idx = max(0, first_row * cols)
         end_idx = min(len(self.current_thumb_files), (last_row + 1) * cols)
         visible_keys = self.current_thumb_files[start_idx:end_idx]
+        _gap_ms = ((_t0_rvt - _prev_call_ts) * 1000) if _prev_call_ts is not None else 0.0
+        if _gap_ms > 500:
+            log_status(f"[Perf] _request_visible_thumbs: {_gap_ms:.0f} ms since previous call | cols={cols} range=[{start_idx}:{end_idx}] loaded={len(self._thumb_loaded)} inflight={len(self._thumb_inflight)}")
         for key in visible_keys:
             if key in self._thumb_loaded or key in self._thumb_inflight:
                 continue
@@ -5087,6 +5243,18 @@ QLabel:hover {{
         self._virtual_counter = ctr
         return f"processed_{stem}_{op}{chan}_{ctr}"
 
+    def _inherit_star_for_virtual_copy(self, new_key, source_key):
+        """A virtual copy of a starred image starts out starred itself, so it stays
+        visible when the 'Starred' view filter is active. It remains independently
+        un-starrable afterwards (S still toggles it like any other thumbnail)."""
+        try:
+            if str(source_key) in self.starred:
+                self.starred.add(str(new_key))
+                self.config['starred'] = sorted(self.starred)
+                save_config(self.config)
+        except Exception:
+            pass
+
     def _thumbnail_cmap_override(self, file_key: str, channel_idx: int, default_cmap: str | None = None):
         try:
             key = str(file_key)
@@ -5110,14 +5278,9 @@ QLabel:hover {{
         return (key, idx, bool(relative_zero))
 
     def _set_combo_text_silent(self, widget, text):
-        if widget is None:
-            return
-        try:
-            prev = widget.blockSignals(True)
-            widget.setCurrentText(str(text) if text is not None else "")
-            widget.blockSignals(prev)
-        except Exception:
-            pass
+        # Thin alias kept for the existing call sites; the shared helper is
+        # the single implementation (see gui/qt_helpers.py).
+        set_silent(widget, current_text=str(text) if text is not None else "")
 
     def _sync_cmap_controls_for_selection(self, file_key=None, channel_idx=None, *, thumb_cmap=None, preview_cmap=None):
         file_key = str(file_key or "")
@@ -5248,25 +5411,99 @@ QLabel:hover {{
         path_set = {str(Path(p)) for p in list(paths or []) if p}
         if not path_set:
             return
-        self._thumbnail_render_state_pending_paths.update(path_set)
-        try:
-            self._thumbnail_render_state_timer.start(120)
-        except Exception:
-            self._flush_thumbnail_render_state_refresh()
+        self._thumbnail_render_debounce.schedule(path_set)
 
     def _flush_thumbnail_render_state_refresh(self):
-        paths = list(getattr(self, "_thumbnail_render_state_pending_paths", set()) or [])
-        self._thumbnail_render_state_pending_paths.clear()
+        paths = list(self._thumbnail_render_debounce.take())
         if not paths:
             return
         try:
             self._invalidate_thumbnail_cache(paths=paths)
         except Exception:
             pass
+        updated = 0
+        try:
+            updated = self._refresh_thumbnail_pixmaps_for_paths(paths)
+        except Exception:
+            updated = 0
+        if updated:
+            try:
+                self._refresh_frame_map_pixmaps()
+            except Exception:
+                pass
+            return
         try:
             self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
         except Exception:
             pass
+
+    def _refresh_thumbnail_pixmaps_for_paths(self, paths):
+        path_set = {str(Path(p)) for p in list(paths or []) if p}
+        if not path_set:
+            return 0
+        labels = getattr(self, "_thumb_labels", {}) or {}
+        updated = 0
+        try:
+            default_cmap = self.thumb_cmap_combo.currentText()
+        except Exception:
+            default_cmap = None
+        if not default_cmap:
+            default_cmap = getattr(self, "thumb_cmap", "viridis")
+        for file_key in path_set:
+            label = labels.get(file_key)
+            if label is None:
+                continue
+            try:
+                thumb_dims = label.property("thumb_dims") or self._thumb_dimensions()
+                thumb_w, thumb_h = int(thumb_dims[0]), int(thumb_dims[1])
+                channel_idx = int(label.property("channel_index") or 0)
+            except Exception:
+                continue
+            if thumb_w <= 0 or thumb_h <= 0:
+                continue
+            cmap_name = self._thumbnail_cmap_override(file_key, channel_idx, default_cmap)
+            base_pix = viewer_thumb_ui._thumbnail_pixmap_for_file(
+                self, file_key, channel_idx, thumb_w, thumb_h, cmap_name
+            )
+            if base_pix is None:
+                try:
+                    self._thumb_loaded.discard(file_key)
+                    self._thumb_inflight.discard(file_key)
+                except Exception:
+                    pass
+                continue
+            pix = base_pix.copy()
+            header, fds = self.headers.get(str(file_key), (None, None))
+            crop_info = None
+            try:
+                if fds and 0 <= channel_idx < len(fds):
+                    fd = fds[channel_idx]
+                    data_key = self._thumbnail_data_key(file_key, channel_idx, fd, thumb_w, thumb_h)
+                    with self._thumb_data_lock:
+                        crop_info = self._thumb_crop_cache.get(data_key)
+            except Exception:
+                crop_info = None
+            try:
+                markers = self._decorate_thumbnail_pixmap(pix, file_key, channel_idx, header, fds, thumb_crop=crop_info)
+            except Exception:
+                markers = []
+            label.setPixmap(pix)
+            label.setProperty("spec_markers", markers)
+            try:
+                label.setProperty("thumb_crop", crop_info)
+            except Exception:
+                pass
+            try:
+                self._thumb_loaded.add(file_key)
+                self._thumb_inflight.discard(file_key)
+            except Exception:
+                pass
+            updated += 1
+        try:
+            self._request_visible_thumbs()
+        except Exception:
+            pass
+        return updated
 
     def _store_canvas_view_clims(self, canvas):
         views = list(getattr(canvas, "views", None) or [])
@@ -5478,10 +5715,20 @@ QLabel:hover {{
         keys = {str(Path(p)) for p in paths if self._is_processed_key(str(p))}
         if not keys:
             return
+        starred_removed = False
         for k in keys:
             self._processed_views.pop(k, None)
             self.headers.pop(k, None)
             self.molecule_overlays.pop(k, None)
+            if k in self.starred:
+                self.starred.discard(k)
+                starred_removed = True
+        if starred_removed:
+            try:
+                self.config['starred'] = sorted(self.starred)
+                save_config(self.config)
+            except Exception:
+                pass
         self.files = [p for p in self.files if str(p) not in keys]
         self._channel_data_cache = OrderedDict()
         self._invalidate_thumbnail_cache(keys)
@@ -5542,22 +5789,27 @@ QLabel:hover {{
     def _get_filtered_channel_array(self, file_key, channel_idx, header, fd):
         file_key = str(file_key)
         channel_key = self._channel_cache_key(file_key, channel_idx, fd)
-        arr = self._get_channel_array(file_key, channel_idx, header, fd)
         unit = fd.get('PhysUnit','')
-        unit_final, arr_conv = normalize_unit_and_data(arr, unit)
         spec = self.thumbnail_filters.get(file_key)
         sig = _filter_signature(spec)
-        cache_key = (channel_key, unit_final, sig)
+        cache_key = (channel_key, str(unit or ""), sig)
         with self._filtered_cache_lock:
             cached = self._filtered_channel_cache.get(cache_key)
             if cached is not None:
                 self._filtered_channel_cache.move_to_end(cache_key)
-                return unit_final, cached
+                try:
+                    unit_final, result = cached
+                    return unit_final, result
+                except Exception:
+                    unit_final, _ = normalize_unit_and_data(np.asarray([], dtype=float), unit)
+                    return unit_final, cached
+        arr = self._get_channel_array(file_key, channel_idx, header, fd)
+        unit_final, arr_conv = normalize_unit_and_data(arr, unit)
         result = np.asarray(arr_conv, dtype=float)
         if sig:
             result = self._apply_filter_pipeline(result, spec.get('steps', []))
         with self._filtered_cache_lock:
-            self._filtered_channel_cache[cache_key] = result
+            self._filtered_channel_cache[cache_key] = (unit_final, result)
             while len(self._filtered_channel_cache) > FILTERED_CACHE_LIMIT:
                 self._filtered_channel_cache.popitem(last=False)
         return unit_final, result
@@ -5601,18 +5853,10 @@ QLabel:hover {{
 
     def on_unit_display_toggled(self, checked: bool):
         self.display_units_si = bool(checked)
-        for widget in (
+        set_many_silent((
             getattr(self, "unit_display_cb", None),
             getattr(self, "display_units_si_act", None),
-        ):
-            if widget is None:
-                continue
-            try:
-                widget.blockSignals(True)
-                widget.setChecked(self.display_units_si)
-                widget.blockSignals(False)
-            except Exception:
-                pass
+        ), checked=self.display_units_si)
         self.config['display_units_si'] = self.display_units_si
         save_config(self.config)
         if self.last_preview:
@@ -5620,19 +5864,11 @@ QLabel:hover {{
 
     def on_unit_relative_toggled(self, checked: bool):
         self.display_units_relative = bool(checked)
-        for widget in (
+        set_many_silent((
             getattr(self, "unit_relative_cb", None),
             getattr(self, "preview_zero_cb", None),
             getattr(self, "display_units_relative_act", None),
-        ):
-            if widget is None:
-                continue
-            try:
-                widget.blockSignals(True)
-                widget.setChecked(self.display_units_relative)
-                widget.blockSignals(False)
-            except Exception:
-                pass
+        ), checked=self.display_units_relative)
         self.config['display_units_relative'] = self.display_units_relative
         save_config(self.config)
         if self.last_preview:
@@ -5640,18 +5876,10 @@ QLabel:hover {{
 
     def on_relative_axes_toggled(self, checked: bool):
         self.relative_axes = bool(checked)
-        for widget in (
+        set_many_silent((
             getattr(self, "relative_axes_cb", None),
             getattr(self, "relative_axes_act", None),
-        ):
-            if widget is None:
-                continue
-            try:
-                widget.blockSignals(True)
-                widget.setChecked(self.relative_axes)
-                widget.blockSignals(False)
-            except Exception:
-                pass
+        ), checked=self.relative_axes)
         self.config['relative_axes'] = self.relative_axes
         save_config(self.config)
         # Prevent restoring stale profile state when switching axes mode
@@ -5705,18 +5933,10 @@ QLabel:hover {{
                     pass
 
     def on_scale_bar_toggled(self, checked: bool):
-        for widget in (
+        set_many_silent((
             getattr(self, "scale_bar_cb", None),
             getattr(self, "display_scale_bar_act", None),
-        ):
-            if widget is None:
-                continue
-            try:
-                widget.blockSignals(True)
-                widget.setChecked(bool(checked))
-                widget.blockSignals(False)
-            except Exception:
-                pass
+        ), checked=bool(checked))
         options = self._canvas_display_state_from_canvas(getattr(self, "preview_canvas", None))
         options["scale_bar_enabled"] = bool(checked)
         self._apply_canvas_display_options(options, source_canvas=getattr(self, "preview_canvas", None), persist=True)
@@ -5732,10 +5952,10 @@ QLabel:hover {{
         try:
             ts = float(self._parse_header_datetime(header or {}, path=path))
             if ts <= 0:
-                ts = Path(path).stat().st_mtime
+                ts = viewer_loader._resolve_effective_mtime(path)
             return datetime.fromtimestamp(ts)
         except Exception:
-            return datetime.fromtimestamp(Path(path).stat().st_mtime)
+            return datetime.fromtimestamp(viewer_loader._resolve_effective_mtime(path))
 
     def _build_image_timestamp_index(self):
         self.image_time_index = {}
@@ -5894,9 +6114,7 @@ QLabel:hover {{
         val = self._zoom_to_slider_value(factor)
         if self.frame_zoom_slider.value() == val:
             return
-        self.frame_zoom_slider.blockSignals(True)
-        self.frame_zoom_slider.setValue(val)
-        self.frame_zoom_slider.blockSignals(False)
+        set_silent(self.frame_zoom_slider, value=val)
         self.config['frame_map_zoom'] = val
         save_config(self.config)
 
@@ -5931,48 +6149,37 @@ QLabel:hover {{
         labels = getattr(self, '_thumb_labels', {}) or {}
         if not labels:
             return
+        keys_to_refresh = set()
         try:
-            cmap_name = self.thumb_cmap_combo.currentText()
+            cols = max(1, int(getattr(self, 'thumb_grid_columns', 1) or 1))
+            card_h = int(getattr(self, '_thumb_card_height', None) or (self.thumb_size_px + 48))
+            scroll = getattr(self, 'scroll', None)
+            vp = getattr(self, '_thumb_viewport', None)
+            y0 = scroll.verticalScrollBar().value() if scroll is not None else 0
+            vh = vp.height() if vp is not None else card_h * 4
+            first_row = max(0, int(y0 // max(1, card_h)) - 2)
+            last_row = int((y0 + vh) // max(1, card_h)) + 2
+            current = list(getattr(self, "current_thumb_files", []) or [])
+            start_idx = max(0, first_row * cols)
+            end_idx = min(len(current), (last_row + 1) * cols)
+            keys_to_refresh.update(str(key) for key in current[start_idx:end_idx])
         except Exception:
-            cmap_name = None
-        if not cmap_name:
-            cmap_name = getattr(self, 'thumb_cmap', 'viridis')
-        for file_key, label in labels.items():
-            if label is None:
-                continue
-            try:
-                thumb_dims = label.property("thumb_dims") or (0, 0)
-                channel_idx = int(label.property("channel_index") or 0)
-            except Exception:
-                continue
-            if not thumb_dims or thumb_dims[0] <= 0 or thumb_dims[1] <= 0:
-                continue
-            base_pix = viewer_thumb_ui._thumbnail_pixmap_for_file(
-                self, file_key, channel_idx, thumb_dims[0], thumb_dims[1], cmap_name
-            )
-            if base_pix is None:
-                continue
-            pix = base_pix.copy()
-            header, fds = self.headers.get(str(file_key), (None, None))
-            crop_info = None
-            try:
-                if fds and 0 <= channel_idx < len(fds):
-                    fd = fds[channel_idx]
-                    data_key = self._thumbnail_data_key(file_key, channel_idx, fd, thumb_dims[0], thumb_dims[1])
-                    with self._thumb_data_lock:
-                        crop_info = self._thumb_crop_cache.get(data_key)
-            except Exception:
-                crop_info = None
-            try:
-                markers = self._decorate_thumbnail_pixmap(pix, file_key, channel_idx, header, fds, thumb_crop=crop_info)
-            except Exception:
-                markers = []
-            label.setPixmap(pix)
-            label.setProperty("spec_markers", markers)
-            try:
-                label.setProperty("thumb_crop", crop_info)
-            except Exception:
-                pass
+            keys_to_refresh = set(labels.keys())
+        try:
+            selected = str(getattr(self, "selected_file_for_thumbs", "") or "")
+            if selected:
+                keys_to_refresh.add(selected)
+        except Exception:
+            pass
+        if not keys_to_refresh:
+            return
+        viewer_thumb_ui.redecorate_thumbnails(self, keys_to_refresh)
+
+    def toggle_star_for_paths(self, paths, animate=True):
+        return viewer_thumb_ui.toggle_star_for_paths(self, paths, animate=animate)
+
+    def set_thumb_filter_mode(self, label, *, toggle=False):
+        return viewer_thumb_ui.set_thumb_filter_mode(self, label, toggle=toggle)
 
     def _make_thumb_press_handler(self, label_widget):
         return viewer_thumb_ui._make_thumb_press_handler(self, label_widget)
@@ -6031,20 +6238,6 @@ QLabel:hover {{
         except Exception:
             pass
 
-    def _ensure_canvas_for_drag(self):
-        """Open the canvas window as a drop target during thumbnail drags."""
-        win = self._canvas_window_ref()
-        if win is None or not win.isVisible():
-            win = ExperimentalCanvasWindow(self, self)
-            self._canvas_window = win
-            win.finished.connect(lambda _=None, w=win: self._remember_closed_canvas_window(w))
-        win.show()
-        win.raise_()
-        try:
-            win.activateWindow()
-        except Exception:
-            pass
-
     def on_thumbnail_clicked(self, header_path_str, channel_idx):
         controller = getattr(self, "thumbnail_controller", None)
         if controller:
@@ -6055,11 +6248,134 @@ QLabel:hover {{
         if controller:
             return controller.handle_thumbnail_double_clicked(header_path_str, channel_idx)
 
+    def _capture_thumbnail_scroll_state(self):
+        try:
+            scroll = getattr(self, "scroll", None)
+            if scroll is None:
+                return None
+            bar = scroll.verticalScrollBar()
+            if bar is None:
+                return None
+            value = int(bar.value())
+            anchor_key = None
+            anchor_offset = 0
+            try:
+                widgets = []
+                for mapping in (
+                    getattr(self, "thumb_widgets", {}) or {},
+                    getattr(self, "spectro_thumb_widgets", {}) or {},
+                ):
+                    for key, widget in mapping.items():
+                        if widget is None:
+                            continue
+                        try:
+                            y = int(widget.y())
+                            h = int(widget.height())
+                        except Exception:
+                            continue
+                        widgets.append((y, h, str(key)))
+                widgets.sort(key=lambda item: item[0])
+                for y, h, key in widgets:
+                    if y + max(1, h) >= value:
+                        anchor_key = key
+                        anchor_offset = max(0, value - y)
+                        break
+            except Exception:
+                anchor_key = None
+            return {
+                "value": value,
+                "maximum": int(bar.maximum()),
+                "ratio": float(value) / float(bar.maximum()) if int(bar.maximum()) > 0 else 0.0,
+                "anchor_key": anchor_key,
+                "anchor_offset": int(anchor_offset),
+            }
+        except Exception:
+            return None
+
+    def _restore_thumbnail_scroll_state(self, state, delayed=False):
+        if not state:
+            return
+
+        def _restore():
+            try:
+                scroll = getattr(self, "scroll", None)
+                if scroll is None:
+                    return
+                bar = scroll.verticalScrollBar()
+                if bar is None:
+                    return
+                anchor_key = str(state.get("anchor_key") or "")
+                anchor_widget = None
+                if anchor_key:
+                    anchor_widget = (getattr(self, "thumb_widgets", {}) or {}).get(anchor_key)
+                    if anchor_widget is None:
+                        anchor_widget = (getattr(self, "spectro_thumb_widgets", {}) or {}).get(anchor_key)
+                old_max = int(state.get("maximum") or 0)
+                value = int(state.get("value") or 0)
+                if anchor_widget is not None:
+                    try:
+                        value = int(anchor_widget.y()) + int(state.get("anchor_offset") or 0)
+                    except Exception:
+                        pass
+                elif old_max > 0 and int(bar.maximum()) != old_max:
+                    value = int(round(float(state.get("ratio") or 0.0) * int(bar.maximum())))
+                bar.setValue(max(0, min(value, int(bar.maximum()))))
+            except Exception:
+                pass
+
+        _restore()
+        if delayed:
+            for delay in (0, 50, 150, 300, 700, 1200):
+                QtCore.QTimer.singleShot(delay, _restore)
+
     # NOTE: removed on_file_channel_selected and on_file_channel_show_clicked
     # These functions supported the removed per-file inspector UI. The same "show channel"
     # functionality is available via the thumbnail UI and the "Add channel view" dialog.
 
     # ---------- preview + metadata ---------- 
+    def request_show_file_channel(self, header_path_str, channel_idx: int, use_local_cmap: bool = False):
+        try:
+            key = str(header_path_str) if header_path_str is not None else ""
+            idx = int(channel_idx)
+        except Exception:
+            return
+        if not key:
+            return
+        self._preview_request_debounce.schedule((key, idx, bool(use_local_cmap)))
+
+    def _flush_preview_request(self):
+        # Deliberately does NOT take() the payload while a render is in
+        # progress: leaving it pending means the request survives to the
+        # next flush instead of being silently dropped.
+        if getattr(self, "_preview_render_in_progress", False):
+            return
+        request = self._preview_request_debounce.take()
+        if not request:
+            return
+        try:
+            key, idx, use_local_cmap = request
+        except Exception:
+            return
+        try:
+            current_preview = getattr(self, "last_preview", None)
+            current_views = getattr(getattr(self, "preview_canvas", None), "views", None)
+            if (
+                current_preview
+                and str(current_preview[0]) == str(key)
+                and int(current_preview[1]) == int(idx)
+                and current_views
+            ):
+                return
+        except Exception:
+            pass
+        self._preview_render_in_progress = True
+        try:
+            self.show_file_channel(key, idx, use_local_cmap=bool(use_local_cmap))
+        finally:
+            self._preview_render_in_progress = False
+        # A newer request may have arrived while the render was running.
+        self._preview_request_debounce.rearm()
+
     def show_file_channel(self, header_path_str, channel_idx:int, use_local_cmap=False):
         highlight = getattr(self, '_highlighted_spec', None)
         if highlight:
@@ -6080,6 +6396,8 @@ QLabel:hover {{
         if new_key and new_key != prev_key:
             self._store_molecule_overlay(prev_key)
             self._load_molecule_overlay(new_key)
+            self._store_svg_molecule_overlay(prev_key)
+            self._load_svg_molecule_overlay(new_key)
         result = viewer_preview.show_file_channel(self, header_path_str, channel_idx, use_local_cmap=use_local_cmap)
         try:
             if new_key:
@@ -6116,6 +6434,34 @@ QLabel:hover {{
             state = []
         try:
             canvas.import_molecule_state(state)
+        except Exception:
+            pass
+
+    def _store_svg_molecule_overlay(self, file_key=None):
+        if not file_key:
+            return
+        canvas = getattr(self, "preview_canvas", None)
+        if canvas is None:
+            return
+        try:
+            state = canvas.export_svg_molecule_state()
+        except Exception:
+            return
+        if state is None:
+            return
+        self.svg_molecule_overlays[str(file_key)] = state
+
+    def _load_svg_molecule_overlay(self, file_key=None):
+        if not file_key:
+            return
+        canvas = getattr(self, "preview_canvas", None)
+        if canvas is None:
+            return
+        state = self.svg_molecule_overlays.get(str(file_key))
+        if state is None:
+            state = []
+        try:
+            canvas.import_svg_molecule_state(state)
         except Exception:
             pass
 
@@ -6186,12 +6532,6 @@ QLabel:hover {{
             cfg['vmin_vmax'][key] = None
         return cfg
 
-    def _apply_filters_to_array(self, file_path, arr):
-        spec = self.thumbnail_filters.get(str(file_path))
-        if not spec:
-            return arr
-        return self._apply_filter_pipeline(arr, spec.get('steps', []))
-
     def on_save_session(self):
         """Legacy hook delegating to SessionController for compatibility."""
         self.session_controller.save_session()
@@ -6203,6 +6543,24 @@ QLabel:hover {{
     def on_open_collection(self):
         """Open a curated cross-folder collection workspace."""
         self.collection_controller.load_collection()
+        self.show_collection_tray(activate=False)
+
+    def on_browse_collections(self):
+        """Preview a collection's contents before setting it as current or opening it - merges
+        the previous blind Choose/Open pickers into one dialog with a live preview."""
+        dlg = CollectionBrowserDialog(
+            self,
+            collection_controller=self.collection_controller,
+            recent_collections=getattr(self, "recent_collections", []),
+            default_dir=self.collection_controller._collection_dialog_start_dir(),
+        )
+        dlg.exec_()
+        self.show_collection_tray(activate=False)
+
+    def on_create_collection(self):
+        """Start a brand-new collection - a separate, plainly-named action from opening an
+        existing one."""
+        self.collection_controller.create_collection()
         self.show_collection_tray(activate=False)
 
     def on_collection_help(self):
@@ -6256,6 +6614,22 @@ QLabel:hover {{
         self._refresh_collection_tray()
         self.show_collection_tray(activate=False)
 
+    def on_add_selected_thumbnails_to_collection_picker(self):
+        """Route the current thumbnail selection to a collection picked just for this batch -
+        does not change the current-collection target, so a different selection can go to a
+        different collection right after without any global re-targeting."""
+        targets = list(self._ordered_thumbnail_selection() or [])
+        if not targets:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Collections",
+                "Select one or more thumbnails first, then use this action.",
+            )
+            return
+        channel_idx = int(self.channel_dropdown.currentIndex() or 0)
+        entries = [{"file_path": str(path), "channel_index": channel_idx} for path in targets if path]
+        self.collection_controller.add_thumbnail_entries_to(entries)
+
     def show_collection_tray(self, activate=True):
         window = getattr(self, "collection_tray_window", None)
         if window is None:
@@ -6268,17 +6642,39 @@ QLabel:hover {{
         except Exception:
             pass
 
+    @staticmethod
+    def _collection_display_name(path_str) -> str:
+        """Collection "name" the user sees is just its filename - strip the full
+        .sxmcoll.json double-suffix so it isn't stuck as e.g. "myset.sxmcoll"."""
+        try:
+            name = Path(path_str).name
+        except Exception:
+            return str(path_str)
+        if name.lower().endswith(".sxmcoll.json"):
+            return name[: -len(".sxmcoll.json")]
+        try:
+            return Path(path_str).stem
+        except Exception:
+            return name
+
     def _refresh_collection_ui(self):
         current = str(getattr(self, "_collection_source", "") or "").strip()
+        item_count = None
+        if current:
+            try:
+                item_count = self.collection_controller.current_collection_item_count()
+            except Exception:
+                item_count = None
+        count_suffix = f" ({item_count} item{'s' if item_count != 1 else ''})" if item_count is not None else ""
         short = current if current else "none"
         if len(short) > 96:
             short = "..." + short[-93:]
-        text = f"Current collection: {short}"
+        text = f"Current collection: {short}{count_suffix}"
         tooltip = current or "No current collection selected. Add actions will ask for a collection file."
         button_text = "Collections"
         if current:
             try:
-                button_text = f"Collection: {Path(current).stem}"
+                button_text = f"Collection: {self._collection_display_name(current)}{count_suffix}"
             except Exception:
                 button_text = "Collection: active"
         for attr in ("collection_current_path_act", "toolbar_collection_current_path_act"):
@@ -6310,6 +6706,86 @@ QLabel:hover {{
         except Exception:
             pass
 
+    def _refresh_collection_toolbar_menu_labels(self):
+        """Update the toolbar's selection-dependent 'Add Selected Thumbnails' entries with the
+        live selection count - connected to the Collections menu's aboutToShow so it's always
+        current when opened."""
+        try:
+            selected = self._ordered_thumbnail_selection()
+        except Exception:
+            selected = []
+        count = len(selected)
+
+        act = getattr(self, "toolbar_collection_add_selected_act", None)
+        if act is not None:
+            try:
+                if count > 1:
+                    act.setText(f"Add Selected Thumbnails ({count})...")
+                    act.setEnabled(True)
+                    act.setToolTip("Add the currently selected thumbnails to the current collection as lightweight file references.")
+                elif count == 1:
+                    act.setText("Add Selected Thumbnail...")
+                    act.setEnabled(True)
+                    act.setToolTip("Add the currently selected thumbnail to the current collection as a lightweight file reference.")
+                else:
+                    act.setText("Add Selected Thumbnails...")
+                    act.setEnabled(False)
+                    act.setToolTip("Select one or more thumbnails first, then use this action.")
+            except Exception:
+                pass
+
+        act_to = getattr(self, "toolbar_collection_add_selected_to_act", None)
+        if act_to is not None:
+            try:
+                if count > 1:
+                    act_to.setText(f"Add Selected Thumbnails ({count}) to...")
+                    act_to.setEnabled(True)
+                    act_to.setToolTip(
+                        "Route the currently selected thumbnails to a collection you pick now - "
+                        "does not change your current collection target."
+                    )
+                elif count == 1:
+                    act_to.setText("Add Selected Thumbnail to...")
+                    act_to.setEnabled(True)
+                    act_to.setToolTip(
+                        "Route the currently selected thumbnail to a collection you pick now - "
+                        "does not change your current collection target."
+                    )
+                else:
+                    act_to.setText("Add Selected Thumbnails to...")
+                    act_to.setEnabled(False)
+                    act_to.setToolTip("Select one or more thumbnails first, then use this action.")
+            except Exception:
+                pass
+
+        self._refresh_recent_collections_menu()
+
+    def _refresh_recent_collections_menu(self):
+        """Populate the toolbar's 'Recent Collections' submenu - clicking an entry opens it
+        (fully replaces the workspace), matching the existing recent-folder/recent-session
+        behavior. Use 'Open a Collection...' (via the browser dialog's "Set as Current
+        Collection" button) if you only want to change the append target without loading."""
+        menu = getattr(self, "toolbar_recent_collections_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        recents = list(getattr(self, "recent_collections", []) or [])
+        if not recents:
+            act = menu.addAction("No recent collections")
+            act.setEnabled(False)
+            return
+        for path in recents:
+            try:
+                label = self._collection_display_name(path)
+            except Exception:
+                label = path
+            act = menu.addAction(label)
+            act.setToolTip(f"Open {path} (replaces your current workspace)")
+            act.triggered.connect(lambda checked=False, p=path: self.collection_controller.load_collection(Path(p)))
+        menu.addSeparator()
+        clear_act = menu.addAction("Clear Recent Collections")
+        clear_act.triggered.connect(self._clear_recent_collections)
+
     def _refresh_collection_tray(self):
         current = str(getattr(self, "_collection_source", "") or "").strip()
         group = getattr(self, "collection_group", None)
@@ -6320,7 +6796,7 @@ QLabel:hover {{
         tray.clear()
         if window is not None:
             try:
-                window.setWindowTitle("Collection Tray" if not current else f"Collection Tray - {Path(current).stem}")
+                window.setWindowTitle("Collection Tray" if not current else f"Collection Tray - {self._collection_display_name(current)}")
             except Exception:
                 pass
         if not current:
@@ -6414,305 +6890,35 @@ QLabel:hover {{
             path = meta.get("path") or meta.get("file_path")
         return path
 
-    def _is_crop_view(self, view):
-        if not view:
-            return False
-        title = str(view.get("title") or "").lower()
-        label = str(view.get("label") or "").lower()
-        if "[crop]" in title or label == "[crop]":
-            return True
-        return False
-
     def _filter_action_label(self, filter_key):
-        base_label = FILTER_DEFINITIONS.get(filter_key, {}).get("label", str(filter_key or "").title())
-        return f"{base_label}..."
+        return self.filter_controller._filter_action_label(filter_key)
 
     def _clone_filter_source_views(self, canvas, views):
-        clone_view = getattr(canvas, "_clone_undo_view", None)
-        cloned = []
-        for view in list(views or []):
-            try:
-                if callable(clone_view):
-                    cloned.append(clone_view(view))
-                else:
-                    cloned.append(copy.deepcopy(view))
-            except Exception:
-                cloned.append(view)
-        return cloned
+        return self.filter_controller._clone_filter_source_views(canvas, views)
 
-    def _normalize_preview_filter_steps(self, steps):
-        if steps is None:
-            return []
-        if isinstance(steps, dict):
-            return [steps]
-        return [step for step in list(steps or []) if isinstance(step, dict)]
+    def _filter_pipeline_label_from_steps(self, steps, default="Custom"):
+        return self.filter_controller._filter_pipeline_label_from_steps(steps, default=default)
 
-    def _set_filter_pipeline_on_canvas(self, canvas, steps, label=None, source_views=None, push_undo=False):
-        if canvas is None:
-            return
-        base_views = source_views if source_views is not None else getattr(canvas, "views", None)
-        if not base_views:
-            return
-        steps = self._normalize_preview_filter_steps(steps)
-        if push_undo:
-            try:
-                canvas.push_undo_state("filter")
-            except Exception:
-                pass
-        new_views = []
-        for view in self._clone_filter_source_views(canvas, base_views):
-            nv = dict(view)
-            base = nv.get("_filter_base_arr")
-            if base is None:
-                try:
-                    base = np.array(nv.get("arr"), copy=True)
-                except Exception:
-                    base = nv.get("arr")
-                nv["_filter_base_arr"] = base
-            if not steps:
-                nv["arr"] = np.array(base, copy=True) if base is not None else nv.get("arr")
-                nv.pop("filter_steps", None)
-                nv.pop("filter_label", None)
-                nv.pop("clim", None)  # drop stale clim from filtered data
-            else:
-                nv["arr"] = self._apply_filter_pipeline(base, steps) if base is not None else nv.get("arr")
-                nv["filter_steps"] = copy.deepcopy(steps)
-                nv["filter_label"] = label
-                try:
-                    clim = self._auto_preview_clim(
-                        nv["arr"],
-                        relative_zero=bool(nv.get("display_relative_zero", False)),
-                    )
-                except Exception:
-                    clim = None
-                if clim is not None:
-                    nv["clim"] = clim
-                else:
-                    nv.pop("clim", None)
-            new_views.append(nv)
-        canvas.set_views(new_views, preserve_profiles=True)
+    def _thumbnail_filter_steps(self, file_key):
+        return self.filter_controller._thumbnail_filter_steps(file_key)
 
-    def _build_canvas_filter_preview_callback(self, canvas, source_views):
-        def _preview(steps, label=None):
-            if steps is None:
-                self._restore_filter_views_on_canvas(canvas, source_views)
-                return
-            self._set_filter_pipeline_on_canvas(
-                canvas,
-                steps,
-                label=label,
-                source_views=source_views,
-                push_undo=False,
-            )
-        return _preview
+    def _thumbnail_filter_label(self, file_key):
+        return self.filter_controller._thumbnail_filter_label(file_key)
 
-    def _restore_filter_views_on_canvas(self, canvas, source_views):
-        if canvas is None or not source_views:
-            return
-        canvas.set_views(self._clone_filter_source_views(canvas, source_views), preserve_profiles=True)
+    def _filter_badge_text(self, steps):
+        return self.filter_controller._filter_badge_text(steps)
 
-    def _base_filter_image_from_views(self, views):
-        try:
-            if views:
-                return views[0].get("_filter_base_arr") or views[0].get("arr")
-        except Exception:
-            return None
-        return None
-
-    def _load_filter_base_array_for_path(self, focus_path):
-        base_arr = None
-        if not focus_path:
-            return None
-        try:
-            focus_key = str(focus_path)
-            header, fds = self.headers.get(focus_key, (None, None))
-            if header and fds:
-                idx = None
-                if self.last_preview and str(self.last_preview[0]) == focus_key:
-                    idx = int(self.last_preview[1])
-                if idx is None:
-                    idx = 0
-                if 0 <= idx < len(fds):
-                    fd = fds[idx]
-                    arr = self._get_channel_array(focus_key, idx, header, fd)
-                    base_arr = normalize_unit_and_data(arr, fd.get("PhysUnit", ""))[1]
-        except Exception:
-            base_arr = None
-        return base_arr
-
-    def _normalize_filter_preview_clim(self, clim):
-        try:
-            if clim is None:
-                return None
-            lo, hi = clim
-            lo = float(lo)
-            hi = float(hi)
-            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                return None
-            return (lo, hi)
-        except Exception:
-            return None
-
-    def _filter_preview_render_state(self, view=None):
-        cmap_name = None
-        clim = None
-        if isinstance(view, dict):
-            cmap_name = str(view.get("cmap") or "").strip() or None
-            clim = self._normalize_filter_preview_clim(view.get("clim"))
-        if not cmap_name:
-            try:
-                cmap_name = str(self.preview_cmap_combo.currentText() or "").strip() or None
-            except Exception:
-                cmap_name = None
-        if not cmap_name:
-            cmap_name = str(getattr(self, "preview_cmap", "viridis") or "viridis")
-        return cmap_name, clim
-
-    def _filter_preview_context_for_path(self, focus_path):
-        preview_target = "selected image"
-        preview_callback = None
-        original_views = None
-        preview_cmap_name = None
-        preview_clim = None
-        base_arr = self._load_filter_base_array_for_path(focus_path)
-        try:
-            preview_target = Path(str(focus_path)).name if focus_path else preview_target
-        except Exception:
-            preview_target = str(focus_path or preview_target)
-        canvas = getattr(self, "preview_canvas", None)
-        if (
-            focus_path
-            and canvas is not None
-            and getattr(canvas, "views", None)
-            and self.last_preview
-            and str(self.last_preview[0]) == str(focus_path)
-        ):
-            original_views = self._clone_filter_source_views(canvas, canvas.views)
-            base_arr = self._base_filter_image_from_views(original_views)
-            preview_callback = self._build_canvas_filter_preview_callback(canvas, original_views)
-            preview_target = self._friendly_view_title(original_views[0] if original_views else None, preview_target)
-            preview_cmap_name, preview_clim = self._filter_preview_render_state(original_views[0] if original_views else None)
-        if preview_cmap_name is None:
-            preview_cmap_name, preview_clim = self._filter_preview_render_state(None)
-        return base_arr, preview_callback, original_views, preview_target, preview_cmap_name, preview_clim
-
-    def _single_filter_step_spec(
-        self,
-        filter_key,
-        parent=None,
-        base_image=None,
-        preview_callback=None,
-        preview_target_text="current image",
-        preview_cmap_name="viridis",
-        preview_clim=None,
-        show_preview_thumbnail=True,
-    ):
-        if not filter_key:
-            return None, None
-        defaults = FILTER_DEFINITIONS.get(filter_key, {})
-        if filter_key in ("highpass", "lowpass"):
-            initial_params = self.config.get(f"{filter_key}_filter_params", {})
-        elif filter_key == "laplacian":
-            initial_params = self.config.get("laplacian_filter_params", {})
-        else:
-            initial_params = defaults
-        dlg = SingleFilterDialog(
-            parent=parent or self,
-            filter_key=filter_key,
-            base_image=base_image,
-            apply_step_func=self._run_filter_step,
-            preview_callback=preview_callback,
-            initial_params=initial_params,
-            preview_target_text=preview_target_text,
-            preview_cmap_name=preview_cmap_name,
-            preview_clim=preview_clim,
-            show_preview_thumbnail=show_preview_thumbnail,
-        )
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return None, None
-        step = dlg.current_step()
-        label = dlg.current_step_label()
-        params = dict(step.get("params") or {})
-        if filter_key in ("highpass", "lowpass"):
-            self.config[f"{filter_key}_filter_params"] = params
-            save_config(self.config)
-        elif filter_key == "laplacian":
-            self.config["laplacian_filter_params"] = params
-            save_config(self.config)
-        return step, label
+    def _filter_pipeline_tooltip(self, label, steps):
+        return self.filter_controller._filter_pipeline_tooltip(label, steps)
 
     def _populate_canvas_filter_menu(self, menu, canvas, view=None):
-        """Populate a context menu with quick filter actions for a preview canvas."""
-        if menu is None or canvas is None:
-            return
-        filt_menu = menu.addMenu("Filters")
-        for key, info in FILTER_DEFINITIONS.items():
-            act = QtWidgets.QAction(self._filter_action_label(key), filt_menu)
-            if info.get("needs_gaussian") and not _gaussian_available():
-                act.setEnabled(False)
-                act.setToolTip("Requires scipy or OpenCV.")
-            act.triggered.connect(lambda _, k=key: self._apply_filter_to_canvas(canvas, filter_key=k))
-            filt_menu.addAction(act)
-        filt_menu.addSeparator()
-        filt_menu.addAction("Custom pipeline...", lambda: self._open_custom_filter_for_canvas(canvas))
-        filt_menu.addAction("Clear filter", lambda: self._apply_filter_to_canvas(canvas, pipeline=[]))
+        return self.filter_controller._populate_canvas_filter_menu(menu, canvas, view=view)
 
     def _apply_filter_to_canvas(self, canvas, filter_key=None, pipeline=None, label=None):
-        """Apply a filter pipeline to the views of a popup/preview canvas."""
-        if not canvas or not getattr(canvas, "views", None):
-            return
-        steps = pipeline
-        if steps is None and filter_key:
-            original_views = self._clone_filter_source_views(canvas, canvas.views)
-            base_arr = self._base_filter_image_from_views(original_views)
-            preview_callback = self._build_canvas_filter_preview_callback(canvas, original_views)
-            preview_cmap_name, preview_clim = self._filter_preview_render_state(original_views[0] if original_views else None)
-            step, step_label = self._single_filter_step_spec(
-                filter_key,
-                parent=canvas,
-                base_image=base_arr,
-                preview_callback=preview_callback,
-                preview_target_text=self._friendly_view_title(original_views[0] if original_views else None, "current image"),
-                preview_cmap_name=preview_cmap_name,
-                preview_clim=preview_clim,
-                show_preview_thumbnail=False,
-            )
-            self._restore_filter_views_on_canvas(canvas, original_views)
-            if step is None:
-                return
-            steps = [step]
-            label = label or step_label
-        self._set_filter_pipeline_on_canvas(canvas, steps, label=label, push_undo=True)
-
-    def _open_custom_filter_for_canvas(self, canvas):
-        if not canvas or not getattr(canvas, "views", None):
-            return
-        original_views = self._clone_filter_source_views(canvas, canvas.views)
-        base_arr = self._base_filter_image_from_views(original_views)
-        preview_cmap_name, preview_clim = self._filter_preview_render_state(original_views[0] if original_views else None)
-        dlg = CustomFilterDialog(
-            self,
-            base_arr,
-            self._run_filter_step,
-            preview_callback=self._build_canvas_filter_preview_callback(canvas, original_views),
-            preview_target_text=self._friendly_view_title(original_views[0] if original_views else None, "current image"),
-            preview_cmap_name=preview_cmap_name,
-            preview_clim=preview_clim,
-            show_preview_thumbnail=False,
-        )
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            steps = dlg.pipeline_steps()
-            label = dlg.pipeline_label()
-            self._restore_filter_views_on_canvas(canvas, original_views)
-            self._apply_filter_to_canvas(canvas, pipeline=steps, label=label)
-            return
-        self._restore_filter_views_on_canvas(canvas, original_views)
+        return self.filter_controller._apply_filter_to_canvas(canvas, filter_key=filter_key, pipeline=pipeline, label=label)
 
     def _apply_filter_pipeline(self, arr, steps):
-        result = np.asarray(arr, dtype=float)
-        for step in steps:
-            result = self._run_filter_step(result, step)
-        return result
+        return self.filter_controller._apply_filter_pipeline(arr, steps)
 
     def _friendly_view_title(self, view, default="Preview"):
         if not view:
@@ -6734,45 +6940,6 @@ QLabel:hover {{
         if label:
             return label
         return default
-
-    def _run_filter_step(self, arr, step):
-        key = step.get('key')
-        params = step.get('params', {})
-        try:
-            if key == 'flatten':
-                axis = params.get('axis', 'both')
-                return flatten_remove_median(arr, axis=axis)
-            if key == 'tilt':
-                return subtract_best_fit_plane(arr)
-            if key == 'plane2':
-                return subtract_2nd_order_plane(arr)
-            if key == 'lowpass':
-                sigma = params.get('sigma', 2.0)
-                return gaussian_filter_image(arr, sigma)
-            if key == 'highpass':
-                sigma = params.get('sigma', 2.0)
-                return highpass_filter(arr, sigma)
-            if key == 'laplacian':
-                sigma = params.get('sigma', FILTER_DEFINITIONS.get('laplacian', {}).get('default_sigma', 0.6))
-                neighbors = params.get('neighbors', FILTER_DEFINITIONS.get('laplacian', {}).get('default_neighbors', 8))
-                absolute = params.get('absolute', FILTER_DEFINITIONS.get('laplacian', {}).get('default_absolute', True))
-                return laplacian_filter_image(arr, sigma=sigma, neighbors=neighbors, absolute=absolute)
-            if key == 'log':
-                epsilon = params.get('epsilon', FILTER_DEFINITIONS.get('log', {}).get('default_epsilon', 1e-3))
-                return log_filter_image(arr, epsilon=epsilon)
-            if key == 'histeq':
-                return histogram_equalize_image(arr)
-            if key == 'clahe':
-                clip_limit = params.get('clip_limit', FILTER_DEFINITIONS.get('clahe', {}).get('default_clip_limit', 0.03))
-                tile_size = params.get('tile_size', FILTER_DEFINITIONS.get('clahe', {}).get('default_tile_size', 8))
-                return clahe_filter_image(arr, clip_limit=clip_limit, tile_size=tile_size)
-            if key == 'line_flatten':
-                axis = params.get('axis', FILTER_DEFINITIONS.get('line_flatten', {}).get('default_axis', 'row'))
-                method = params.get('method', FILTER_DEFINITIONS.get('line_flatten', {}).get('default_method', 'median'))
-                return line_flatten_image(arr, axis=axis, method=method)
-        except Exception:
-            pass
-        return arr
 
     # ---------- dz helpers ----------
     def _dz_vs_previous_ch(self, header_path:Path):
@@ -6829,11 +6996,10 @@ QLabel:hover {{
         hm = QtWidgets.QHBoxLayout()
         hm.addWidget(QtWidgets.QLabel("Cmap:"))
         cmapcombo = QtWidgets.QComboBox()
-        # Populate cmap list with icons, falling back to a fixed list if colormaps is unavailable
-        try:
-            cmap_names = sorted(colormaps.keys())
-        except Exception:
-            cmap_names = ['viridis','plasma','inferno','magma','cividis','gray','hot','coolwarm','turbo']
+        # Populate cmap list with icons from the central registry (featured first)
+        _featured = cmap_registry.featured_cmap_names("general")
+        cmap_names = _featured + [n for n in cmap_registry.all_cmap_names()
+                                  if n not in set(_featured)]
         for name in cmap_names:
             try:
                 icon = _colormap_icon(name, width=96, height=14)
@@ -6894,13 +7060,36 @@ QLabel:hover {{
         }
         self._header_cache_dirty = True
 
+    def _prune_stale_header_cache_entries(self):
+        """Drop header-cache entries whose source file no longer exists.
+
+        Nothing else ever removes entries from this cache, so left alone it
+        grows across every folder ever opened for as long as the app is
+        used, making the JSON parse at startup slower and slower over time.
+        Only called from _save_header_cache (i.e. when the cache is already
+        being written back to disk), not on every load, so this doesn't add
+        a stat() call per cached entry to the common all-cached-hits path.
+
+        Guarded to run at most once per session: a folder full of files
+        never seen before (many cache misses -> many saves in a row) would
+        otherwise re-scan the entire multi-thousand-entry cache on every
+        single one of those saves, adding a real ~300-400ms each time a
+        session opens several new folders in a row.
+        """
+        if getattr(self, "_header_cache_pruned_this_session", False):
+            return
+        self._header_cache_pruned_this_session = True
+        stale_keys = [key for key in list(self.header_cache.keys()) if not os.path.exists(key)]
+        for key in stale_keys:
+            self.header_cache.pop(key, None)
+
     def _save_header_cache(self):
         if getattr(self, '_header_cache_dirty', False):
+            self._prune_stale_header_cache_entries()
             save_header_cache(self.header_cache)
             self._header_cache_dirty = False
 
     def on_clear_views(self):
-        self.added_views = []
         self.extra_view_specs = []
         if self.last_preview: self.show_file_channel(self.last_preview[0], self.last_preview[1])
 
@@ -7125,7 +7314,133 @@ QLabel:hover {{
     def on_export_xyz_files(self):
         return viewer_export.on_export_xyz_files(self)
 
+    def _thumbnail_channel_idx_for_file(self, file_key):
+        key = str(file_key)
+        label = (getattr(self, "_thumb_labels", {}) or {}).get(key)
+        if label is not None:
+            try:
+                channel_idx = label.property("channel_index")
+                if channel_idx is not None:
+                    return int(channel_idx)
+            except Exception:
+                pass
+        payload = (getattr(self, "_processed_views", {}) or {}).get(key) or {}
+        try:
+            channel_idx = payload.get("channel_idx")
+            if channel_idx is not None:
+                return int(channel_idx)
+        except Exception:
+            pass
+        try:
+            return int(self.channel_dropdown.currentIndex())
+        except Exception:
+            return 0
+
+    def _send_thumbnail_targets_to_powerpoint(self, paths, *, new_slide=True):
+        targets = [str(Path(p)) for p in list(paths or []) if p]
+        if not targets:
+            QtWidgets.QMessageBox.information(self, "PowerPoint", "No thumbnails selected.")
+            return
+        canvas = getattr(self, "preview_canvas", None)
+        if canvas is None:
+            QtWidgets.QMessageBox.warning(self, "PowerPoint", "Preview canvas is unavailable.")
+            return
+        original_last = getattr(self, "last_preview", None)
+        original_views = None
+        try:
+            original_views = self._clone_filter_source_views(canvas, getattr(canvas, "views", None) or [])
+        except Exception:
+            original_views = list(getattr(canvas, "views", None) or [])
+        items = []
+        try:
+            for file_key in targets:
+                channel_idx = self._thumbnail_channel_idx_for_file(file_key)
+                self.show_file_channel(file_key, channel_idx, use_local_cmap=True)
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+                views = list(getattr(canvas, "views", None) or [])
+                if not views:
+                    continue
+                view = views[0]
+                label_text = canvas._resolve_powerpoint_label(view)
+                hide_titles = bool(label_text) and len(views) == 1
+                pixmap = canvas._render_displayed_pixmap(show_titles=not hide_titles)
+                if pixmap is None or pixmap.isNull():
+                    pixmap = canvas.get_overview_pixmap()
+                if pixmap is None or pixmap.isNull():
+                    continue
+                items.append((pixmap, label_text))
+        finally:
+            try:
+                if original_last:
+                    self.show_file_channel(original_last[0], original_last[1], use_local_cmap=True)
+                elif original_views is not None:
+                    canvas.set_views(original_views, preserve_profiles=True)
+            except Exception:
+                pass
+        if not items:
+            QtWidgets.QMessageBox.warning(self, "PowerPoint", "No image to send.")
+            return
+        try:
+            if new_slide or len(items) == 1:
+                slide_number = None
+                shape_name = ""
+                for pixmap, label_text in items:
+                    slide_number, shape_name = send_pixmap_to_ppt(
+                        pixmap,
+                        label=label_text,
+                        new_slide=True,
+                    )
+                if slide_number is not None:
+                    canvas._show_powerpoint_success(slide_number, shape_name)
+                return
+            presentation = _ppt_bridge._presentation()
+            slide = _ppt_bridge._resolve_slide(presentation, new_slide=False, slide_index=None)
+            slide_index = int(slide.SlideIndex)
+            slide_w = float(presentation.PageSetup.SlideWidth)
+            slide_h = float(presentation.PageSetup.SlideHeight)
+            count = len(items)
+            cols = int(math.ceil(math.sqrt(count)))
+            rows = int(math.ceil(count / max(cols, 1)))
+            outer_margin = 24.0
+            gutter = 16.0
+            caption_h = 28.0
+            cell_w = max(120.0, (slide_w - 2 * outer_margin - max(0, cols - 1) * gutter) / max(cols, 1))
+            cell_h = max(110.0, (slide_h - 2 * outer_margin - max(0, rows - 1) * gutter) / max(rows, 1))
+            image_h = max(80.0, cell_h - caption_h)
+            shape_name = ""
+            for idx, (pixmap, label_text) in enumerate(items):
+                row = idx // max(cols, 1)
+                col = idx % max(cols, 1)
+                left = outer_margin + col * (cell_w + gutter)
+                top = outer_margin + row * (cell_h + gutter)
+                _slide_number, shape_name = send_pixmap_to_ppt(
+                    pixmap,
+                    label=label_text,
+                    new_slide=False,
+                    slide_index=slide_index,
+                    left=left,
+                    top=top,
+                    width=cell_w,
+                    height=image_h,
+                )
+            canvas._show_powerpoint_success(slide_index, shape_name)
+        except ConnectionError:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "PowerPoint",
+                "PowerPoint is not running. Please open a presentation first.",
+            )
+        except EnvironmentError as exc:
+            QtWidgets.QMessageBox.critical(self, "PowerPoint", str(exc))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "PowerPoint", str(exc))
+
     def on_adjust_image(self):
+        """Image > Crop/Rotate. Geometry (crop/rotate/flips) becomes an
+        adjacent virtual copy — the original is never altered. Clip/gamma
+        stay live display adjustments on the original (or on the new copy
+        when geometry was applied too); cmap goes to per_file_channel_cmap
+        as before."""
         if not self.last_preview or not hasattr(self, '_last_base_array'):
             QtWidgets.QMessageBox.information(self, "Adjust image", "Select an image first.")
             return
@@ -7135,15 +7450,8 @@ QLabel:hover {{
             QtWidgets.QMessageBox.information(self, "Adjust image", "Image data not available.")
             return
         current_cmap = self.per_file_channel_cmap.get((file_key, int(channel_idx)), self.preview_cmap_combo.currentText() or self.preview_cmap)
-        spec = self._get_adjust_spec(file_key, channel_idx) or {
-            'crop': {'x0': 0, 'y0': 0, 'x1': base_arr.shape[1], 'y1': base_arr.shape[0]},
-            'rotate': 0.0,
-            'flip_h': False,
-            'flip_v': False,
-            'clip': {'low': None, 'high': None},
-            'gamma': 1.0,
-            'cmap': current_cmap,
-        }
+        spec = self._get_adjust_spec(file_key, channel_idx) or {}
+        spec = dict(spec)
         spec.setdefault('cmap', current_cmap)
         base_extent = getattr(self, '_last_base_extent', None)
         axis_unit = getattr(self, '_last_axis_unit', 'px')
@@ -7154,13 +7462,111 @@ QLabel:hover {{
                                 axis_unit=axis_unit, colorbar_label=colorbar_label,
                                 base_unit=getattr(self, '_last_base_unit', None),
                                 relative_axes=bool(getattr(self, 'relative_axes', False)))
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            new_spec = dlg.current_spec
-            self._set_adjust_spec(file_key, channel_idx, new_spec)
-            new_cmap = dlg.cmap_combo.currentText()
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        geom = dlg.geometry_spec()
+        tone = dlg.tone_spec()
+        new_cmap = dlg.selected_cmap()
+        old_spec = self._get_adjust_spec(file_key, channel_idx)
+
+        if geom is not None:
+            new_arr, new_extent = resample_geometry(base_arr, base_extent, geom)
+            title = f"{Path(str(file_key)).stem} [edit]"
+            angle = float(geom.get('rotate', 0.0) or 0.0)
+            if abs(angle) > 1e-3:
+                title += f" rot={angle:g}°"
+            view = {
+                'path': str(file_key),
+                'arr': new_arr,
+                'channel_idx': int(channel_idx),
+                'title': title,
+            }
+            if new_extent is not None:
+                view['extent_raw'] = tuple(float(v) for v in new_extent)
+            new_key = self._create_virtual_view_copy(
+                view, insert_after_key=str(file_key), tag="[edit]", op="edit")
+            if not new_key:
+                QtWidgets.QMessageBox.warning(
+                    self, "Crop/Rotate", "Could not create the virtual copy.")
+                return
+            self._adjustment_undo_stack.append(("copy", str(new_key)))
+            # Tone settings ride along on the copy (still live/reversible
+            # there); the ORIGINAL's display spec is untouched by design.
+            if tone is not None:
+                self._set_adjust_spec(new_key, channel_idx, dict(tone))
+            if new_cmap:
+                self.per_file_channel_cmap[(str(new_key), int(channel_idx))] = new_cmap
+            self._refresh_adjusted_channel(new_key, channel_idx)
+            log_status(f"[Crop/Rotate] Created virtual copy '{title}' (Ctrl+Z removes it)")
+        else:
+            # Tone-only Accept: live display adjustment on the original,
+            # with proper cache invalidation and global-undo support.
+            changed = (tone or None) != (old_spec or None)
+            self._set_adjust_spec(file_key, channel_idx, dict(tone) if tone else None)
             if new_cmap:
                 self.per_file_channel_cmap[(str(file_key), int(channel_idx))] = new_cmap
+            if changed:
+                self._adjustment_undo_stack.append(
+                    ("tone", str(file_key), int(channel_idx),
+                     dict(old_spec) if old_spec else None))
+            self._refresh_adjusted_channel(file_key, channel_idx)
+
+    def _refresh_adjusted_channel(self, file_key, channel_idx):
+        """Re-render every surface showing file_key after its display
+        adjustments changed — thumbnail caches key on the spec signature,
+        but the pixmap caches and the visible grid/preview don't refresh
+        by themselves (the old staleness bug)."""
+        try:
+            self._invalidate_thumbnail_cache(paths=[str(file_key)])
+        except Exception:
+            pass
+        try:
+            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
+        except Exception:
+            pass
+        try:
             self.show_file_channel(file_key, channel_idx)
+        except Exception:
+            pass
+
+    def on_reset_image_adjustments(self):
+        """Image > Reset display adjustments (also in the thumbnail context
+        menu): clear the previewed file's clip/gamma spec."""
+        if not self.last_preview:
+            return
+        file_key, channel_idx = self.last_preview
+        old_spec = self._get_adjust_spec(file_key, channel_idx)
+        if not old_spec:
+            log_status("[Crop/Rotate] No display adjustments to reset")
+            return
+        self._adjustment_undo_stack.append(
+            ("tone", str(file_key), int(channel_idx), dict(old_spec)))
+        self._set_adjust_spec(file_key, channel_idx, None)
+        self._refresh_adjusted_channel(file_key, channel_idx)
+        log_status("[Crop/Rotate] Display adjustments reset (Ctrl+Z restores)")
+
+    def _undo_last_adjustment(self):
+        """Ctrl+Z step for Crop/Rotate actions: restores the previous
+        tone spec, or removes an [edit] virtual copy. Returns True when
+        something was undone."""
+        stack = getattr(self, '_adjustment_undo_stack', None)
+        while stack:
+            entry = stack.pop()
+            if entry[0] == "tone":
+                _, file_key, channel_idx, old_spec = entry
+                self._set_adjust_spec(file_key, channel_idx,
+                                      dict(old_spec) if old_spec else None)
+                self._refresh_adjusted_channel(file_key, channel_idx)
+                log_status("[Crop/Rotate] Display adjustments restored")
+                return True
+            if entry[0] == "copy":
+                new_key = entry[1]
+                if new_key not in getattr(self, '_processed_views', {}):
+                    continue  # already removed by hand; try the next entry
+                self._remove_virtual_entries([new_key])
+                log_status("[Crop/Rotate] Virtual copy removed")
+                return True
+        return False
 
     def _prepare_render_items(self, header_path, config):
         header_path = Path(header_path)
@@ -7533,17 +7939,79 @@ QLabel:hover {{
     def _on_preview_value(self, value, x, y, view):
         return viewer_preview._on_preview_value(self, value, x, y, view)
 
+    def _contrast_finite_values(self, arr):
+        try:
+            data = np.asarray(arr, dtype=float)
+        except Exception:
+            return None, None, np.array([], dtype=float)
+        if data.ndim == 2:
+            try:
+                region = detect_valid_scan_region(data)
+            except Exception:
+                region = None
+            if region:
+                r0, r1 = region
+                data = data[r0:r1 + 1, :]
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            return None, None, finite
+        try:
+            hist, edges = np.histogram(finite, bins=256)
+            idx_max = int(np.argmax(hist))
+            frac = hist[idx_max] / float(finite.size)
+            if frac > 0.5:
+                lo_edge, hi_edge = edges[idx_max], edges[idx_max + 1]
+                trimmed = finite[(finite < lo_edge) | (finite > hi_edge)]
+                if trimmed.size >= max(10, int(0.001 * finite.size)):
+                    finite = trimmed
+        except Exception:
+            pass
+        if finite.size == 0:
+            return None, None, finite
+        return float(np.nanmin(finite)), float(np.nanmax(finite)), finite
+
     def _view_finite_values(self, view):
         if not view:
             return None, None, None
         try:
-            arr = np.asarray(view.get("arr"))
+            arr = view.get("arr")
         except Exception:
             return None, None, None
-        finite = arr[np.isfinite(arr)]
+        try:
+            data = np.asarray(arr, dtype=float)
+        except Exception:
+            return None, None, None
+        if data.ndim == 2:
+            try:
+                region = detect_valid_scan_region(data)
+            except Exception:
+                region = None
+            if region:
+                r0, r1 = region
+                data = data[r0:r1 + 1, :]
+        finite = data[np.isfinite(data)]
         if finite.size == 0:
             return None, None, None
-        return float(finite.min()), float(finite.max()), finite
+        return float(np.nanmin(finite)), float(np.nanmax(finite)), finite
+
+    def _recommended_view_clim(self, view, *, pct_low=1.0, pct_high=99.0):
+        if not view:
+            return None
+        try:
+            arr = view.get("arr")
+        except Exception:
+            arr = None
+        if arr is None:
+            return None
+        relative_zero = bool(view.get("display_relative_zero", False))
+        try:
+            vmin, vmax = robust_limits(arr, low_pct=float(pct_low), high_pct=float(pct_high))
+        except Exception:
+            vmin = vmax = None
+        if vmin is None or vmax is None or not np.isfinite(vmin) or not np.isfinite(vmax) or float(vmax) <= float(vmin):
+            fallback = self._auto_preview_clim(arr, relative_zero=relative_zero)
+            return fallback
+        return (float(vmin), float(vmax))
 
     def _apply_clim_to_view(self, canvas, view, lo, hi):
         if canvas is None or view is None:
@@ -7557,39 +8025,152 @@ QLabel:hover {{
         except Exception:
             pass
 
+    def _resolve_canvas_contrast_target(self, canvas):
+        if canvas is None:
+            return None
+        try:
+            if hasattr(canvas, "active_view_and_axes"):
+                view, _ax = canvas.active_view_and_axes()
+                if view is not None:
+                    return view
+        except Exception:
+            pass
+        views = list(getattr(canvas, "views", None) or [])
+        return views[0] if views else None
+
     def _auto_contrast(self, canvas, pct_low=1.0, pct_high=99.0):
-        view = canvas.views[0] if canvas and getattr(canvas, "views", None) else None
-        vmin, vmax, finite = self._view_finite_values(view)
-        if finite is None:
+        view = self._resolve_canvas_contrast_target(canvas)
+        suggested = self._recommended_view_clim(view, pct_low=pct_low, pct_high=pct_high)
+        if suggested is None:
             return
         try:
             canvas.push_undo_state("auto_contrast")
         except Exception:
             pass
-        try:
-            lo, hi = np.percentile(finite, [pct_low, pct_high])
-        except Exception:
-            lo, hi = vmin, vmax
-        if view and bool(view.get("display_relative_zero", False)):
-            lo = 0.0
-            hi = max(float(hi), float(vmax or 0.0), 0.0)
+        lo, hi = suggested
         self._apply_clim_to_view(canvas, view, lo, hi)
 
     def _reset_contrast(self, canvas):
-        view = canvas.views[0] if canvas and getattr(canvas, "views", None) else None
-        vmin, vmax, _ = self._view_finite_values(view)
-        if vmin is None:
+        view = self._resolve_canvas_contrast_target(canvas)
+        vmin, vmax, _finite = self._view_finite_values(view)
+        if vmin is None or vmax is None:
             return
         try:
             canvas.push_undo_state("reset_contrast")
         except Exception:
             pass
-        if view and bool(view.get("display_relative_zero", False)):
-            vmin = 0.0
         self._apply_clim_to_view(canvas, view, vmin, vmax)
 
     def _open_histogram_dialog(self, canvas):
         open_histogram_dialog(self, canvas)
+
+    def _on_let_the_robot_clicked(self, canvas=None):
+        """Diagnose the current view (tilt, incomplete scan, glitched lines,
+        spikes, noise, contrast) and apply whichever fixes actually apply, as
+        ordinary visible/editable steps in the same filter pipeline the
+        Filters menu uses - see processing/auto_enhance.diagnose()."""
+        canvas = canvas or getattr(self, "preview_canvas", None)
+        if canvas is None:
+            return
+        # Clicking the button doesn't naturally move keyboard focus onto the
+        # canvas (QToolButton defaults to no focus), so canvas shortcuts like
+        # "A" for auto-contrast would otherwise silently do nothing until the
+        # user clicks directly inside the plot area first.
+        try:
+            canvas.setFocus(QtCore.Qt.OtherFocusReason)
+        except Exception:
+            pass
+        view = self._resolve_canvas_contrast_target(canvas)
+        if view is None:
+            self._show_toast("No image loaded to enhance.")
+            return
+        arr = view.get("arr")
+        if arr is None:
+            self._show_toast("No image loaded to enhance.")
+            return
+        arr = np.asarray(arr, dtype=float)
+        summaries = []
+        source_view = view
+
+        # Incomplete-scan crop first, since it changes array shape - detected
+        # here (GUI layer) rather than in auto_enhance, which stays array-only.
+        try:
+            region = detect_valid_scan_region(arr) if arr.ndim == 2 else None
+        except Exception:
+            region = None
+        if region is not None:
+            r0, r1 = region
+            h = arr.shape[0]
+            if r0 > 0 or r1 < h - 1:
+                cropped = arr[r0:r1 + 1, :]
+                cropped_view = dict(view)
+                cropped_view["arr"] = np.array(cropped, copy=True)
+                try:
+                    w = arr.shape[1]
+                    crop_extent = canvas._compute_crop_extent(view, w, h, 0, w - 1, r0, r1)
+                except Exception:
+                    crop_extent = None
+                if crop_extent is not None:
+                    cropped_view["extent_raw"] = crop_extent
+                    try:
+                        display_extent = canvas._display_extent_for_view(cropped_view, crop_extent)
+                    except Exception:
+                        display_extent = None
+                    if display_extent is not None:
+                        cropped_view["extent"] = display_extent
+                    else:
+                        cropped_view.pop("extent", None)
+                arr = cropped
+                source_view = cropped_view
+                summaries.append(f"cropped to the valid scan region ({r1 - r0 + 1}/{h} rows)")
+
+        steps, diagnosis_summaries = _auto_enhance.diagnose(arr)
+        summaries.extend(diagnosis_summaries)
+
+        did_crop = source_view is not view
+        did_something = bool(steps) or did_crop
+        if steps or did_crop:
+            self.filter_controller._set_filter_pipeline_on_canvas(
+                canvas, steps, label="Auto-enhance", source_views=[source_view], push_undo=True
+            )
+            self.filter_controller._sync_main_preview_filter_to_thumbnail(
+                canvas, steps, "Auto-enhance", allow_full_rerender=not did_crop
+            )
+
+        # Contrast is always worth checking, even when no structural fix was
+        # needed - reuses the exact same robust-percentile path Auto uses.
+        current_view = self._resolve_canvas_contrast_target(canvas)
+        if current_view is not None:
+            suggested = self._recommended_view_clim(current_view, pct_low=1.0, pct_high=99.0)
+            if suggested is not None:
+                lo, hi = suggested
+                prev_clim = current_view.get("clim")
+                changed = True
+                if prev_clim is not None:
+                    try:
+                        prev_lo, prev_hi = float(prev_clim[0]), float(prev_clim[1])
+                        span = max(abs(hi - lo), 1e-12)
+                        changed = (abs(prev_lo - lo) + abs(prev_hi - hi)) / span > 0.01
+                    except Exception:
+                        changed = True
+                if changed:
+                    if not did_something:
+                        try:
+                            canvas.push_undo_state("auto_enhance")
+                        except Exception:
+                            pass
+                    self._apply_clim_to_view(canvas, current_view, lo, hi)
+                    summaries.append("adjusted contrast")
+                    did_something = True
+
+        if not did_something:
+            self._show_toast("Already looks good - no changes made.")
+            log_status("Let the robot: already looks good, no changes made")
+            return
+
+        summary = ", ".join(summaries) if summaries else "enhanced the image"
+        self._show_toast(summary[:1].upper() + summary[1:], duration_ms=2600)
+        log_status(f"Let the robot: {summary}")
 
     def _is_matrix_spec(self, spec) -> bool:
         try:
@@ -7735,92 +8316,17 @@ QLabel:hover {{
 
     def ensure_spectros_loaded(self, refresh: bool = True):
         """Load spectroscopies on-demand if they were deferred."""
-        if self._spectros_loaded:
-            return True
-        if getattr(self, "_spectros_loading", False):
-            return False
-        try:
-            self._spectro_autoload_timer.stop()
-        except Exception:
-            pass
-        self._spectros_loading = True
-        self._spectros_pending = False
-        try:
-            log_status("[Lazy] Loading spectroscopy references...")
-            self._reload_spectros(refresh=refresh)
-            if not refresh and self._spectros_loaded:
-                self._schedule_marker_refresh()
-                if self.last_preview:
-                    try:
-                        self.show_file_channel(self.last_preview[0], self.last_preview[1])
-                    except Exception:
-                        pass
-        finally:
-            self._spectros_loading = False
-        return True
+        return spectro_loading.ensure_loaded(self, refresh=refresh)
 
     def _schedule_pending_spectro_load(self, delay_ms: int = 1200):
-        if self._spectros_loaded or not getattr(self, "_spectros_pending", False):
-            return
-        if getattr(self, "_spectros_loading", False):
-            return
-        try:
-            self._spectro_autoload_timer.start(max(0, int(delay_ms)))
-        except Exception:
-            pass
+        spectro_loading.schedule_pending_load(self, delay_ms=delay_ms)
 
-    def _run_pending_spectro_load(self):
-        if self._spectros_loaded or not getattr(self, "_spectros_pending", False):
-            return
-        if getattr(self, "_spectros_loading", False):
-            return
-        self.ensure_spectros_loaded(refresh=True)
+    def _run_pending_spectro_load_async(self):
+        spectro_loading.run_pending_load_async(self, _SpectroScanWorker)
 
     def _reload_spectros(self, refresh=True):
-        # unless we complete a successful reload, consider spectra cache stale
-        self._spectros_loaded = False
-        self._spectros_pending = False
-        self._spectro_miniature_cache.clear()
-        t_scan_start = time.perf_counter()
-        try:
-            folder = getattr(self, 'spec_folder_path', None) or self.last_dir
-            folder = Path(folder)
-        except Exception:
-            folder = self.last_dir
-        log_status(f"Scanning spectroscopy files in: {folder}")
-        self._spectro_deferred = set()
-        self.spectros, spec_stats = self._scan_spectros(folder)
-        t_scan_end = time.perf_counter()
-        if spec_stats:
-            total_entries = spec_stats.get('total_specs', len(self.spectros))
-            single_files = spec_stats.get('single_dat_files', 0)
-            single_entries = spec_stats.get('single_entries', single_files)
-            matrix_files = spec_stats.get('matrix_dat_files', 0)
-            matrix_entries = spec_stats.get('matrix_specs', 0)
-            # keep stats for UI but avoid duplicate terminal spam (loader already logged)
-        else:
-            log_status(f"Loaded {len(self.spectros)} spectroscopy entries")
-        t_assign_start = time.perf_counter()
-        self._assign_spectros_to_images()
-        t_assign_end = time.perf_counter()
-        self.matrix_spectros = [spec for spec in self.spectros if spec.get('matrix_index') is not None]
-        self._clear_multi_spec_selection()
-        self._update_spectro_stats_label(spec_stats)
-        self._spectros_loaded = True
-        self._update_matrix_summary_banner()
-        if refresh:
-            t_thumb_start = time.perf_counter()
-            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
-            if self.last_preview:
-                self.show_file_channel(self.last_preview[0], self.last_preview[1])
-            t_thumb_end = time.perf_counter()
-        else:
-            t_thumb_start = t_assign_end
-            t_thumb_end = t_assign_end
-        scan_ms = (t_scan_end - t_scan_start) * 1000.0
-        assign_ms = (t_assign_end - t_assign_start) * 1000.0
-        thumb_ms = (t_thumb_end - t_thumb_start) * 1000.0
-        log_status(f"[Perf] Spectros: scan {scan_ms:.0f} ms | assign {assign_ms:.0f} ms | thumbs {thumb_ms:.0f} ms")
+        spectro_loading.reload_spectros(self, refresh=refresh)
+
 
     def _scan_spectros(self, folder:Path):
         return viewer_loader._scan_spectros(self, folder)
@@ -7835,41 +8341,11 @@ QLabel:hover {{
         return viewer_loader.refresh_spectro_manifest_from_viewer(self)
 
     def _schedule_spectro_manifest_save(self):
-        self._spectro_manifest_save_pending = True
-        try:
-            self._spectro_manifest_save_timer.start(400)
-        except Exception:
-            self._flush_spectro_manifest_save()
+        spectro_loading.schedule_manifest_save(self)
 
     def _flush_spectro_manifest_save(self):
-        if self._spectro_manifest_save_inflight:
-            self._spectro_manifest_save_pending = True
-            return
-        folder = getattr(self, "spec_folder_path", None) or getattr(self, "last_dir", None)
-        manifest_entries = dict(getattr(self, "_spectro_manifest_entries", {}) or {})
-        if not folder or not manifest_entries:
-            self._spectro_manifest_save_pending = False
-            return
-        self._spectro_manifest_save_pending = False
-        self._spectro_manifest_save_inflight = True
+        spectro_loading.flush_manifest_save(self)
 
-        def _persist(snapshot_folder, snapshot_manifest):
-            try:
-                viewer_loader.save_spectro_manifest_snapshot(snapshot_folder, snapshot_manifest)
-            finally:
-                QtCore.QTimer.singleShot(0, self._on_spectro_manifest_save_finished)
-
-        threading.Thread(
-            target=_persist,
-            args=(folder, manifest_entries),
-            name="spectro-manifest-save",
-            daemon=True,
-        ).start()
-
-    def _on_spectro_manifest_save_finished(self):
-        self._spectro_manifest_save_inflight = False
-        if self._spectro_manifest_save_pending:
-            self._schedule_spectro_manifest_save()
 
     def _assign_spectros_to_images(self):
         spectro_controller._assign_spectros_to_images(self)
@@ -7881,171 +8357,204 @@ QLabel:hover {{
         except Exception:
             self.files_with_matrix = set()
         try:
+            self.files_with_spectra = {
+                key for key, entries in (self.spectros_by_image or {}).items() if entries
+            }
+        except Exception:
+            self.files_with_spectra = set()
+        try:
             QtCore.QTimer.singleShot(0, self.refresh_spectro_manifest)
         except Exception:
             pass
         self._update_matrix_summary_banner()
 
-    def _choose_image_for_spec(self, spec, images, image_extents):
-        return spectro_controller._choose_image_for_spec(self, spec, images, image_extents)
+    def _current_spectro_assignment_target_image_key(self):
+        return spectro_overrides.current_target_image_key(self)
+
+    def _apply_spectro_assignment_override(self, specs, image_key=""):
+        spectro_overrides.apply_override(self, specs, image_key=image_key)
+
+    def _clear_spectro_assignment_override(self, specs):
+        spectro_overrides.clear_override(self, specs)
+
+
+    def _spec_matches_image_key(self, spec, image_key):
+        image_key = str(image_key or "").strip()
+        if not image_key or not spec:
+            return False
+        primary_key = str(spec.get("image_key") or spec.get("primary_image_key") or "").strip()
+        if primary_key == image_key:
+            return True
+        shared_keys = [str(key) for key in (spec.get("shared_image_keys") or []) if key]
+        return image_key in shared_keys
+
+    def _set_spectro_browser_filters(self, *, current_image_only=None, low_conf_only=None, z_stacks_only=None, matrix_only=None, off_frame_only=None):
+        for attr, value in (
+            ("spectro_filter_current_image_cb", current_image_only),
+            ("spectro_filter_low_conf_cb", low_conf_only),
+            ("spectro_filter_z_stack_cb", z_stacks_only),
+            ("spectro_filter_matrix_cb", matrix_only),
+            ("spectro_filter_off_frame_cb", off_frame_only),
+        ):
+            widget = getattr(self, attr, None)
+            if widget is None or value is None:
+                continue
+            set_silent(widget, checked=bool(value))
+
+    def on_open_current_spectro_site(self):
+        if not self._spectros_loaded:
+            self.ensure_spectros_loaded(refresh=False)
+        spec = spectro_overrides.current_focus_spec(self)
+        if spec is not None:
+            image_key = str(spec.get("image_key") or spec.get("primary_image_key") or self._current_spectro_assignment_target_image_key() or "")
+            self._open_spectro_summary_for_site(spec, file_key=image_key, quiet=True)
+            try:
+                self._highlight_spectrum_entry(spec)
+            except Exception:
+                pass
+            return
+        image_key = self._current_spectro_assignment_target_image_key()
+        if image_key:
+            self._open_spectro_summary_for_file(image_key, quiet=True)
+            return
+        QtWidgets.QMessageBox.information(self, "Spectroscopy", "Highlight a spectroscopy marker or open an image with assigned spectroscopy first.")
+
+    def on_review_low_conf_spectros(self, current_image_only=False):
+        if not self._spectros_loaded:
+            self.ensure_spectros_loaded(refresh=False)
+        entries = list(getattr(self, "spectros", []) or [])
+        if current_image_only:
+            image_key = self._current_spectro_assignment_target_image_key()
+            entries = [spec for spec in entries if self._spec_matches_image_key(spec, image_key)]
+        low_entries = [
+            spec for spec in entries
+            if str(spec.get("assignment_confidence") or "").strip().lower() == "low"
+        ]
+        if not low_entries:
+            scope = " for the current image" if current_image_only else ""
+            QtWidgets.QMessageBox.information(self, "Spectroscopy", f"No low-confidence spectroscopy assignments were found{scope}.")
+            return
+        self.open_spectro_browser(list(getattr(self, "spectros", []) or []))
+        self._set_spectro_browser_filters(
+            current_image_only=bool(current_image_only),
+            low_conf_only=True,
+        )
+        # spectro_search is a QLineEdit, so text="" == clear().
+        set_silent(getattr(self, "spectro_search", None), text="")
+        self._filter_spectro_browser()
+        try:
+            main_window_spectro.select_first_spectro_browser_match(
+                self,
+                predicate=lambda payload: str(payload.get("kind") or "") in {"site", "spec"},
+            )
+        except Exception:
+            pass
+        scope_label = "current image" if current_image_only else "folder"
+        log_status(f"[Spectro] Reviewing {len(low_entries)} low-confidence assignment(s) in the {scope_label}")
+
+    def on_review_off_frame_spectros(self, current_image_only=False):
+        if not self._spectros_loaded:
+            self.ensure_spectros_loaded(refresh=False)
+        entries = list(getattr(self, "spectros", []) or [])
+        if current_image_only:
+            image_key = self._current_spectro_assignment_target_image_key()
+            entries = [spec for spec in entries if self._spec_matches_image_key(spec, image_key)]
+        off_frame_entries = [spec for spec in entries if spec.get("off_frame_direction")]
+        if not off_frame_entries:
+            scope = " for the current image" if current_image_only else ""
+            QtWidgets.QMessageBox.information(self, "Spectroscopy", f"No off-frame spectroscopies were found{scope}.")
+            return
+        self.open_spectro_browser(list(getattr(self, "spectros", []) or []))
+        self._set_spectro_browser_filters(
+            current_image_only=bool(current_image_only),
+            off_frame_only=True,
+        )
+        # spectro_search is a QLineEdit, so text="" == clear().
+        set_silent(getattr(self, "spectro_search", None), text="")
+        self._filter_spectro_browser()
+        try:
+            main_window_spectro.select_first_spectro_browser_match(
+                self,
+                predicate=lambda payload: str(payload.get("kind") or "") in {"site", "spec"},
+            )
+        except Exception:
+            pass
+        scope_label = "current image" if current_image_only else "folder"
+        log_status(f"[Spectro] Reviewing {len(off_frame_entries)} off-frame spectroscop{'y' if len(off_frame_entries) == 1 else 'ies'} in the {scope_label}")
+
+    def _choose_image_for_spec(self, spec, images, image_extents, *, image_angles=None, with_details=False):
+        return spectro_controller._choose_image_for_spec(self, spec, images, image_extents, image_angles=image_angles, with_details=with_details)
 
     def _extent_center(self, extent):
         return spectro_controller._extent_center(self, extent)
 
-    def _spec_within_extent(self, sx, sy, extent, margin_frac=0.05):
-        return spectro_controller._spec_within_extent(self, sx, sy, extent, margin_frac=margin_frac)
+    def _spec_within_extent(self, sx, sy, extent, margin_frac=0.05, angle_deg=0.0):
+        return spectro_controller._spec_within_extent(self, sx, sy, extent, margin_frac=margin_frac, angle_deg=angle_deg)
+
+    def _spec_frame_offset_info(self, sx, sy, extent, angle_deg=0.0):
+        return spectro_controller._spec_frame_offset_info(self, sx, sy, extent, angle_deg=angle_deg)
 
     def _match_spec_to_image_by_hint(self, spec, images, with_score=False):
         return spectro_controller._match_spec_to_image_by_hint(self, spec, images, with_score=with_score)
 
     def _map_spec_to_pixels(self, spec, header, xpix, ypix, file_key=None, thumb_crop=None):
-        try:
-            x = float(spec.get('x'))
-            y = float(spec.get('y'))
-        except Exception:
-            x = y = None
-        if x is None or y is None:
-            # fallback placement using a stable order index if present
-            try:
-                idx = int(spec.get('order_idx', 1))
-            except Exception:
-                idx = 1
-            return self._fallback_spec_coords(idx, xpix, ypix)
-        try:
-            extent = self._header_extent(header) if header is not None else [0.0, 1.0, 1.0, 0.0]
-        except Exception:
-            extent = [0.0, 1.0, 1.0, 0.0]
-        x0, x1, y1, y0 = extent
-        xspan = x1 - x0
-        yspan = y1 - y0
-        if xspan <= 0 or yspan <= 0:
-            # try to map using spectroscopy cloud extents if available
-            fallback = self._map_spec_by_spec_extent(file_key, spec, xpix, ypix)
-            if fallback is not None:
-                col, row = fallback
-                return self._apply_thumb_crop_to_coords(col, row, xpix, ypix, thumb_crop)
-            grid_fallback = self._map_spec_by_grid(spec, xpix, ypix)
-            if grid_fallback is not None:
-                col, row = grid_fallback
-                return self._apply_thumb_crop_to_coords(col, row, xpix, ypix, thumb_crop)
-            return None
-        cx = 0.5 * (x0 + x1)
-        cy = 0.5 * (y0 + y1)
-        dx_norm = (x - cx) / xspan
-        dy_norm = (y - cy) / yspan
-        angle_deg = self._header_scan_angle(header)
-        if angle_deg:
-            theta = math.radians(angle_deg)
-            cos_t = math.cos(theta)
-            sin_t = math.sin(theta)
-            u = dx_norm * cos_t + dy_norm * sin_t
-            v = -dx_norm * sin_t + dy_norm * cos_t
-        else:
-            u = dx_norm
-            v = dy_norm
-        frac_x = (u + 0.5)
-        frac_y = (0.5 - v)
-        if not (0.0 <= frac_x <= 1.0 and 0.0 <= frac_y <= 1.0):
-            # try spectroscopy cloud extent before clamping/grid
-            fallback = self._map_spec_by_spec_extent(file_key, spec, xpix, ypix)
-            if fallback is not None:
-                col, row = fallback
-                return self._apply_thumb_crop_to_coords(col, row, xpix, ypix, thumb_crop)
-            grid_pt = self._map_spec_by_grid(spec, xpix, ypix)
-            if grid_pt is not None:
-                col, row = grid_pt
-                return self._apply_thumb_crop_to_coords(col, row, xpix, ypix, thumb_crop)
-            frac_x = min(max(frac_x, 0.0), 1.0)
-            frac_y = min(max(frac_y, 0.0), 1.0)
-        cols = max(1, int(xpix) - 1)
-        rows = max(1, int(ypix) - 1)
-        col = frac_x * cols
-        row = frac_y * rows
-        return self._apply_thumb_crop_to_coords(col, row, xpix, ypix, thumb_crop)
+        """Map a spec's absolute nm position to (col, row) in this image.
 
-    def _apply_thumb_crop_to_coords(self, col, row, xpix, ypix, thumb_crop):
-        if thumb_crop is None:
-            return col, row
-        try:
-            r0 = int(thumb_crop.get("r0"))
-            r1 = int(thumb_crop.get("r1"))
-        except Exception:
-            return col, row
-        if r1 <= r0:
-            return col, row
-        crop_rows = r1 - r0 + 1
-        try:
-            row = float(row) - float(r0)
-        except Exception:
-            return col, row
-        row = min(max(row, 0.0), max(0.0, crop_rows - 1))
-        return col, row
+        The geometry itself lives in the Qt-free
+        ``sxm_viewer.geometry.spec_mapping`` (extracted so it is unit-
+        testable and so the rotation/off-frame rules live in one place -
+        see that module and CLAUDE.md). The viewer supplies only what
+        needs viewer state: the spec-cloud bounding box, passed as a
+        *callable* so it stays lazy - it is used only on fallback paths
+        and computing it eagerly per marker was O(n^2) on large grids.
+        """
+        return spec_mapping.map_spec_to_pixels(
+            spec,
+            spec_mapping.header_extent(header),
+            spec_mapping.header_scan_angle(header),
+            xpix, ypix,
+            thumb_crop=thumb_crop,
+            cloud_bounds=lambda: self._spec_cloud_bounds(file_key, spec),
+        )
 
-    def _map_spec_by_spec_extent(self, file_key, spec, xpix, ypix):
-        """Fallback mapping using the min/max of all specs for this image to keep real-space layout."""
+    def _spec_cloud_bounds(self, file_key, spec):
+        """(xmin, xmax, ymin, ymax) over every spec assigned to an image.
+
+        Cached: rebuilding is an O(len(entries)) scan called once per spec
+        whenever the header extent is degenerate (routine for grid files),
+        so uncached it is O(n^2) in the grid's point count - measured 5-9+
+        seconds opening a real 2400-point .3ds grid. `entries` is a list
+        owned by spectros_by_image that gets replaced wholesale (not
+        appended to) on every rescan, so identity + length is a cheap,
+        correct staleness check.
+        """
         if not file_key:
             file_key = spec.get('image_key')
         if not file_key:
             return None
-        entries = self.spectros_by_image.get(str(file_key), [])
+        key = str(file_key)
+        entries = self.spectros_by_image.get(key, [])
+        cache = getattr(self, '_spec_extent_cache', None)
+        if cache is None:
+            cache = {}
+            self._spec_extent_cache = cache
+        cached = cache.get(key)
+        if cached is not None and cached[0] is entries and cached[1] == len(entries):
+            return cached[2]
         xs = [s.get('x') for s in entries if s.get('x') is not None]
         ys = [s.get('y') for s in entries if s.get('y') is not None]
         if not xs or not ys:
             return None
         try:
-            xmin, xmax = float(min(xs)), float(max(xs))
-            ymin, ymax = float(min(ys)), float(max(ys))
-        except Exception:
+            bounds = (float(min(xs)), float(max(xs)),
+                      float(min(ys)), float(max(ys)))
+        except (TypeError, ValueError):
             return None
-        # pad spans to avoid zero division
-        span_x = xmax - xmin
-        span_y = ymax - ymin
-        if span_x == 0 or span_y == 0:
-            span_x = span_x or 1.0
-            span_y = span_y or 1.0
-        try:
-            x = float(spec.get('x')); y = float(spec.get('y'))
-        except Exception:
-            return None
-        frac_x = (x - xmin) / span_x
-        frac_y = (ymax - y) / span_y
-        frac_x = min(max(frac_x, 0.0), 1.0)
-        frac_y = min(max(frac_y, 0.0), 1.0)
-        col = frac_x * max(1, xpix - 1)
-        row = frac_y * max(1, ypix - 1)
-        return col, row
-
-    def _map_spec_by_grid(self, spec, xpix, ypix):
-        grid_cols = spec.get('grid_cols')
-        grid_rows = spec.get('grid_rows')
-        if not grid_cols or not grid_rows:
-            return None
-        try:
-            col_idx = int(spec.get('grid_col', 0))
-            row_idx = int(spec.get('grid_row', 0))
-        except Exception:
-            return None
-        cols = max(1, int(grid_cols) - 1)
-        rows = max(1, int(grid_rows) - 1)
-        if grid_cols <= 0 or grid_rows <= 0:
-            return None
-        col_frac = col_idx / cols if cols > 0 else 0.0
-        row_frac = row_idx / rows if rows > 0 else 0.0
-        col = col_frac * max(1, xpix - 1)
-        row = row_frac * max(1, ypix - 1)
-        return col, row
+        cache[key] = (entries, len(entries), bounds)
+        return bounds
 
     def _fallback_spec_coords(self, idx, xpix, ypix):
-        """Fallback placement for specs lacking coordinates: spread markers on a 3x3 grid."""
-        slots = [
-            (0.15, 0.15), (0.50, 0.15), (0.85, 0.15),
-            (0.15, 0.50), (0.50, 0.50), (0.85, 0.50),
-            (0.15, 0.85), (0.50, 0.85), (0.85, 0.85),
-        ]
-        frac_x, frac_y = slots[(idx - 1) % len(slots)]
-        col = frac_x * max(1, xpix - 1)
-        row = frac_y * max(1, ypix - 1)
-        return col, row
+        return spec_mapping.fallback_spec_coords(idx, xpix, ypix)
 
     def _render_spectroscopy_overlays(
         self,
@@ -8155,17 +8664,6 @@ QLabel:hover {{
             return controller.handle_navigation(key, modifiers=modifiers)
         return False
 
-    def _activate_thumbnail_by_index(self, index):
-        controller = getattr(self, "thumbnail_controller", None)
-        if controller:
-            return controller.activate_thumbnail_by_index(index)
-        return False
-
-    def _focus_first_matrix_dataset(self):
-        controller = getattr(self, "thumbnail_controller", None)
-        if controller:
-            return controller.focus_first_matrix_dataset()
-
     def _update_matrix_summary_banner(self):
         controller = getattr(self, "thumbnail_controller", None)
         if controller:
@@ -8185,6 +8683,7 @@ QLabel:hover {{
         x, y = coords
         file_key = str(label_widget.property("file_path"))
         hit_info = None
+        best_area = None
         fallback = None
         best_d2 = None
         tol_px = 14.0
@@ -8194,8 +8693,17 @@ QLabel:hover {{
             if rect is None:
                 continue
             if rect.contains(x, y):
-                hit_info = info
-                break
+                # Rects can overlap - a Z-stack icon or single-point marker
+                # is drawn on top of a much larger matrix/group footprint
+                # rect. Prefer the smallest (most specific) rect under the
+                # cursor instead of whichever marker happens to come first
+                # in list order, or the footprint always wins and whatever
+                # is drawn on top of it is never individually clickable.
+                area = max(0.0, rect.width()) * max(0.0, rect.height())
+                if best_area is None or area < best_area:
+                    best_area = area
+                    hit_info = info
+                continue
             center = rect.center()
             try:
                 dx = float(x - center.x())
@@ -8213,6 +8721,13 @@ QLabel:hover {{
         if hit_info.get('label') == 'badge':
             self._open_spectro_summary_for_file(file_key)
             return True
+        # Note: the 'stack-badge' (Z-stack icon) marker deliberately falls
+        # through to the same generic activation path as clicking the point
+        # marker below it - both used to lead to different dialogs (site
+        # summary browser vs. Z-series comparison plot), which was
+        # confusing since they represent the same site. _handle_activation
+        # already opens the Z-series comparison popup for any spec with
+        # xy_stack_count > 1, so a plain marker/kind lookup handles it.
         mods = QtCore.Qt.NoModifier
         if event is not None:
             try:
@@ -8240,66 +8755,74 @@ QLabel:hover {{
             QtWidgets.QToolTip.hideText()
             return False
         x, y = coords
+        hit_info = None
+        best_area = None
         for info in markers:
             rect = info.get('rect')
-            if rect and rect.contains(x, y):
-                if info.get('label') == 'badge':
-                    QtWidgets.QToolTip.showText(label_widget.mapToGlobal(event.pos()), "Spectroscopy summary")
-                    return True
-                spec = info.get('spec') or {}
-                tooltip = info.get('tooltip')
-                if not tooltip:
-                    tooltip = Path(spec.get('path', '')).name
-                    idx = spec.get('matrix_index')
-                    if idx is not None:
-                        tooltip = f"{tooltip} [{idx}]"
-                    xs = spec.get('x'); ys = spec.get('y')
-                    if xs is not None and ys is not None:
-                        tooltip = f"{tooltip}\n({xs:.1f}, {ys:.1f}) nm"
-                    stack_summary = str(spec.get("xy_stack_summary") or "").strip()
-                    if stack_summary:
-                        tooltip = f"{tooltip}\n{stack_summary}"
-                QtWidgets.QToolTip.showText(label_widget.mapToGlobal(event.pos()), tooltip)
+            if not rect or not rect.contains(x, y):
+                continue
+            # Same precedence as clicks (_handle_spec_marker_click): prefer
+            # the smallest (most specific) rect under the cursor so hovering
+            # a marker drawn on top of a footprint shows that marker's
+            # tooltip, not the footprint's.
+            area = max(0.0, rect.width()) * max(0.0, rect.height())
+            if best_area is None or area < best_area:
+                best_area = area
+                hit_info = info
+        if hit_info is not None:
+            if hit_info.get('label') == 'badge':
+                file_key = str(label_widget.property("file_path") or "")
+                entries = list((getattr(self, "spectros_by_image", {}) or {}).get(file_key, []) or [])
+                site_count = len(list((getattr(self, "spectro_sites_by_image", {}) or {}).get(file_key, []) or []))
+                single_count = sum(1 for entry in entries if entry.get("matrix_index") is None)
+                matrix_count = sum(1 for entry in entries if entry.get("matrix_index") is not None)
+                text = (
+                    f"Spectroscopy summary\n"
+                    f"{len(entries)} spectra | {site_count} position" + ("" if site_count == 1 else "s") + "\n"
+                    f"Single {single_count} | Grid {matrix_count}"
+                )
+                QtWidgets.QToolTip.showText(label_widget.mapToGlobal(event.pos()), text)
                 return True
+            if hit_info.get('label') == 'stack-badge':
+                spec = hit_info.get('spec') or {}
+                site_summary = str(spec.get("site_summary") or spec.get("xy_stack_summary") or "Position summary").strip()
+                QtWidgets.QToolTip.showText(label_widget.mapToGlobal(event.pos()), site_summary)
+                return True
+            spec = hit_info.get('spec') or {}
+            tooltip = hit_info.get('tooltip')
+            if not tooltip:
+                tooltip = Path(spec.get('path', '')).name
+                idx = spec.get('matrix_index')
+                if idx is not None:
+                    tooltip = f"{tooltip} [{idx}]"
+                xs = spec.get('x'); ys = spec.get('y')
+                if xs is not None and ys is not None:
+                    tooltip = f"{tooltip}\n({xs:.1f}, {ys:.1f}) nm"
+                stack_summary = str(spec.get("xy_stack_summary") or "").strip()
+                if stack_summary:
+                    tooltip = f"{tooltip}\n{stack_summary}"
+                site_display = str(spec.get("site_display") or "").strip()
+                if site_display:
+                    tooltip = f"{tooltip}\n{site_display}"
+                assignment_summary = str(spec.get("assignment_summary") or "").strip()
+                assignment_conf = str(spec.get("assignment_confidence") or "").strip()
+                if assignment_summary:
+                    if assignment_conf:
+                        tooltip = f"{tooltip}\nAssignment: {assignment_summary} ({assignment_conf})"
+                    else:
+                        tooltip = f"{tooltip}\nAssignment: {assignment_summary}"
+            QtWidgets.QToolTip.showText(label_widget.mapToGlobal(event.pos()), tooltip)
+            return True
         QtWidgets.QToolTip.hideText()
         return False
 
-    def _open_spectroscopy_popup(self, spec):
+    def _open_spectroscopy_popup(self, spec, initial_color=None):
         controller = getattr(self, "spectro_compare_controller", None)
         if controller:
-            return controller.open_single_popup(spec)
+            return controller.open_single_popup(spec, initial_color=initial_color)
         if not self._spectros_loaded:
             self.ensure_spectros_loaded(refresh=False)
-        return spectro_popups._open_spectroscopy_popup(self, spec)
-
-    def _ensure_single_spectro_popup(self, spec):
-        controller = getattr(self, "spectro_compare_controller", None)
-        if controller:
-            return controller.ensure_single_popup(spec)
-        if not spec:
-            return None
-        key = self._spec_identity_key(spec)
-        if key and getattr(self, "_spectro_popups", None):
-            for dlg in list(self._spectro_popups):
-                dlg_spec = getattr(dlg, "spec", None)
-                if dlg_spec and self._spec_identity_key(dlg_spec) == key:
-                    try:
-                        dlg.raise_()
-                        dlg.activateWindow()
-                    except Exception:
-                        pass
-                    return dlg
-        return self._open_spectroscopy_popup(spec)
-
-    def _append_spec_to_single_popup(self, spec):
-        controller = getattr(self, "spectro_compare_controller", None)
-        if controller:
-            return controller.append_spec_to_single_popup(spec)
-
-    def _prime_multi_selection_anchor(self, current_spec):
-        controller = getattr(self, "spectro_compare_controller", None)
-        if controller:
-            return controller.prime_multi_selection_anchor(current_spec)
+        return spectro_popups._open_spectroscopy_popup(self, spec, initial_color=initial_color)
 
     def _highlight_spectrum_entry(self, spec):
         if not getattr(self, "spectro_highlight_glow", True):
@@ -8374,15 +8897,55 @@ QLabel:hover {{
         # If user has a multi-selection, operate on all of them (plus the clicked one)
         targets = sorted(set(self.thumb_multi_select or []) | {fp})
         menu = QtWidgets.QMenu(self)
-        sub = menu.addMenu("Apply filter")
+        all_starred = all(str(p) in self.starred for p in targets)
+        star_label = "Remove star  (S)" if all_starred else "★ Star  (S)"
+        if len(targets) > 1:
+            star_label = ("Remove star" if all_starred else "★ Star") + f" ({len(targets)} selected)  (S)"
+        star_act = QtWidgets.QAction(star_label, menu)
+        star_act.setToolTip("Mark as favourite - S toggles the star on the selected thumbnails; view only starred images with Ctrl+Alt+F or Display → Show only → Starred")
+        star_act.triggered.connect(lambda _, paths=list(targets): self.toggle_star_for_paths(paths))
+        menu.addAction(star_act)
+        menu.addSeparator()
+        # Compare all point spectra assigned to the clicked image - mirrors the
+        # preview canvas' Analysis action so it's reachable from the grid too
+        # (matrix/grid points are excluded; those belong in the Grid Map).
+        try:
+            image_specs = self.spectro_compare_controller.all_specs_for_image(fp)
+        except Exception:
+            image_specs = []
+        if len(image_specs) >= 2:
+            compare_all_specs_act = QtWidgets.QAction(
+                f"Compare All Spectra on This Image ({len(image_specs)})...", menu)
+            compare_all_specs_act.setToolTip(
+                "Open every point spectrum assigned to this image together in a comparison window")
+            compare_all_specs_act.triggered.connect(
+                lambda _, key=fp: self.spectro_compare_controller.open_all_specs_popup(key))
+            menu.addAction(compare_all_specs_act)
+            menu.addSeparator()
+        current_thumb_steps = self._thumbnail_filter_steps(fp)
+        current_thumb_summary = self._filter_pipeline_label_from_steps(current_thumb_steps)
+        sub = menu.addMenu("Filters")
+        if current_thumb_summary:
+            status_act = QtWidgets.QAction(f"Current: {current_thumb_summary}", menu)
+            status_act.setEnabled(False)
+            sub.addAction(status_act)
+            sub.addSeparator()
         for key, info in FILTER_DEFINITIONS.items():
-            act = QtWidgets.QAction(self._filter_action_label(key), menu)
+            if info.get('requires_dialog'):
+                # Needs a per-image review dialog (e.g. periodic-noise removal
+                # - which peaks to remove is specific to one image's own
+                # spectrum) - doesn't make sense as a blind batch action, so
+                # it's left out of this multi-file quick-menu entirely.
+                continue
+            prefix = "Add step: " if current_thumb_steps else ""
+            act = QtWidgets.QAction(f"{prefix}{self._filter_action_label(key)}", menu)
             if info.get('needs_gaussian') and not _gaussian_available():
                 act.setEnabled(False)
                 act.setToolTip("Requires scipy or OpenCV.")
             act.triggered.connect(lambda _, k=key, paths=list(targets), focus=fp: self._apply_filter_to_paths(paths, k, focus_path=focus))
             sub.addAction(act)
-        custom_act = QtWidgets.QAction("Custom pipeline...", menu)
+        custom_label = "Edit custom pipeline..." if current_thumb_steps else "Custom pipeline..."
+        custom_act = QtWidgets.QAction(custom_label, menu)
         custom_act.triggered.connect(lambda _, paths=list(targets), focus=fp: self._open_custom_filter_dialog(paths, focus))
         sub.addAction(custom_act)
         clear_one = QtWidgets.QAction("Clear filter", menu)
@@ -8392,6 +8955,29 @@ QLabel:hover {{
             clear_sel = QtWidgets.QAction("Clear filter (selected)", menu)
             clear_sel.triggered.connect(lambda _, paths=list(targets): self._clear_filter_for_paths(paths))
             menu.addAction(clear_sel)
+        has_adjust = False
+        try:
+            ch_for_menu = int(self.channel_dropdown.currentIndex())
+            has_adjust = any(bool(self._get_adjust_spec(p, ch_for_menu)) for p in targets)
+        except Exception:
+            has_adjust = False
+        if has_adjust:
+            reset_adjust_act = QtWidgets.QAction("Reset display adjustments", menu)
+            reset_adjust_act.setToolTip(
+                "Clear the clip/gamma display adjustments from Image > Crop/Rotate (Ctrl+Z restores)")
+
+            def _reset_targets(_=False, paths=list(targets), ch=None):
+                ch = int(self.channel_dropdown.currentIndex()) if ch is None else ch
+                for p in paths:
+                    old = self._get_adjust_spec(p, ch)
+                    if not old:
+                        continue
+                    self._adjustment_undo_stack.append(("tone", str(p), int(ch), dict(old)))
+                    self._set_adjust_spec(p, ch, None)
+                    self._refresh_adjusted_channel(p, ch)
+
+            reset_adjust_act.triggered.connect(_reset_targets)
+            menu.addAction(reset_adjust_act)
         menu.addSeparator()
         add_source_file_menu(menu, fp, self)
 
@@ -8403,12 +8989,31 @@ QLabel:hover {{
         export_png_act = QtWidgets.QAction("Export PNGs...", menu)
         export_png_act.triggered.connect(self.on_export_pngs)
         menu.addAction(export_png_act)
+        ppt_supported, ppt_reason = powerpoint_support_status()
+        send_ppt_act = QtWidgets.QAction("Send selected to PowerPoint", menu)
+        send_ppt_act.triggered.connect(lambda _, paths=list(targets): self._send_thumbnail_targets_to_powerpoint(paths, new_slide=True))
+        send_current_slide_act = QtWidgets.QAction("Send selected to Current Slide", menu)
+        send_current_slide_act.triggered.connect(lambda _, paths=list(targets): self._send_thumbnail_targets_to_powerpoint(paths, new_slide=False))
+        if not ppt_supported:
+            send_ppt_act.setEnabled(False)
+            send_current_slide_act.setEnabled(False)
+            send_ppt_act.setToolTip(ppt_reason or "")
+            send_current_slide_act.setToolTip(ppt_reason or "")
+        menu.addAction(send_ppt_act)
+        menu.addAction(send_current_slide_act)
         export_xyz_act = QtWidgets.QAction("Export XYZ...", menu)
         export_xyz_act.triggered.connect(self.on_export_xyz_files)
         menu.addAction(export_xyz_act)
         export_stp_act = QtWidgets.QAction("Export WSxM STP...", menu)
         export_stp_act.triggered.connect(self.on_export_stp_files)
         menu.addAction(export_stp_act)
+        report_act = QtWidgets.QAction("Generate folder report (PDF)...", menu)
+        report_act.setToolTip("One-click PDF overview of this folder: session map, "
+                              "images with their spectroscopy positions and curves, "
+                              "grid maps with curve-shape clustering, and a "
+                              "needs-attention appendix.")
+        report_act.triggered.connect(self.report_controller.generate_folder_report)
+        menu.addAction(report_act)
         adjust_act = QtWidgets.QAction("Adjust image...", menu)
         adjust_act.triggered.connect(self.on_adjust_image)
         menu.addAction(adjust_act)
@@ -8425,10 +9030,7 @@ QLabel:hover {{
         if virtual_targets:
             virt_menu.addSeparator()
             cmap_menu = virt_menu.addMenu("Colormap")
-            try:
-                cmap_names = sorted(colormaps.keys())
-            except Exception:
-                cmap_names = ['viridis','plasma','inferno','magma','cividis','gray','hot','coolwarm','turbo']
+            cmap_names = cmap_registry.all_cmap_names()
             featured = []
             for name in ["viridis", "cividis", "Blues_r", "gray", "inferno", "magma", "plasma", "coolwarm", "turbo"]:
                 if name in cmap_names and name not in featured:
@@ -8474,40 +9076,63 @@ QLabel:hover {{
 
         menu.addSeparator()
         collection_menu = menu.addMenu("Collections")
-        show_tray_act = QtWidgets.QAction("Show collection tray", collection_menu)
+        show_tray_act = QtWidgets.QAction("Show Collection Tray", collection_menu)
         show_tray_act.triggered.connect(self.on_show_collection_tray)
         collection_menu.addAction(show_tray_act)
-        add_selected_collection_act = QtWidgets.QAction("Add selected thumbnails to collection", collection_menu)
+        selected_count = len([p for p in targets if p])
+        add_label = (
+            f"Add Selected Thumbnails ({selected_count})..." if selected_count > 1
+            else "Add Selected Thumbnail..." if selected_count == 1
+            else "Add Selected Thumbnails..."
+        )
+        add_selected_collection_act = QtWidgets.QAction(add_label, collection_menu)
+        add_selected_collection_act.setEnabled(selected_count > 0)
         add_selected_collection_act.triggered.connect(self.on_add_selected_thumbnails_to_collection)
         collection_menu.addAction(add_selected_collection_act)
-        remove_selected_collection_act = QtWidgets.QAction("Remove selected thumbnails from collection", collection_menu)
+        add_label_to = (
+            f"Add Selected Thumbnails ({selected_count}) to..." if selected_count > 1
+            else "Add Selected Thumbnail to..." if selected_count == 1
+            else "Add Selected Thumbnails to..."
+        )
+        add_selected_collection_to_act = QtWidgets.QAction(add_label_to, collection_menu)
+        add_selected_collection_to_act.setEnabled(selected_count > 0)
+        add_selected_collection_to_act.setToolTip(
+            "Route the selected thumbnail(s) to a collection you pick now - does not change your "
+            "current collection target."
+            if selected_count > 0 else "Select one or more thumbnails first, then use this action."
+        )
+        add_selected_collection_to_act.triggered.connect(self.on_add_selected_thumbnails_to_collection_picker)
+        collection_menu.addAction(add_selected_collection_to_act)
+        remove_selected_collection_act = QtWidgets.QAction("Remove Selected Thumbnails from Collection", collection_menu)
         remove_selected_collection_act.triggered.connect(
             lambda: self.collection_controller.remove_thumbnail_entries(
                 [{"file_path": str(path), "channel_index": int(self.channel_dropdown.currentIndex() or 0)} for path in targets if path]
             )
         )
-        remove_selected_collection_act.setEnabled(bool(getattr(self, "_collection_source", None)))
+        remove_selected_collection_act.setEnabled(bool(getattr(self, "_collection_source", None)) and selected_count > 0)
         collection_menu.addAction(remove_selected_collection_act)
-        choose_collection_act = QtWidgets.QAction("Choose current collection...", collection_menu)
-        choose_collection_act.triggered.connect(self.on_choose_current_collection)
-        collection_menu.addAction(choose_collection_act)
-        open_collection_act = QtWidgets.QAction("Open collection...", collection_menu)
-        open_collection_act.triggered.connect(self.on_open_collection)
+        create_collection_act = QtWidgets.QAction("Create a Collection...", collection_menu)
+        create_collection_act.triggered.connect(self.on_create_collection)
+        collection_menu.addAction(create_collection_act)
+        open_collection_act = QtWidgets.QAction("Open a Collection...", collection_menu)
+        open_collection_act.triggered.connect(self.on_browse_collections)
         collection_menu.addAction(open_collection_act)
-        clear_target_act = QtWidgets.QAction("Clear current collection target", collection_menu)
+        clear_target_act = QtWidgets.QAction("Clear Current Collection Target", collection_menu)
         clear_target_act.triggered.connect(self.on_clear_current_collection)
         collection_menu.addAction(clear_target_act)
-        if not getattr(self, "_collection_source", None):
+        if selected_count == 0:
+            add_selected_collection_act.setToolTip("Select one or more thumbnails first, then use this action.")
+        elif not getattr(self, "_collection_source", None):
             add_selected_collection_act.setToolTip(
                 "Choose or open a collection first, or use this action to create one when prompted."
             )
 
         menu.addSeparator()
         drift_act = QtWidgets.QAction("Drift-correct and export...", menu)
-        drift_act.triggered.connect(lambda _, paths=list(targets): self._on_drift_correct(paths))
+        drift_act.triggered.connect(lambda _, paths=list(targets): drift_animation.on_drift_correct(self, paths))
         menu.addAction(drift_act)
         anim_act = QtWidgets.QAction("Create animation from selection...", menu)
-        anim_act.triggered.connect(lambda _, paths=list(targets): self._on_create_animation(paths))
+        anim_act.triggered.connect(lambda _, paths=list(targets): drift_animation.on_create_animation(self, paths))
         menu.addAction(anim_act)
 
         menu.exec_(label_widget.mapToGlobal(pos))
@@ -8523,9 +9148,24 @@ QLabel:hover {{
         open_act = QtWidgets.QAction("Open spectroscopy", menu)
         open_act.triggered.connect(lambda: self._open_spectroscopy_popup(spec))
         menu.addAction(open_act)
+        site_act = QtWidgets.QAction("Open position summary", menu)
+        site_act.triggered.connect(lambda: self._open_spectro_summary_for_site(spec, file_key=str(spec.get("image_key") or spec.get("primary_image_key") or ""), quiet=True))
+        menu.addAction(site_act)
+        compare_site_act = QtWidgets.QAction("Compare spectra at this position", menu)
+        compare_site_act.triggered.connect(lambda: self.spectro_compare_controller.open_site_popup(spec, file_key=str(spec.get("image_key") or spec.get("primary_image_key") or "")))
+        menu.addAction(compare_site_act)
         details_act = QtWidgets.QAction("Show metadata in Details", menu)
         details_act.triggered.connect(lambda: self.show_spectroscopy_details(spec))
         menu.addAction(details_act)
+        current_image_key = self._current_spectro_assignment_target_image_key()
+        if current_image_key:
+            assign_act = QtWidgets.QAction(f"Assign to current image ({Path(current_image_key).name})", menu)
+            assign_act.triggered.connect(lambda: self._apply_spectro_assignment_override([spec], current_image_key))
+            menu.addAction(assign_act)
+        clear_assign_act = QtWidgets.QAction("Clear manual assignment", menu)
+        clear_assign_act.setEnabled(bool(str(spec.get("assignment_override_image_key") or "").strip()))
+        clear_assign_act.triggered.connect(lambda: self._clear_spectro_assignment_override([spec]))
+        menu.addAction(clear_assign_act)
         add_source_file_menu(menu, spec.get("path"), self)
 
         channels = list((spec.get("channels") or {}).keys())
@@ -8556,90 +9196,13 @@ QLabel:hover {{
         menu.exec_(label_widget.mapToGlobal(pos))
 
     def _apply_filter_to_paths(self, paths, filter_key=None, pipeline=None, label=None, focus_path=None):
-        if not paths:
-            return
-        if len(paths) > 12:
-            ret = QtWidgets.QMessageBox.question(self, "Filters", f"Apply filter to {len(paths)} images? This may use significant memory.",
-                                                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
-            if ret != QtWidgets.QMessageBox.Yes:
-                return
-        if filter_key and FILTER_DEFINITIONS.get(filter_key, {}).get('needs_gaussian') and not _gaussian_available():
-            QtWidgets.QMessageBox.warning(self, "Filters", "Gaussian filters require scipy or OpenCV.")
-            return
-        if pipeline is None:
-            base_arr, preview_callback, original_views, preview_target, preview_cmap_name, preview_clim = self._filter_preview_context_for_path(focus_path)
-            step, spec_label = self._single_filter_step_spec(
-                filter_key,
-                parent=self,
-                base_image=base_arr,
-                preview_callback=preview_callback,
-                preview_target_text=preview_target,
-                preview_cmap_name=preview_cmap_name,
-                preview_clim=preview_clim,
-            )
-            if original_views is not None:
-                self._restore_filter_views_on_canvas(self.preview_canvas, original_views)
-            if step is None:
-                return
-            spec_steps = [step]
-        else:
-            spec_steps = pipeline
-            spec_label = label or 'Custom'
-        path_keys = {str(Path(p)) for p in paths}
-        for key in path_keys:
-            steps_copy = [dict(step) for step in spec_steps]
-            self.thumbnail_filters[key] = {'steps': steps_copy, 'label': spec_label}
-        self._invalidate_thumbnail_cache(path_keys)
-        self._invalidate_filtered_cache(path_keys)
-        self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
-        if self.last_preview and str(self.last_preview[0]) in path_keys:
-            self.show_file_channel(self.last_preview[0], self.last_preview[1])
+        return self.filter_controller._apply_filter_to_paths(paths, filter_key=filter_key, pipeline=pipeline, label=label, focus_path=focus_path)
 
     def _clear_filter_for_paths(self, paths):
-        changed = False
-        path_keys = {str(Path(p)) for p in paths}
-        for key in path_keys:
-            if self.thumbnail_filters.pop(key, None) is not None:
-                changed = True
-        if changed:
-            self._invalidate_thumbnail_cache(path_keys)
-            self._invalidate_filtered_cache(path_keys)
-            # Clear stored clim overrides for affected files so that
-            # _resolve_preview_clim falls back to _auto_preview_clim
-            # instead of returning a clim that was computed for the
-            # now-removed filter.
-            clim_map = getattr(self, "per_file_channel_clim", None) or {}
-            for clim_key in list(clim_map.keys()):
-                try:
-                    file_key = str(clim_key[0]) if isinstance(clim_key, tuple) else ""
-                except Exception:
-                    continue
-                if file_key in path_keys:
-                    clim_map.pop(clim_key, None)
-            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
-            if self.last_preview and str(self.last_preview[0]) in path_keys:
-                self.show_file_channel(self.last_preview[0], self.last_preview[1])
+        return self.filter_controller._clear_filter_for_paths(paths)
 
     def _open_custom_filter_dialog(self, paths, focus_path):
-        base_arr, preview_callback, original_views, preview_target, preview_cmap_name, preview_clim = self._filter_preview_context_for_path(focus_path)
-        dlg = CustomFilterDialog(
-            self,
-            base_arr,
-            self._run_filter_step,
-            preview_callback=preview_callback,
-            preview_target_text=preview_target,
-            preview_cmap_name=preview_cmap_name,
-            preview_clim=preview_clim,
-        )
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            pipeline = dlg.pipeline_steps()
-            if pipeline:
-                if original_views is not None:
-                    self._restore_filter_views_on_canvas(self.preview_canvas, original_views)
-                self._apply_filter_to_paths(paths, pipeline=pipeline, label=dlg.pipeline_label())
-                return
-        if original_views is not None:
-            self._restore_filter_views_on_canvas(self.preview_canvas, original_views)
+        return self.filter_controller._open_custom_filter_dialog(paths, focus_path)
 
     def _toggle_thumb_multi_selection(self, file_path):
         return viewer_thumb_ui._toggle_thumb_multi_selection(self, file_path)
@@ -8690,887 +9253,21 @@ QLabel:hover {{
         if controller:
             return controller.clear_multi_spec_selection()
 
-    def _on_drift_correct(self, paths):
-        if not paths:
-            return
-        try:
-            from scipy import ndimage  # type: ignore
-        except Exception:
-            QtWidgets.QMessageBox.warning(self, "Drift correction", "scipy is required for alignment interpolation.")
-            return
-        # Prefer skimage phase_cross_correlation; fall back to OpenCV ECC; else zeros
-        try:
-            from skimage.registration import phase_cross_correlation  # type: ignore
-        except Exception:
-            phase_cross_correlation = None  # type: ignore
-        try:
-            import cv2  # type: ignore
-            has_cv = True
-        except Exception:
-            has_cv = False
-        channel_idx = self.channel_dropdown.currentIndex()
-        images = []
-        names_full = []
-        names_display = []
-        missing = 0
-        # Preserve user selection order while dropping duplicates
-        seen = set()
-        ordered_paths = []
-        for p in paths:
-            ps = str(Path(p))
-            if ps in seen:
-                continue
-            seen.add(ps)
-            ordered_paths.append(ps)
-        for p in ordered_paths:
-            try:
-                header, fds = self.headers.get(p, (None, None))
-                if header is None or fds is None:
-                    header, fds = parse_header(Path(p))
-                if not fds:
-                    continue
-                # Prefer current channel, but fall back to any available channel with data
-                indices = [channel_idx] + [i for i in range(len(fds)) if i != channel_idx]
-                arr = None
-                for idx in indices:
-                    if idx < 0 or idx >= len(fds):
-                        continue
-                    try:
-                        arr = self._get_channel_array(p, idx, header, fds[idx])
-                    except Exception:
-                        arr = None
-                    if arr is not None:
-                        break
-                if arr is None:
-                    missing += 1
-                    continue
-                names_full.append(str(p))
-                names_display.append(Path(p).stem)
-                images.append(np.array(arr, dtype=float))
-            except Exception:
-                missing += 1
-                continue
-        if len(images) < 2:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Drift correction",
-                f"Need at least two images to align.\nLoaded: {len(images)} / Selected: {len(set(paths))}\n"
-                f"Skipped/missing: {missing}",
-            )
-            return
-        # Align relative to the first frame
-        ref_idx = 0
-        reference = images[ref_idx]
-        shifts = np.zeros((len(images), 2), dtype=float)
-        ref_gray = reference.astype(np.float32)
-        ref_gray = (ref_gray - ref_gray.min()) / max(ref_gray.max() - ref_gray.min(), 1e-6)
-        # apply a Hann window to reduce edge effects
-        try:
-            win_y = np.hanning(ref_gray.shape[0])
-            win_x = np.hanning(ref_gray.shape[1])
-            window = np.sqrt(np.outer(win_y, win_x))
-            ref_gray *= window
-        except Exception:
-            pass
-        for i, img in enumerate(images):
-            if i == ref_idx:
-                continue
-            target = img.astype(np.float32)
-            target = (target - target.min()) / max(target.max() - target.min(), 1e-6)
-            try:
-                target *= window
-            except Exception:
-                pass
-            try:
-                if phase_cross_correlation is not None:
-                    shift, _, _ = phase_cross_correlation(ref_gray, target, upsample_factor=20, normalization="phase")
-                    shifts[i] = [float(shift[0]), float(shift[1])]  # dy, dx mapping target -> ref
-                elif has_cv:
-                    import cv2  # type: ignore
-                    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
-                    warp_matrix = np.eye(2, 3, dtype=np.float32)
-                    _, warp_matrix = cv2.findTransformECC(ref_gray, target, warp_matrix, cv2.MOTION_TRANSLATION, criteria)
-                    shifts[i] = [warp_matrix[1, 2], warp_matrix[0, 2]]  # dy, dx that map target -> ref
-                else:
-                    shifts[i] = [0.0, 0.0]
-            except Exception:
-                shifts[i] = [0.0, 0.0]
-        
-        H, W = images[0].shape[:2]
-        
-        # Calculate the intersection crop region after alignment
-        # After shifting image i by (dy, dx), its valid region is constrained
-        top = int(np.ceil(max(0, np.max(shifts[:, 0]))))
-        bottom = int(np.floor(min(H, H + np.min(shifts[:, 0]))))
-        left = int(np.ceil(max(0, np.max(shifts[:, 1]))))
-        right = int(np.floor(min(W, W + np.min(shifts[:, 1]))))
-        
-        # Ensure valid bounds
-        top = max(0, min(top, H - 1))
-        left = max(0, min(left, W - 1))
-        bottom = max(top + 1, min(bottom, H))
-        right = max(left + 1, min(right, W))
-        
-        # REMOVED: Square enforcement logic that was causing severe overcropping
-        # The intersection crop is sufficient - no need to force square dimensions
-        
-        aligned = []
-        for img, shift in zip(images, shifts):
-            dy, dx = shift
-            try:
-                # FIXED: Apply shift directly (removed negation)
-                warped = ndimage.shift(img, [dy, dx], order=3, mode="reflect", cval=0.0)
-            except Exception:
-                warped = img
-            aligned.append(warped[top:bottom, left:right])
-        
-        self._show_alignment_preview(names_display, aligned, shifts, channel_idx, names_full, crop_bounds=(top, bottom, left, right))
-
-    def _on_create_animation(self, paths):
-        if not paths:
-            return
-        try:
-            import imageio.v3 as iio  # type: ignore
-        except Exception:
-            QtWidgets.QMessageBox.warning(self, "Animation", "imageio is required to create GIF/MP4 animations.")
-            return
-
-        def _resize_frame(arr: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-            if arr.shape[0] == target_h and arr.shape[1] == target_w:
-                return arr
-            # Prefer Pillow if available
-            try:
-                from PIL import Image
-                mode = "L" if arr.ndim == 2 else "RGB"
-                im = Image.fromarray(arr, mode=mode if mode else None)
-                im = im.resize((target_w, target_h), Image.BILINEAR)
-                return np.array(im)
-            except Exception:
-                pass
-            # Fallback to scipy if present
-            try:
-                from scipy import ndimage as _ndi  # type: ignore
-                zoom = (target_h / arr.shape[0], target_w / arr.shape[1]) + (() if arr.ndim == 2 else (1,))
-                return _ndi.zoom(arr, zoom, order=1)
-            except Exception:
-                pass
-            # Last resort: nearest-neighbor using numpy repeat
-            y_idx = np.linspace(0, arr.shape[0] - 1, target_h).astype(int)
-            x_idx = np.linspace(0, arr.shape[1] - 1, target_w).astype(int)
-            if arr.ndim == 2:
-                return arr[np.ix_(y_idx, x_idx)]
-            else:
-                return arr[np.ix_(y_idx, x_idx, np.arange(arr.shape[2]))]
-
-        # Build a rich export dialog with preview and options
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Export animation")
-        dlg.resize(800, 640)
-        vbox = QtWidgets.QVBoxLayout(dlg); vbox.setContentsMargins(10, 10, 10, 10); vbox.setSpacing(8)
-
-        # Gather frames
-        channel_idx = self.channel_dropdown.currentIndex()
-        frames = []
-        missing = 0
-        names = []
-        for p in sorted({str(Path(p)) for p in paths}):
-            try:
-                header, fds = self.headers.get(p, (None, None))
-                if header is None or fds is None:
-                    header, fds = parse_header(Path(p))
-                if not fds:
-                    continue
-                indices = [channel_idx] + [i for i in range(len(fds)) if i != channel_idx]
-                arr = None
-                for idx in indices:
-                    if idx < 0 or idx >= len(fds):
-                        continue
-                    try:
-                        arr = self._get_channel_array(p, idx, header, fds[idx])
-                    except Exception:
-                        arr = None
-                    if arr is not None:
-                        break
-                if arr is None:
-                    missing += 1
-                    continue
-                frames.append(np.array(arr, dtype=float))
-                names.append(Path(p).name)
-            except Exception:
-                missing += 1
-                continue
-        if not frames:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Animation",
-                f"No frames could be loaded. Selected: {len(set(paths))}, skipped: {missing}",
-            )
-            return
-
-        # Controls row
-        controls = QtWidgets.QHBoxLayout(); controls.setSpacing(12)
-        controls.addWidget(QtWidgets.QLabel("Format:"))
-        fmt_combo = QtWidgets.QComboBox(); fmt_combo.addItems(["gif", "mp4", "png-seq"]); controls.addWidget(fmt_combo)
-        controls.addWidget(QtWidgets.QLabel("FPS:"))
-        fps_spin = QtWidgets.QSpinBox(); fps_spin.setRange(1, 60); fps_spin.setValue(6); controls.addWidget(fps_spin)
-        controls.addWidget(QtWidgets.QLabel("Duration (s):"))
-        dur_spin = QtWidgets.QDoubleSpinBox(); dur_spin.setRange(0.1, 120.0); dur_spin.setDecimals(1); dur_spin.setSingleStep(0.5); controls.addWidget(dur_spin)
-        dur_spin.setValue(max(0.1, len(frames) / fps_spin.value()))
-        def _update_duration():
-            dur_spin.setValue(max(0.1, len(frames) / max(1, fps_spin.value())))
-        fps_spin.valueChanged.connect(_update_duration)
-        controls.addStretch(1)
-        vbox.addLayout(controls)
-
-        # Overlay toggles
-        overlay_row = QtWidgets.QHBoxLayout(); overlay_row.setSpacing(12)
-        scale_cb = QtWidgets.QCheckBox("Include scale bar"); scale_cb.setChecked(True)
-        markers_cb = QtWidgets.QCheckBox("Include markers/overlays"); markers_cb.setChecked(True)
-        mol_cb = QtWidgets.QCheckBox("Include molecules"); mol_cb.setChecked(True)
-        overlay_row.addWidget(scale_cb); overlay_row.addWidget(markers_cb); overlay_row.addWidget(mol_cb); overlay_row.addStretch(1)
-        vbox.addLayout(overlay_row)
-
-        # Resolution
-        res_row = QtWidgets.QHBoxLayout(); res_row.setSpacing(12)
-        res_row.addWidget(QtWidgets.QLabel("Resolution:"))
-        res_combo = QtWidgets.QComboBox(); res_combo.addItems(["Auto", "720p", "1080p", "Custom"]); res_row.addWidget(res_combo)
-        w_spin = QtWidgets.QSpinBox(); w_spin.setRange(256, 4096); w_spin.setValue(frames[0].shape[1]); res_row.addWidget(QtWidgets.QLabel("W")); res_row.addWidget(w_spin)
-        h_spin = QtWidgets.QSpinBox(); h_spin.setRange(256, 4096); h_spin.setValue(frames[0].shape[0]); res_row.addWidget(QtWidgets.QLabel("H")); res_row.addWidget(h_spin)
-        def _on_res_change(text):
-            presets = {"720p": (1280, 720), "1080p": (1920, 1080)}
-            if text in presets:
-                w_spin.setValue(presets[text][0]); h_spin.setValue(presets[text][1])
-            elif text == "Auto":
-                w_spin.setValue(frames[0].shape[1]); h_spin.setValue(frames[0].shape[0])
-        res_combo.currentTextChanged.connect(_on_res_change)
-        vbox.addLayout(res_row)
-
-        # Preview canvas
-        prev_label = QtWidgets.QLabel(); prev_label.setAlignment(QtCore.Qt.AlignCenter)
-        prev_label.setMinimumHeight(260)
-        vbox.addWidget(prev_label, 1)
-
-        # Buttons
-        btn_row = QtWidgets.QHBoxLayout(); btn_row.addStretch(1)
-        save_btn = QtWidgets.QPushButton("Save…"); cancel_btn = QtWidgets.QPushButton("Cancel")
-        btn_row.addWidget(save_btn); btn_row.addWidget(cancel_btn)
-        vbox.addLayout(btn_row)
-
-        def _render_frame(arr):
-            # simple normalization for preview
-            a = np.asarray(arr, dtype=float)
-            rng = a.max() - a.min()
-            if rng <= 0:
-                norm = np.zeros_like(a, dtype=np.uint8)
-            else:
-                norm = ((a - a.min()) / rng * 255.0).clip(0, 255).astype(np.uint8)
-            h, w = norm.shape[:2]
-            if norm.ndim == 2:
-                rgb = np.stack([norm]*3, axis=-1)
-            else:
-                rgb = norm
-            qimg = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
-            pm = QtGui.QPixmap.fromImage(qimg.copy())
-            return pm
-
-        def _fit_resize_with_pad(rgb: np.ndarray, tw: int, th: int, fill=255):
-            rgb = np.asarray(rgb)
-            if rgb.ndim == 2:
-                rgb = np.stack([rgb]*3, axis=-1)
-            h, w = rgb.shape[:2]
-            if h == 0 or w == 0:
-                return np.zeros((th, tw, 3), dtype=np.uint8)
-            scale = min(tw / w, th / h)
-            new_w = max(1, int(round(w * scale)))
-            new_h = max(1, int(round(h * scale)))
-            resized = _resize_frame(rgb, new_w, new_h)
-            canvas = np.full((th, tw, 3), fill, dtype=np.uint8)
-            off_x = (tw - new_w) // 2
-            off_y = (th - new_h) // 2
-            canvas[off_y:off_y+new_h, off_x:off_x+new_w, :] = resized if resized.ndim == 3 else np.stack([resized]*3, axis=-1)
-            return canvas
-
-        def _update_preview(idx=0):
-            pm = _render_frame(frames[idx % len(frames)])
-            if not pm.isNull():
-                pm = pm.scaled(prev_label.width(), prev_label.height(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-                prev_label.setPixmap(pm)
-        _update_preview(0)
-
-        # Auto-play preview timer
-        timer = QtCore.QTimer(dlg); timer.setInterval(400)
-        idx_ref = {"i": 0}
-        def _tick():
-            idx_ref["i"] = (idx_ref["i"] + 1) % len(frames)
-            _update_preview(idx_ref["i"])
-        timer.timeout.connect(_tick); timer.start()
-
-        def _save():
-            fmt = fmt_combo.currentText()
-            default_name = f"animation.{ 'gif' if fmt=='gif' else ('mp4' if fmt=='mp4' else 'png') }"
-            filter_str = "GIF (*.gif);;MP4 (*.mp4);;PNG sequence (*.png)"
-            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, "Save animation", default_name, filter_str)
-            if not out_path:
-                return
-            # render each frame via the preview canvas so overlays (scale bar) are honored
-            target_w, target_h = w_spin.value(), h_spin.value()
-            canvas = getattr(self, "preview_canvas", None)
-            orig_last = getattr(self, "last_preview", None)
-            orig_views = list(getattr(canvas, "views", [])) if canvas else []
-            norm_frames = []
-
-            def _render_path(path_str: str):
-                if not canvas:
-                    return None
-                try:
-                    # toggle scale bar; drop molecules/markers for clean export
-                    prev_scale = canvas.scale_bar_enabled
-                    prev_ticks = canvas._show_ticks
-                    prev_mols = list(getattr(canvas, "molecules", []))
-                    canvas.scale_bar_enabled = scale_cb.isChecked()
-                    canvas._show_ticks = prev_ticks  # keep ticks as-is
-                    canvas.molecules = []  # always exclude molecules for animation per requirement
-                    # show file/channel and draw a fresh figure (with scale bar)
-                    self.show_file_channel(path_str, channel_idx)
-                    QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
-                    if not getattr(canvas, "views", None):
-                        return None
-                    view = canvas.views[0]
-                    fig = canvas._render_view_figure(view)
-                    fig.set_dpi(100)
-                    fig.set_size_inches(target_w / 100.0, target_h / 100.0)
-                    fig.canvas.draw()
-                    buf = fig.canvas.buffer_rgba()
-                    if buf is None:
-                        return None
-                    arr = np.asarray(buf)
-                    rgb = arr[:, :, :3].copy()
-                    rgb = _fit_resize_with_pad(rgb, target_w, target_h, fill=255)
-                    try:
-                        import matplotlib.pyplot as _plt  # type: ignore
-                        _plt.close(fig)
-                    except Exception:
-                        pass
-                    # restore
-                    canvas.scale_bar_enabled = prev_scale
-                    canvas._show_ticks = prev_ticks
-                    canvas.molecules = prev_mols
-                    return rgb
-                except Exception:
-                    return None
-
-            for p in sorted({str(Path(p)) for p in paths}):
-                rendered = _render_path(p)
-                if rendered is not None:
-                    norm_frames.append(rendered)
-
-            # fallback to raw frames if rendering failed
-            if not norm_frames:
-                for arr in frames:
-                    a = np.asarray(arr, dtype=float)
-                    rng = a.max() - a.min()
-                    if rng <= 0:
-                        norm = np.zeros_like(a, dtype=np.uint8)
-                    else:
-                        norm = ((a - a.min()) / rng * 255.0).clip(0, 255).astype(np.uint8)
-                    if norm.shape[0] != target_h or norm.shape[1] != target_w:
-                        norm = _resize_frame(norm, target_w, target_h)
-                    norm_frames.append(norm)
-
-            # restore original view
-            try:
-                if orig_last:
-                    self.show_file_channel(orig_last[0], orig_last[1])
-                elif canvas and orig_views:
-                    canvas.views = orig_views
-                    canvas._redraw()
-            except Exception:
-                pass
-            try:
-                if fmt == "gif":
-                    iio.imwrite(out_path, norm_frames, plugin="pillow", loop=0, duration=1000.0 / max(1, fps_spin.value()))
-                elif fmt == "mp4":
-                    iio.imwrite(out_path, norm_frames, plugin="ffmpeg", fps=max(1, fps_spin.value()))
-                else:
-                    stem = Path(out_path).with_suffix("")
-                    for i, fr in enumerate(norm_frames):
-                        iio.imwrite(f"{stem}_{i:03d}.png", fr)
-                QtWidgets.QMessageBox.information(dlg, "Animation", f"Saved animation to {out_path}")
-                dlg.accept()
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(dlg, "Animation", f"Failed to save animation: {exc}")
-
-        save_btn.clicked.connect(_save)
-        cancel_btn.clicked.connect(dlg.reject)
-        dlg.exec_()
-
-    def _show_alignment_preview(self, names, aligned, shifts, channel_idx, source_paths=None, crop_bounds=None):
-        """Preview aligned/cropped images and optionally save outputs/animation."""
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Drift correction preview")
-        dlg.resize(900, 720)
-        layout = QtWidgets.QVBoxLayout(dlg)
-
-        info = QtWidgets.QPlainTextEdit()
-        info.setReadOnly(True)
-        info.setMaximumHeight(140)
-        text_lines = []
-        max_shift = 0.0
-        for name, shift in zip(names, shifts):
-            mag = float(np.hypot(shift[0], shift[1]))
-            max_shift = max(max_shift, mag)
-            text_lines.append(f"{name}: dy={shift[0]:.3f} px, dx={shift[1]:.3f} px | |d|={mag:.3f} px")
-        if crop_bounds:
-            top, bottom, left, right = crop_bounds
-            crop_h = max(0, bottom - top)
-            crop_w = max(0, right - left)
-            text_lines.append(f"\nCrop: top={top}, bottom={bottom}, left={left}, right={right}  -> size={crop_w}x{crop_h}px")
-        text_lines.append(f"Max shift magnitude: {max_shift:.3f} px")
-        info.setPlainText("\n".join(text_lines))
-        layout.addWidget(info)
-
-        # Controls row: cmap + speed slider
-        controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(QtWidgets.QLabel("Colormap:"))
-        cmap_combo = QtWidgets.QComboBox()
-        try:
-            cmap_combo.addItems(sorted(colormaps.keys()))
-        except Exception:
-            cmap_combo.addItems(["gray", "viridis", "plasma", "magma", "cividis"])
-        if hasattr(self, "thumb_cmap"):
-            idx = cmap_combo.findText(self.thumb_cmap)
-            if idx >= 0:
-                cmap_combo.setCurrentIndex(idx)
-        controls.addWidget(cmap_combo)
-        controls.addSpacing(12)
-        controls.addWidget(QtWidgets.QLabel("Speed (fps):"))
-        speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        speed_slider.setRange(1, 30)
-        speed_slider.setValue(6)
-        controls.addWidget(speed_slider)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-
-        preview_label = QtWidgets.QLabel("")
-        preview_label.setAlignment(QtCore.Qt.AlignCenter)
-        preview_label.setMinimumHeight(320)
-        layout.addWidget(preview_label, 1)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        save_imgs_btn = QtWidgets.QPushButton("Save aligned PNGs...")
-        save_gif_btn = QtWidgets.QPushButton("Save animation...")
-        save_virtual_btn = QtWidgets.QPushButton("Save corrected copies to thumbnails")
-        btn_row.addWidget(save_imgs_btn)
-        btn_row.addWidget(save_gif_btn)
-        btn_row.addWidget(save_virtual_btn)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
-
-        # Build simple QTimer-based preview using RGB frames to avoid GIF issues
-        preview_timer = QtCore.QTimer(dlg)
-        preview_timer.setSingleShot(False)
-        frames_rgb = []
-
-        def _build_frames(cmap_name):
-            nonlocal frames_rgb
-            frames_rgb = []
-            try:
-                import matplotlib.cm as mcm
-            except Exception:
-                mcm = None
-            cmap_lookup = getattr(mcm, "cmap_d", None)
-            cmap = None
-            if mcm:
-                try:
-                    if (cmap_lookup and cmap_name in cmap_lookup) or hasattr(mcm, "get_cmap"):
-                        cmap = mcm.get_cmap(cmap_name)
-                except Exception:
-                    cmap = None
-            for arr in aligned:
-                arr = np.asarray(arr, dtype=float)
-                rng = arr.max() - arr.min()
-                if rng <= 0:
-                    base = np.zeros_like(arr, dtype=float)
-                else:
-                    base = (arr - arr.min()) / rng
-                if cmap is not None:
-                    rgb = (cmap(base)[:, :, :3] * 255.0).astype(np.uint8)
-                else:
-                    rgb = np.repeat((base * 255.0).astype(np.uint8)[..., None], 3, axis=2)
-                frames_rgb.append(rgb)
-
-        def _update_preview():
-            if not frames_rgb:
-                preview_label.setText("Preview unavailable")
-                return
-            idx = (preview_timer.property("frame_idx") or 0) % len(frames_rgb)
-            frame = frames_rgb[idx]
-            h, w, _ = frame.shape
-            qimg = QtGui.QImage(frame.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
-            preview_label.setPixmap(QtGui.QPixmap.fromImage(qimg))
-            preview_timer.setProperty("frame_idx", (idx + 1) % len(frames_rgb))
-
-        def _render_preview(cmap_name, fps):
-            _build_frames(cmap_name)
-            interval = max(30, int(1000 / max(1, fps)))
-            preview_timer.setInterval(interval)
-            preview_timer.setProperty("frame_idx", 0)
-            preview_timer.start()
-            _update_preview()
-
-        _render_preview(cmap_combo.currentText(), speed_slider.value())
-        cmap_combo.currentTextChanged.connect(lambda name: _render_preview(name, speed_slider.value()))
-        speed_slider.valueChanged.connect(lambda val: _render_preview(cmap_combo.currentText(), val))
-
-        def _save_imgs():
-            out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
-            if not out_dir:
-                return
-            out_dir = Path(out_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            for name, arr in zip(names, aligned):
-                out_path = out_dir / f"{name}_aligned.png"
-                try:
-                    import imageio.v3 as iio  # type: ignore
-                    iio.imwrite(out_path, arr.astype(np.float32))
-                except Exception:
-                    try:
-                        from matplotlib import pyplot as plt  # type: ignore
-                        plt.imsave(out_path, arr, cmap=cmap_combo.currentText())
-                    except Exception:
-                        np.savetxt(out_path.with_suffix(".txt"), arr)
-            QtWidgets.QMessageBox.information(self, "Drift correction", f"Saved aligned images to {out_dir}")
-
-        def _save_anim():
-            try:
-                import imageio.v3 as iio  # type: ignore
-            except Exception:
-                QtWidgets.QMessageBox.warning(dlg, "Animation", "imageio is required to save animations.")
-                return
-            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, "Save animation", "aligned.gif", "GIF (*.gif);;MP4 (*.mp4)")
-            if not out_path:
-                return
-            try:
-                import matplotlib.cm as mcm
-            except Exception:
-                mcm = None
-            cmap_lookup = getattr(mcm, "cmap_d", None)
-            frames_out = []
-            for arr in aligned:
-                arr = np.asarray(arr, dtype=float)
-                rng = arr.max() - arr.min()
-                if rng <= 0:
-                    base = np.zeros_like(arr, dtype=float)
-                else:
-                    base = (arr - arr.min()) / rng
-                if mcm and ((cmap_lookup and cmap_combo.currentText() in cmap_lookup) or hasattr(mcm, "get_cmap")):
-                    cmap = mcm.get_cmap(cmap_combo.currentText())
-                    frames_out.append((cmap(base)[:, :, :3] * 255.0).astype(np.uint8))
-                else:
-                    frames_out.append((base * 255.0).astype(np.uint8))
-            suffix = Path(out_path).suffix.lower()
-            fps = max(1, speed_slider.value())
-            try:
-                if suffix == ".mp4":
-                    iio.imwrite(out_path, frames_out, plugin="ffmpeg", fps=fps)
-                else:
-                    iio.imwrite(out_path, frames_out, plugin="pillow", loop=0, duration=max(20, int(1000 / fps)))
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(dlg, "Animation", f"Failed to save animation: {exc}")
-                return
-            QtWidgets.QMessageBox.information(dlg, "Animation", f"Saved animation to {out_path}")
-
-        def _save_virtual():
-            added = 0
-            existing = set(str(p) for p in self.files)
-            top, bottom, left, right = crop_bounds if crop_bounds else (None, None, None, None)
-            for idx, arr in enumerate(aligned):
-                orig = str(source_paths[idx] if source_paths and idx < len(source_paths) else names[idx])
-                header_fds = self.headers.get(orig)
-                if not header_fds:
-                    continue
-                header, fds = header_fds
-                if not fds:
-                    continue
-                fd_src = fds[channel_idx if 0 <= channel_idx < len(fds) else 0]
-                header_new = dict(header)
-                header_new['xPixel'] = arr.shape[1]
-                header_new['yPixel'] = arr.shape[0]
-                arr_by_channel = {}
-                try:
-                    from scipy import ndimage as _ndi  # type: ignore
-                except Exception:
-                    _ndi = None
-                dy, dx = shifts[idx]
-                for ch_idx, fd_ch in enumerate(fds):
-                    try:
-                        if ch_idx == channel_idx:
-                            raw_arr = arr  # already aligned/cropped for the primary channel
-                        else:
-                            raw_arr = self._get_channel_array(orig, ch_idx, header, fd_ch)
-                    except Exception:
-                        continue
-                    try:
-                        if ch_idx == channel_idx:
-                            shifted = raw_arr
-                        elif _ndi is not None:
-                            shifted = _ndi.shift(raw_arr, [-dy, -dx], order=1, mode="reflect", cval=0.0)
-                        else:
-                            shifted = raw_arr
-                        if all(v is not None for v in (top, bottom, left, right)):
-                            shifted = shifted[top:bottom, left:right]
-                        arr_by_channel[ch_idx] = np.array(shifted, copy=True)
-                    except Exception:
-                        continue
-                if not arr_by_channel:
-                    continue
-                # adjust header dims to cropped size
-                sample_arr = next(iter(arr_by_channel.values()))
-                header_new['xPixel'] = sample_arr.shape[1]
-                header_new['yPixel'] = sample_arr.shape[0]
-                fds_new = [dict(fd) for fd in fds]
-                caption_base = fds[channel_idx].get('Caption') or Path(orig).name if 0 <= channel_idx < len(fds) else Path(orig).name
-                for i, fd_new in enumerate(fds_new):
-                    fd_new['FileName'] = f"{Path(orig).name}_drift_ch{i}"
-                    fd_new['Caption'] = f"{caption_base} [drift]"
-                processed_key = f"processed_{Path(orig).stem}_drift"
-                self._processed_views[processed_key] = {
-                    'arr_by_channel': arr_by_channel,
-                    'header': header_new,
-                    'fds': fds_new,
-                    'channel_idx': channel_idx,
-                    'source': orig,
-                }
-                self.headers[processed_key] = (header_new, fds_new)
-                if processed_key not in existing:
-                    self.files.append(Path(processed_key))
-                    existing.add(processed_key)
-                added += 1
-            if added:
-                try:
-                    # insert new processed entries right after the last selected source in current ordering
-                    cur_files = [str(p) for p in self.files]
-                    inserted = []
-                    for idx, src in enumerate(source_paths or []):
-                        src_str = str(src)
-                        pk = f"processed_{Path(src_str).stem}_drift"
-                        try:
-                            pos = cur_files.index(src_str)
-                        except ValueError:
-                            pos = len(self.files)
-                        if pk not in cur_files:
-                            self.files.insert(pos + 1, Path(pk))
-                            cur_files.insert(pos + 1, pk)
-                            inserted.append(pk)
-                    if not inserted:
-                        for pk in list(self._processed_views.keys()):
-                            if pk not in cur_files:
-                                self.files.append(Path(pk))
-                    self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
-                except Exception:
-                    pass
-                QtWidgets.QMessageBox.information(dlg, "Drift correction", f"Added {added} drift-corrected copy(ies) to thumbnails.\nLook for entries tagged [drift].")
-            else:
-                QtWidgets.QMessageBox.information(dlg, "Drift correction", "No corrected copies were created (missing headers or channels).")
-
-        save_imgs_btn.clicked.connect(_save_imgs)
-        save_gif_btn.clicked.connect(_save_anim)
-        save_virtual_btn.clicked.connect(_save_virtual)
-        dlg.exec_()
-
-    # ---------- Virtual copies (channels, crops, drift) ----------
-
-    def _virtual_copy_source_anchor(self, view):
-        if not view:
-            return VIRTUAL_COPY_INSERT_START
-        path = view.get("path") or (view.get("meta") or {}).get("path") or (view.get("meta") or {}).get("file_path")
-        return str(path) if path else VIRTUAL_COPY_INSERT_START
-
     def _create_virtual_copy_from_popup_view(self, view):
-        return self._create_virtual_view_copy(view, insert_after_key=self._virtual_copy_source_anchor(view))
-
-    def _create_virtual_copy_from_drag_payload(self, payload, insert_after_key=None):
-        if not isinstance(payload, dict):
-            return None
-        drag_token = payload.get("view_drag_token")
-        if drag_token:
-            view = MultiPreviewCanvas.consume_drag_view_snapshot(drag_token)
-            if view:
-                return self._create_virtual_view_copy(view, insert_after_key=insert_after_key)
-        file_path = payload.get("file_path")
-        channel_idx = payload.get("channel_index")
-        if not file_path or channel_idx is None:
-            return None
-        try:
-            channel_idx = int(channel_idx)
-        except Exception:
-            return None
-        created = self._create_virtual_channel_copies(
-            [str(file_path)],
-            channel_idx=channel_idx,
-            insert_after_key=insert_after_key,
-        )
-        return created
+        # Kept as a bound method on purpose: it is passed by reference
+        # as a callback (set_virtual_copy_callback) rather than called,
+        # and preview_popup.py reaches it through a receiver named
+        # `owner`. Neither form is visible to a call-site scan.
+        return virtual_copies.create_virtual_copy_from_popup_view(self, view)
 
     def _create_virtual_channel_copies(self, paths, channel_idx=None, insert_after_key=None):
-        """Create virtual copies of selected images for a specific channel."""
-        if not paths:
-            return 0
-        targets = [str(Path(p)) for p in paths]
-        # If channel not provided, ask the user using first file's channels
-        if channel_idx is None:
-            first = targets[0]
-            header, fds = self.headers.get(first, (None, None))
-            if header is None or fds is None:
-                header, fds = parse_header(Path(first))
-            if not fds:
-                return
-            channel_idx = self._choose_channel_index_for_virtual_copy(
-                fds,
-                current_idx=self.channel_dropdown.currentIndex(),
-            )
-            if channel_idx is None:
-                return 0
-        added = 0
-        anchor_key = insert_after_key
-        for p in targets:
-            try:
-                header, fds = self.headers.get(p, (None, None))
-                if header is None or fds is None:
-                    header, fds = parse_header(Path(p))
-                if not fds or channel_idx < 0 or channel_idx >= len(fds):
-                    continue
-                # Build arrays for all channels so switching works
-                arr_by_channel = {}
-                for ch_idx, fd in enumerate(fds):
-                    try:
-                        arr_by_channel[ch_idx] = np.array(self._get_channel_array(p, ch_idx, header, fd), copy=True)
-                    except Exception:
-                        continue
-                if not arr_by_channel:
-                    continue
-                fds_new = [dict(fd) for fd in fds]
-                for i, fd_new in enumerate(fds_new):
-                    fd_new['FileName'] = f"{Path(p).name}_virt_ch{i}"
-                    fd_new['Caption'] = f"{fd_new.get('Caption') or Path(p).name} [ch{i}]"
-                key = self._make_processed_key(p, op="ch", channel_idx=channel_idx)
-                self._processed_views[key] = {
-                    'arr_by_channel': arr_by_channel,
-                    'header': dict(header),
-                    'fds': fds_new,
-                    'channel_idx': channel_idx,
-                    'source': p,
-                    'label': f"[ch{channel_idx}]",
-                    'op': 'channel',
-                }
-                self.headers[key] = (dict(header), fds_new)
-                self._insert_processed_after_source(key, p, insert_after_key=anchor_key)
-                if insert_after_key not in (None, "", VIRTUAL_COPY_INSERT_START):
-                    anchor_key = key
-                added += 1
-            except Exception:
-                continue
-        if added:
-            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
-        return added
+        return virtual_copies.create_virtual_channel_copies(self, paths, channel_idx=channel_idx, insert_after_key=insert_after_key)
 
     def _create_virtual_view_copy(self, view, insert_after_key=None, tag=None, op=None):
-        """Create a virtual thumbnail copy from the current popup/preview view snapshot."""
-        if not view:
-            return None
-        path = view.get("path") or (view.get("meta") or {}).get("path") or (view.get("meta") or {}).get("file_path")
-        arr = view.get("arr")
-        ch_idx = view.get("channel_idx")
-        if ch_idx is None:
-            ch_idx = (view.get("meta") or {}).get("channel_index")
-        if path is None or arr is None:
-            return None
-        try:
-            arr = np.asarray(arr)
-        except Exception:
-            return None
-        if arr.ndim < 2 or arr.size == 0:
-            return None
-        path = str(path)
-        try:
-            header, fds = self.headers.get(path, (None, None))
-            if header is None or fds is None:
-                header, fds = parse_header(Path(path))
-            if not fds:
-                return None
-            ch_idx = int(ch_idx) if ch_idx is not None else 0
-            title = str(view.get("title") or "")
-            inferred_crop = bool(view.get("crop_sequence") is not None or "[crop]" in title.lower())
-            tag = str(tag or ("[crop]" if inferred_crop else "[copy]"))
-            op_name = str(op or ("crop" if inferred_crop else "copy"))
-            arr_by_channel = {ch_idx: np.array(arr, copy=True)}
-            fds_new = [dict(fd) for fd in fds]
-            for i, fd_new in enumerate(fds_new):
-                base_caption = fd_new.get("Caption") or Path(path).name
-                fd_new["FileName"] = f"{Path(path).name}_{op_name}_ch{i}"
-                fd_new["Caption"] = f"{base_caption} {tag}"
-            header_new = dict(header)
-            header_new["xPixel"] = int(arr.shape[1])
-            header_new["yPixel"] = int(arr.shape[0])
-            stored_extent = None
-            view_extent = view.get("extent_raw")
-            if view_extent is None:
-                view_extent = view.get("extent")
-            if view_extent is not None and len(view_extent) == 4:
-                try:
-                    x0, x1, y_a, y_b = [float(v) for v in view_extent]
-                    stored_extent = (x0, x1, y_a, y_b)
-                    xmin, xmax = sorted((x0, x1))
-                    ymin, ymax = sorted((y_a, y_b))
-                    x_range = max(xmax - xmin, 1e-12)
-                    y_range = max(ymax - ymin, 1e-12)
-                    x_center = 0.5 * (xmin + xmax)
-                    y_center = 0.5 * (ymin + ymax)
-                    header_new["XScanRange"] = x_range
-                    header_new["YScanRange"] = y_range
-                    header_new["XRange"] = x_range
-                    header_new["YRange"] = y_range
-                    header_new["xCenter"] = x_center
-                    header_new["yCenter"] = y_center
-                    header_new["XCenter"] = x_center
-                    header_new["YCenter"] = y_center
-                except Exception:
-                    pass
-            key = self._make_processed_key(path, op=op_name, channel_idx=ch_idx)
-            self._processed_views[key] = {
-                "arr_by_channel": arr_by_channel,
-                "header": header_new,
-                "fds": fds_new,
-                "channel_idx": ch_idx,
-                "source": path,
-                "extent_raw": stored_extent,
-                "label": tag,
-                "op": op_name,
-            }
-            self.headers[key] = (header_new, fds_new)
-            self._insert_processed_after_source(key, path, insert_after_key=insert_after_key)
-            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
-            return key
-        except Exception:
-            return None
-
-    def _create_virtual_crop_view(self, view, insert_after_key=None):
-        """Create a virtual copy from a cropped preview view (single channel)."""
-        return self._create_virtual_view_copy(view, insert_after_key=insert_after_key, tag="[crop]", op="crop")
+        return virtual_copies.create_virtual_view_copy(self, view, insert_after_key=insert_after_key, tag=tag, op=op)
 
     def _create_virtual_copy_from_history(self, seq):
-        if seq is None:
-            return
-        entry = None
-        if hasattr(self, "quick_crop_controller"):
-            entry = self.quick_crop_controller.get_history_entry(seq)
-        if not entry:
-            return
-        view_snapshot = entry.get("view_snapshot")
-        if not view_snapshot:
-            QtWidgets.QMessageBox.information(self, "Virtual copy", "This crop does not have a stored snapshot.")
-            return
-        self._create_virtual_crop_view(dict(view_snapshot))
+        return virtual_copies.create_virtual_copy_from_history(self, seq)
 
     def on_clear_spec_selection(self):
         self._clear_multi_spec_selection()
@@ -9628,6 +9325,82 @@ QLabel:hover {{
             self._schedule_marker_refresh()
             self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
 
+    def on_pick_spectro_stack_color(self):
+        current = getattr(self, 'spectro_marker_color_stack', None) or QtGui.QColor(165, 141, 242, 235)
+        col = QtWidgets.QColorDialog.getColor(current, self, "Select Z-Stack Marker Color", QtWidgets.QColorDialog.ShowAlphaChannel)
+        if col.isValid():
+            self.spectro_marker_color_stack = col
+            self.config['spectro_marker_color_stack'] = col.name(QtGui.QColor.HexArgb)
+            save_config(self.config)
+            self.populate_thumbnails_for_channel(self.channel_dropdown.currentIndex())
+            if self.last_preview:
+                self.show_file_channel(self.last_preview[0], self.last_preview[1])
+            self._schedule_marker_refresh()
+
+    # ---- favourite (default) colormaps -------------------------------
+    # Saved via the small star buttons next to each colormap/color-cycle
+    # selector; applied at startup ahead of merely-last-used values.
+    # Contexts in use: 'preview', 'thumbnails', 'grid_metric',
+    # 'grid_reference'. The folder report reads the same favourites.
+
+    def get_favorite_cmap(self, context, fallback=None):
+        favs = self.config.get('favorite_cmaps') or {}
+        name = favs.get(str(context))
+        return str(name) if name else fallback
+
+    def set_favorite_cmap(self, context, name):
+        if not name:
+            return
+        favs = dict(self.config.get('favorite_cmaps') or {})
+        favs[str(context)] = str(name)
+        self.config['favorite_cmaps'] = favs
+        save_config(self.config)
+        log_status(f"[Colormaps] Saved '{name}' as your default for {context}")
+
+    def set_favorite_color_cycle(self, name):
+        if not name:
+            return
+        self.config['favorite_color_cycle'] = str(name)
+        save_config(self.config)
+        log_status(f"[Colormaps] Saved '{name}' as your default color cycle")
+
+    def clear_colormap_favorites(self):
+        had = ('favorite_cmaps' in self.config) or ('favorite_color_cycle' in self.config)
+        self.config.pop('favorite_cmaps', None)
+        self.config.pop('favorite_color_cycle', None)
+        save_config(self.config)
+        log_status("[Colormaps] Cleared saved colormap defaults"
+                   if had else "[Colormaps] No saved colormap defaults to clear")
+
+    def on_extra_colormaps_status(self):
+        """Display → Extra colormaps...: status of the optional pratiman-91
+        'colormaps' package (never a hard dependency — see cmap_registry)."""
+        status = cmap_registry.extra_colormaps_status()
+        if status.get("available"):
+            skipped = int(status.get("skipped") or 0)
+            skipped_note = (
+                f"\n({skipped} name(s) were skipped because matplotlib "
+                "already provides a colormap with the same name.)" if skipped else "")
+            QtWidgets.QMessageBox.information(
+                self, "Extra colormaps",
+                f"The optional 'colormaps' package is installed — "
+                f"{int(status.get('count') or 0)} extra colormaps are "
+                f"registered and available in every colormap picker."
+                f"{skipped_note}")
+        else:
+            err = status.get("error")
+            err_note = f"\n\n(Import problem detected: {err})" if err else ""
+            QtWidgets.QMessageBox.information(
+                self, "Extra colormaps",
+                "The optional 'colormaps' package (pratiman-91) is not "
+                "installed, so only matplotlib's built-in colormaps (plus "
+                "the viewer's own) are available.\n\n"
+                "To add ~100+ extra scientific colormaps, install it into "
+                "this Python environment:\n\n"
+                f"    {cmap_registry.EXTRA_PACKAGE_INSTALL_HINT}\n\n"
+                "then restart the viewer. Existing sessions and settings "
+                f"are unaffected either way.{err_note}")
+
     def set_spectro_color_cycle(self, name: str):
         cycle = name or DEFAULT_COLOR_CYCLE
         if cycle == self.spectro_color_cycle:
@@ -9663,6 +9436,8 @@ QLabel:hover {{
     def _populate_marker_style_menu(self, menu):
         col_single = menu.addAction("Single marker color...")
         col_single.triggered.connect(self.on_pick_spectro_single_color)
+        col_stack = menu.addAction("Z-stack marker color...")
+        col_stack.triggered.connect(self.on_pick_spectro_stack_color)
         col_matrix = menu.addAction("Matrix marker color...")
         col_matrix.triggered.connect(self.on_pick_spectro_matrix_color)
         menu.addSeparator()
@@ -9703,18 +9478,10 @@ QLabel:hover {{
 
     def on_preview_lock_toggled(self, checked: bool):
         self.preview_locked = bool(checked)
-        for widget in (
+        set_many_silent((
             getattr(self, "preview_lock_cb", None),
             getattr(self, "tools_preview_lock_act", None),
-        ):
-            if widget is None:
-                continue
-            try:
-                widget.blockSignals(True)
-                widget.setChecked(self.preview_locked)
-                widget.blockSignals(False)
-            except Exception:
-                pass
+        ), checked=self.preview_locked)
         self.config["preview_locked"] = self.preview_locked; save_config(self.config)
         self._update_preview_detach_button()
         if self.preview_locked and getattr(self, "preview_detached", False):
@@ -9829,27 +9596,6 @@ QLabel:hover {{
         except Exception:
             pass
 
-    def on_dark_mode_toggled(self, checked: bool):
-        self.dark_mode = bool(checked)
-        try:
-            if hasattr(self, 'toolbar_dark_btn'):
-                self.toolbar_dark_btn.blockSignals(True)
-                self.toolbar_dark_btn.setChecked(self.dark_mode)
-                self.toolbar_dark_btn.blockSignals(False)
-        except Exception:
-            pass
-        if getattr(self, "_detail_theme_follows_dark_mode", True):
-            self._set_detail_dark_view_state(self.dark_mode, follow_dark_mode=True, persist=False)
-        self.config['dark_mode'] = self.dark_mode
-        self.config['detail_dark_view'] = self.detail_dark_view
-        self.config['detail_theme_follows_dark_mode'] = bool(
-            getattr(self, "_detail_theme_follows_dark_mode", True)
-        )
-        save_config(self.config)
-        self._apply_dark_mode(self.dark_mode)
-        if self.last_preview:
-            self.show_file_channel(self.last_preview[0], self.last_preview[1])
-
     # ---------- control callbacks ----------
     def on_channel_dropdown_changed(self, idx):
         self.last_channel_index = int(idx); self.config['last_channel_index'] = self.last_channel_index; save_config(self.config)
@@ -9874,6 +9620,120 @@ QLabel:hover {{
 
     def on_preview_cmap_changed(self, idx):
         return viewer_preview.on_preview_cmap_changed(self, idx)
+
+    def on_open_colormap_gallery(self):
+        """Open the colormap gallery for the preview colormap.
+
+        Pending selections recolor the currently displayed views live via
+        the cheap set_cmap_for_current_views path only; per-file/global
+        cmap state is written exclusively on Apply, through the same
+        preview_cmap_combo path a manual combo change takes (so
+        thumbnails, config persistence, and per-file overrides all behave
+        identically). Cancel/close reverts the live recolor.
+        """
+        current = self.preview_cmap_combo.currentText() or self.preview_cmap
+        if self.last_preview:
+            key, idx = self.last_preview
+            try:
+                current = self.per_file_channel_cmap.get(
+                    (str(key), int(idx)), current)
+            except Exception:
+                pass
+        manager = ColormapManager(current, parent=self)
+        manager.pending_changed.connect(self._on_gallery_cmap_pending)
+        manager.applied_changed.connect(self._on_gallery_cmap_applied)
+        sorter = ColormapSorter(usage_provider=self._cmap_usage_stats)
+        strategy = self.config.get('colormap_sort_strategy') or DEFAULT_STRATEGY
+        dlg = ColormapGalleryDialog(
+            manager, sorter=sorter, strategy=strategy, parent=self)
+        dlg.strategy_changed.connect(self._on_gallery_strategy_changed)
+        dlg.exec_()
+        manager.deleteLater()
+
+    def _on_gallery_cmap_pending(self, name, is_reversed):
+        # Resolving first also registers a programmatically-reversed
+        # variant under its joined name, so the string path below (and
+        # every later string consumer) can find it.
+        cmap_registry.get_colormap(name, is_reversed)
+        cmap_name = cmap_registry.join_cmap_name(name, is_reversed)
+        try:
+            cb = getattr(self.preview_canvas, "set_cmap_for_current_views", None)
+            if callable(cb):
+                cb(cmap_name)
+        except Exception:
+            pass
+
+    def _on_gallery_cmap_applied(self, name, is_reversed):
+        cmap_registry.get_colormap(name, is_reversed)
+        cmap_name = cmap_registry.join_cmap_name(name, is_reversed)
+        # Programmatically-reversed / extra-package maps may not be in the
+        # combos yet; add them so both combos can display the applied name.
+        for combo in (getattr(self, "thumb_cmap_combo", None),
+                      getattr(self, "preview_cmap_combo", None)):
+            if combo is not None and combo.findText(cmap_name) < 0:
+                try:
+                    icon = _colormap_icon(cmap_name, width=96, height=14)
+                except Exception:
+                    icon = QIcon()
+                combo.addItem(icon, cmap_name)
+        # Apply to the current thumbnail selection (Ctrl+A / multi-select),
+        # falling back to the highlighted-or-previewed image — the same
+        # targeting the Thumb colormap combo uses (on_thumb_cmap_changed) so
+        # thumbnails AND the preview update, not just the preview.
+        targets = list((getattr(self, "_ordered_thumbnail_selection",
+                                 lambda: [])() or []))
+        if not targets:
+            current = str(getattr(self, "selected_file_for_thumbs", "") or "")
+            if not current and self.last_preview:
+                current = str(self.last_preview[0])
+            if current:
+                targets = [current]
+        image_targets = [str(p) for p in targets
+                         if str(p) in getattr(self, "thumb_widgets", {})]
+        if image_targets:
+            self._set_thumbnail_entry_cmap(image_targets, cmap_name)
+            self._set_combo_text_silent(getattr(self, "preview_cmap_combo", None), cmap_name)
+            self._set_combo_text_silent(getattr(self, "thumb_cmap_combo", None), cmap_name)
+            # Keep the preview truthful if it was live-recolored during the
+            # gallery session but isn't one of the retargeted images.
+            if self.last_preview:
+                pk, pidx = self.last_preview
+                if str(pk) not in image_targets:
+                    try:
+                        self.show_file_channel(str(pk), int(pidx), use_local_cmap=True)
+                    except Exception:
+                        pass
+        else:
+            # Nothing loaded/selected: fall back to the global preview cmap.
+            self.preview_cmap_combo.setCurrentText(cmap_name)
+        try:
+            self._record_cmap_usage(name)
+        except Exception:
+            pass
+
+    def _on_gallery_strategy_changed(self, strategy):
+        self.config['colormap_sort_strategy'] = str(strategy)
+        save_config(self.config)
+
+    def _cmap_usage_stats(self):
+        """Usage provider for ColormapSorter: {base_name: (count, last_used)}."""
+        raw = self.config.get('colormap_usage', {}) or {}
+        stats = {}
+        for base, rec in raw.items():
+            try:
+                count, last = rec
+                stats[str(base)] = (int(count), float(last))
+            except Exception:
+                continue
+        return stats
+
+    def _record_cmap_usage(self, name):
+        base, _rev = cmap_registry.split_cmap_name(name)
+        usage = dict(self.config.get('colormap_usage', {}) or {})
+        count, _last = usage.get(base, (0, 0.0))
+        usage[base] = [int(count) + 1, float(time.time())]
+        self.config['colormap_usage'] = usage
+        save_config(self.config)
 
     def on_show_spectra_toggled(self, checked):
         self.show_spectra = bool(checked)
@@ -10105,7 +9965,7 @@ QLabel:hover {{
             "colorbar_orientation": str(getattr(canvas, "_colorbar_orientation", "vertical") or "vertical").strip().lower(),
             "show_title": bool(getattr(canvas, "_show_title", True)),
             "show_acquisition_overlay": bool(getattr(canvas, "_show_acquisition_overlay", False)),
-            "show_shortcut_hint": bool(getattr(canvas, "_show_shortcut_hint", True)),
+            "show_shortcut_hint": bool(getattr(canvas, "_show_shortcut_hint", False)),
             "show_profile_overlays": bool(getattr(canvas, "_show_profile_overlays", True)),
             "show_angle_overlays": bool(getattr(canvas, "_show_angle_overlays", True)),
             "show_molecules": bool(getattr(canvas, "show_molecules", True)),
@@ -10141,7 +10001,7 @@ QLabel:hover {{
                 "colorbar_orientation": str(options.get("colorbar_orientation", "vertical") or "vertical").strip().lower(),
                 "show_title": bool(options.get("show_title", True)),
                 "show_acquisition_overlay": bool(options.get("show_acquisition_overlay", False)),
-                "show_shortcut_hint": bool(options.get("show_shortcut_hint", True)),
+                "show_shortcut_hint": bool(options.get("show_shortcut_hint", False)),
                 "show_profile_overlays": bool(options.get("show_profile_overlays", True)),
                 "show_angle_overlays": bool(options.get("show_angle_overlays", True)),
                 "show_molecules": bool(options.get("show_molecules", True)),
@@ -10300,13 +10160,12 @@ QLabel:hover {{
     def on_show_crop_template_overlay_toggled(self, checked: bool):
         self.show_crop_template_overlay = bool(checked)
         self.config['show_crop_template_overlay'] = self.show_crop_template_overlay; save_config(self.config)
-        canvases = [getattr(self, 'preview_canvas', None)] + list(getattr(self, '_popup_canvases', []))
-        for canv in canvases:
-            if canv:
-                try:
-                    canv.show_fixed_crop_template(self.show_crop_template_overlay)
-                except Exception:
-                    continue
+        canv = getattr(self, 'preview_canvas', None)
+        if canv:
+            try:
+                canv.show_fixed_crop_template(self.show_crop_template_overlay)
+            except Exception:
+                pass
         act = getattr(self, 'crop_template_act', None)
         if act is not None:
             act.blockSignals(True)
@@ -10347,14 +10206,119 @@ QLabel:hover {{
             controller.update_hint()
 
     def _on_preview_canvas_state_changed(self, canvas):
-        self._store_canvas_view_clims(canvas)
+        if not getattr(self, "_suppress_thumbnail_clim_sync", False):
+            self._store_canvas_view_clims(canvas)
         self._on_canvas_display_options_changed(canvas)
         self._update_quick_crop_hint()
+        if canvas is getattr(self, "preview_canvas", None) and not getattr(
+            self, "_suppress_compact_histogram_refresh", False
+        ):
+            self._refresh_compact_histogram()
 
-    def _sync_quick_crop_template_controls(self):
-        controller = getattr(self, "quick_crop_controller", None)
-        if controller:
-            controller.sync_template_controls()
+    def _compact_histogram_current_view(self):
+        canvas = getattr(self, "preview_canvas", None)
+        views = list(getattr(canvas, "views", None) or [])
+        if not views:
+            return None, None
+        try:
+            idx = canvas.active_view_index()
+        except Exception:
+            idx = 0
+        idx = max(0, min(idx, len(views) - 1))
+        return canvas, views[idx]
+
+    def _refresh_compact_histogram(self):
+        widget = getattr(self, "compact_histogram", None)
+        if widget is None:
+            return
+        canvas, view = self._compact_histogram_current_view()
+        if view is None:
+            widget.clear()
+            return
+        vmin, vmax, finite = self._view_finite_values(view)
+        if vmin is None:
+            widget.clear()
+            return
+        lo, hi = view.get("clim", (vmin, vmax))
+        widget.set_data(vmin, vmax, lo, hi, finite)
+
+    def _on_compact_histogram_clim_changed(self, lo, hi, final):
+        # Undo must snapshot the state as it was BEFORE this gesture's first
+        # change, not before whichever flush happens to run last - so the
+        # push happens here, on the first event of a new gesture, rather than
+        # in _flush_compact_histogram_clim gated on "final" (which would
+        # capture an already-partially-applied intermediate state instead).
+        if not getattr(self, "_compact_histogram_gesture_active", False):
+            self._compact_histogram_gesture_active = True
+            canvas, _view = self._compact_histogram_current_view()
+            if canvas is not None:
+                try:
+                    canvas.push_undo_state("histogram_range")
+                except Exception:
+                    pass
+        self._pending_compact_histogram_clim = (float(lo), float(hi))
+        self._pending_compact_histogram_final = bool(final) or bool(
+            getattr(self, "_pending_compact_histogram_final", False)
+        )
+        try:
+            if not self._compact_histogram_apply_timer.isActive():
+                self._compact_histogram_apply_timer.start(0)
+        except Exception:
+            self._flush_compact_histogram_clim()
+
+    def _flush_compact_histogram_clim(self):
+        pending = getattr(self, "_pending_compact_histogram_clim", None)
+        final = bool(getattr(self, "_pending_compact_histogram_final", False))
+        self._pending_compact_histogram_clim = None
+        self._pending_compact_histogram_final = False
+        if final:
+            self._compact_histogram_gesture_active = False
+        if not pending:
+            return
+        canvas, view = self._compact_histogram_current_view()
+        if view is None:
+            return
+        lo, hi = pending
+        if lo > hi:
+            lo, hi = hi, lo
+        self._suppress_compact_histogram_refresh = True
+        try:
+            canvas._fast_preview_update_once = True
+            canvas._async_redraw_once = True
+        except Exception:
+            pass
+        try:
+            self._apply_clim_to_view(canvas, view, lo, hi)
+        finally:
+            self._suppress_compact_histogram_refresh = False
+
+    def _on_compact_histogram_auto_requested(self):
+        widget = getattr(self, "compact_histogram", None)
+        canvas, view = self._compact_histogram_current_view()
+        if view is None:
+            return
+        try:
+            suggested = self._recommended_view_clim(view, pct_low=1.0, pct_high=99.0)
+        except Exception:
+            suggested = None
+        if suggested is None:
+            return
+        lo, hi = suggested
+        if widget is not None:
+            widget.set_range(lo, hi)
+        self._on_compact_histogram_clim_changed(lo, hi, True)
+
+    def _on_compact_histogram_reset_requested(self):
+        widget = getattr(self, "compact_histogram", None)
+        canvas, view = self._compact_histogram_current_view()
+        if view is None:
+            return
+        vmin, vmax, _finite = self._view_finite_values(view)
+        if vmin is None:
+            return
+        if widget is not None:
+            widget.set_range(vmin, vmax)
+        self._on_compact_histogram_clim_changed(vmin, vmax, True)
 
     def _on_quick_crop_edit_toggled(self, checked: bool):
         controller = getattr(self, "quick_crop_controller", None)
@@ -10374,20 +10338,6 @@ QLabel:hover {{
         controller = getattr(self, "quick_crop_controller", None)
         if controller:
             controller.on_aspect_mode_changed()
-
-    def _on_quick_crop_real_spin_changed(self, _=None):
-        try:
-            sender = self.sender()
-        except Exception:
-            sender = None
-        controller = getattr(self, "quick_crop_controller", None)
-        if controller:
-            controller.on_real_spin_changed(sender)
-
-    def _apply_quick_crop_template_from_controls(self):
-        controller = getattr(self, "quick_crop_controller", None)
-        if controller:
-            controller.apply_template_from_controls()
 
     def _on_fixed_crop_history_updated(self, entries):
         controller = getattr(self, "quick_crop_controller", None)

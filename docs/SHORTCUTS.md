@@ -74,7 +74,7 @@ Current UX limitation:
 Mode switching:
 - `Ctrl+B` - switch to Browse mode.
 - `Ctrl+M` - switch to Measure mode.
-- `Ctrl+S` - switch to Spectroscopy mode.
+- `Ctrl+Alt+S` - switch to Spectroscopy mode.
 
 Quick crop controls:
 - `Ctrl+Shift+C` - toggle quick crop mode.
@@ -86,7 +86,15 @@ Quick crop controls:
   ones.
 - `Ctrl+Shift+W` - close the latest quick-crop pop-out.
 
+View filters (also in `Display -> Show only`; press the same shortcut again to
+show all images):
+- `Ctrl+Alt+F` - show only starred favourites.
+- `Ctrl+Alt+H` - show only constant-height (CH) images.
+- `Ctrl+Alt+C` - show only constant-current (CC) images.
+- `Ctrl+Alt+P` - show only images with linked spectroscopy points.
+
 General:
+- `Ctrl+S` - save the current session (prompts once if no session file exists yet).
 - `Ctrl+Z` - undo the focused canvas action; if no focused canvas action is
   available, fall back to quick-crop undo.
 - `Ctrl+D` - duplicate the current preview into a popup.
@@ -113,6 +121,12 @@ Rubber-band selection:
   selection instead of replacing it.
 
 Thumbnail actions:
+- `S` while focus is in the thumbnail area - star the selected thumbnails
+  (favourites). `S` toggles: pressing it again on starred images removes the
+  star. Starred thumbnails show a gold star badge; filter to them with
+  `Ctrl+Alt+F` or the `Starred` entry of the thumbnail filter dropdown.
+  An in-app explanation lives at `Display -> Show only -> How favourites &
+  filters work...`.
 - `Ctrl+Wheel` over thumbnails - resize thumbnail previews.
 - `Ctrl+C` while focus is in the thumbnail area - export the selected thumbnails
   to temporary image files and place those file paths on the clipboard.
@@ -120,6 +134,7 @@ Thumbnail actions:
 - Drag multiple selected thumbnails together into the canvas.
 
 Thumbnail context menu:
+- Star or unstar the selected files (favourites).
 - Apply a single filter or a custom pipeline to one or many selected files.
 - Clear filters for one or many selected files.
 - Copy selected thumbnails as SVG using the current rendered view.
@@ -140,9 +155,23 @@ Thumbnail navigation:
 
 Marker interactions:
 - `Left click` a spectroscopy marker - open or select that spectroscopy entry.
-- `Shift+Click` - multi-select spectroscopy entries for comparison.
+- `Shift+Click` - multi-select spectroscopy entries for comparison. A selection
+  tray appears under the thumbnails ("N spectra selected - Compare | Clear");
+  press its `Compare` button to open the comparison window (the old behavior of
+  auto-opening it at the second selection is gone).
 - `Ctrl+Click` - toggle a spectroscopy entry in the current selection.
 - Clicking a spectroscopy badge opens the summary for that image.
+- `Spectroscopy -> What do these markers mean?` in the toolbar shows a legend of
+  all marker symbols, rings, and badges.
+- A presence banner above the thumbnails appears automatically whenever the
+  folder contains spectroscopy ("N spectra | M grid maps"); click it to open
+  the Spectro Browser.
+
+Show on image:
+- Every spectroscopy window (single spectrum, comparison, grid map explorer) has
+  a `Show on image` button (also in its right-click menu) that focuses the main
+  preview on the source image, scrolls its thumbnail into view, and pulses the
+  marker of that spectrum.
 
 Context menu:
 - Open spectroscopy popup.

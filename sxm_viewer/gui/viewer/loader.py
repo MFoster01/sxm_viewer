@@ -1,7 +1,9 @@
 """Loader helpers for SXMGridViewer."""
 from __future__ import annotations
 
+import copy
 import time
+from functools import lru_cache
 from ..._shared import (
     QtCore,
     QtGui,
@@ -85,12 +87,21 @@ from ...processing.detection import (
     filedesc_indicates_current_or_topo,
 )
 from ...providers import convert_nanonis, convert_nanonis_files, parse_nanonis_spectroscopy, parse_nanonis_3ds
-from ..detail_panels import SpectroscopyPopup, SpectroscopyCompareDialog
+from ..dialogs.spectroscopy_dialogs import SpectroscopyPopup, SpectroscopyCompareDialog
 
 
-_SPECTRO_MANIFEST_VERSION = 3
+_SPECTRO_MANIFEST_VERSION = 5
 _SPECTRO_CACHE_MTIME_TOLERANCE = 2.0
 _SPECTRO_MANIFEST_FILE = "manifest_v2.json"
+# Bumped once, alongside the _scan_spectros per-file-loop fix that stopped
+# manifest-restored (metadata-only) spec lists from being written back to the
+# per-file disk payload cache as false "payload_usable: False" negatives.
+# _load_spectro_disk_payload only trusts a stored negative (skips reparsing)
+# when it was written by a cache_format_version match, so every entry written
+# before this fix - which may be a real negative or may be cache poisoning,
+# indistinguishable after the fact - gets re-verified against the file once
+# instead of being trusted forever.
+_SPECTRO_DISK_CACHE_VERSION = 2
 _SPECTRO_METADATA_ARRAY_KEYS = {
     "channels",
     "V",
@@ -120,11 +131,27 @@ _SPECTRO_METADATA_KEYS = {
     "grid_col",
     "channel_name",
     "channel_code",
+    "assignment_override_image_key",
     "image_key",
     "image_path",
     "primary_image_key",
     "shared_image_keys",
     "shared_repeat_assignment",
+    "site_key",
+    "site_image_key",
+    "site_display",
+    "site_summary",
+    "site_member_count",
+    "site_trace_count",
+    "site_channel_count",
+    "site_channels",
+    "site_has_matrix",
+    "site_has_z_stack",
+    "site_z_label",
+    "site_z_min_nm",
+    "site_z_max_nm",
+    "site_x_nm",
+    "site_y_nm",
     "xy_stack_count",
     "xy_stack_display",
     "xy_stack_key",
@@ -168,7 +195,17 @@ def _spectro_relative_key(base_folder: Path | None, filepath: Path) -> str:
 def _discover_spectro_file_records(folder_path: Path | None, files) -> list[dict]:
     records = []
     seen = set()
-    valid_exts = {".dat", ".3ds"}
+    valid_exts = {".dat", ".txt", ".3ds"}
+
+    def _is_image_header_txt(path: Path) -> bool:
+        if path.suffix.lower() != ".txt":
+            return False
+        try:
+            _header, fds = parse_header(path)
+        except Exception:
+            return False
+        return bool(fds) and any(str(fd.get("FileName") or "").strip() for fd in fds)
+
     if files:
         for f in files:
             if not f:
@@ -179,6 +216,8 @@ def _discover_spectro_file_records(folder_path: Path | None, files) -> list[dict
                 continue
             suffix = p.suffix.lower()
             if suffix not in valid_exts:
+                continue
+            if suffix == ".txt" and _is_image_header_txt(p):
                 continue
             norm_key = _normalize_spectro_path_key(p)
             if norm_key in seen:
@@ -218,6 +257,8 @@ def _discover_spectro_file_records(folder_path: Path | None, files) -> list[dict
                 if suffix not in valid_exts:
                     continue
                 full_path = Path(entry.path)
+                if suffix == ".txt" and _is_image_header_txt(full_path):
+                    continue
                 norm_key = _normalize_spectro_path_key(full_path)
                 if norm_key in seen:
                     continue
@@ -242,7 +283,7 @@ def _discover_spectro_file_records(folder_path: Path | None, files) -> list[dict
     except Exception:
         try:
             fallback_files = []
-            for pat in ("*.dat", "*.DAT", "*.3ds", "*.3DS"):
+            for pat in ("*.dat", "*.DAT", "*.txt", "*.TXT", "*.3ds", "*.3DS"):
                 fallback_files.extend(folder_path.glob(pat))
             return _discover_spectro_file_records(folder_path, fallback_files)
         except Exception:
@@ -301,6 +342,40 @@ def _deserialize_cache_value(value):
         return {key: _deserialize_cache_value(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_deserialize_cache_value(item) for item in value]
+    return value
+
+
+def _sanitize_metadata_value(value):
+    """Deep-copy `value` while dropping numpy arrays and normalizing numpy
+    scalars/Paths, in a single recursive pass.
+
+    Equivalent in net effect to `_deserialize_cache_value(_serialize_cache_value(value))`,
+    but without round-tripping every value (including plain scalars that need
+    no conversion at all) through a JSON-style intermediate form. That
+    round-trip was the dominant cost of loading a folder's spectroscopy
+    metadata (datetime values were being formatted to ISO strings and
+    immediately re-parsed back to the exact same datetime, for example).
+    """
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return None
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            sanitized = _sanitize_metadata_value(item)
+            if sanitized is not None:
+                out[str(key)] = sanitized
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            sanitized = _sanitize_metadata_value(item)
+            if sanitized is not None:
+                out.append(sanitized)
+        return out
     return value
 
 
@@ -387,6 +462,9 @@ def _payload_specs_usable(specs) -> bool:
     return any(_spec_has_payload_data(spec) for spec in specs)
 
 
+_SPEC_METADATA_SIMPLE_SCALAR_TYPES = (str, int, float, bool)
+
+
 def _spec_metadata_entry(spec):
     entry = {}
     spec_dict = dict(spec or {})
@@ -409,9 +487,19 @@ def _spec_metadata_entry(spec):
             if axes:
                 entry["AxisChoices"] = axes
             continue
-        serialized = _serialize_cache_value(value)
-        if serialized is not None:
-            entry[key] = _deserialize_cache_value(serialized)
+        # Most metadata values are already plain, cache-safe scalars
+        # (str/int/float/bool) needing no conversion at all; datetimes also
+        # need none here (only the on-disk manifest form needs the ISO-string
+        # round trip). Skipping straight to the value, and using the
+        # single-pass sanitizer for the remaining container/numpy/Path cases,
+        # is what turned this from the dominant cost of loading a folder's
+        # spectroscopy cache (~2900 specs x ~55 keys each) into a minor one.
+        if isinstance(value, _SPEC_METADATA_SIMPLE_SCALAR_TYPES) or isinstance(value, datetime):
+            entry[key] = value
+            continue
+        sanitized = _sanitize_metadata_value(value)
+        if sanitized is not None:
+            entry[key] = sanitized
     axis_choices = spec_dict.get("AxisChoices")
     if axis_choices:
         axes = []
@@ -440,9 +528,48 @@ def _spec_metadata_list(specs):
 
 
 def _restore_spec_metadata(entry):
-    spec = dict(_deserialize_cache_value(entry or {}))
+    # Mirrors _spec_metadata_entry's fast path on the save side (see its
+    # docstring): most values are already plain, cache-safe scalars needing
+    # no conversion - _deserialize_cache_value's own body is a no-op for
+    # those (falls through dict/list checks straight to `return value`), so
+    # skipping the call for them entirely is exactly equivalent, just
+    # without the isinstance checks and recursive-call overhead repeated
+    # ~54x per spec. Only dict/list values (site_channels, AxisChoices, the
+    # {"__datetime__": ...} markers on time/display_time, etc.) need the
+    # real recursive pass. This was the dominant remaining cost of loading a
+    # folder's spectroscopy manifest (measured ~54 recursive calls/spec on a
+    # real 17885-spec manifest).
+    entry = entry or {}
+    spec = {}
+    for key, value in entry.items():
+        if isinstance(value, _SPEC_METADATA_SIMPLE_SCALAR_TYPES):
+            spec[key] = value
+        else:
+            spec[key] = _deserialize_cache_value(value)
     spec["_payload_hydrated"] = bool(spec.get("_payload_hydrated", False))
     return spec
+
+
+def _restore_spec_metadata_list(entry):
+    """Restore a manifest entry's "specs" list, merging back any
+    per-file-constant fields hoisted out into "file_meta" at write time
+    (see _hoist_constant_spec_fields - a real .3ds grid entry had ~51% of
+    its per-spec bytes exactly this kind of duplication: image_key,
+    image_path, channel_name, AxisLabel, grid_rows/grid_cols, etc. repeated
+    identically on every single grid point). Each returned spec is a fully
+    independent dict - file_meta's contribution is deep-copied per spec so
+    a mutable field (e.g. shared_image_keys, a list) can never be silently
+    shared and mutated across every point in a grid."""
+    entry = entry or {}
+    spec_entries = entry.get("specs") or []
+    file_meta = entry.get("file_meta")
+    if not file_meta:
+        return [_restore_spec_metadata(spec_entry) for spec_entry in spec_entries]
+    restored_file_meta = _restore_spec_metadata(file_meta)
+    return [
+        {**copy.deepcopy(restored_file_meta), **_restore_spec_metadata(spec_entry)}
+        for spec_entry in spec_entries
+    ]
 
 
 def _restore_spectro_payload_specs(entries):
@@ -515,13 +642,62 @@ def _spec_identity_token(spec):
 def _merge_payload_into_spec(target, payload):
     if target is payload:
         return target
+    # off_frame_direction/off_frame_distance_nm are computed once by
+    # _assign_spectros_to_images and meant to be authoritative everywhere
+    # downstream (see CLAUDE.md) - but None is itself a meaningful,
+    # deliberately-computed result here ("checked, and it's confirmed not
+    # off-frame"), not "never set". The generic `preserved` dict below skips
+    # None values (right for every other field, where None genuinely means
+    # "not applicable yet"), so these two need their own None-safe
+    # preservation - captured before target.clear() and re-applied
+    # unconditionally afterward, but only when the key actually existed
+    # (so a spec that was truly never assigned stays that way, and
+    # _map_spec_to_pixels's "off-frame status unknown -> use the fallback"
+    # branch still applies to it, not just to unhydrated/never-scanned specs).
+    had_off_frame_direction = "off_frame_direction" in target
+    had_off_frame_distance = "off_frame_distance_nm" in target
+    off_frame_direction_val = target.get("off_frame_direction")
+    off_frame_distance_val = target.get("off_frame_distance_nm")
     preserved = {
+        # grid_row/grid_col are derived once at scan time by
+        # _ensure_grid_indices (from matrix_index, for formats like Nanonis
+        # .3ds whose own raw parser never sets them) - a fresh re-parse via
+        # hydrate_spectro_file never re-runs that derivation, so without
+        # preserving these here, opening a lazily-loaded grid (which
+        # triggers exactly this hydration path) silently wiped grid_row/
+        # grid_col back to missing on every point. Confirmed on real data:
+        # most call sites happen to fall back to re-deriving the same values
+        # from matrix_index anyway, but at least one (_map_spec_by_grid,
+        # main_window.py) does not and just silently no-ops - real,
+        # if usually invisible, data loss on every hydration.
+        "grid_row": target.get("grid_row"),
+        "grid_col": target.get("grid_col"),
+        "assignment_override_image_key": target.get("assignment_override_image_key"),
         "image_key": target.get("image_key"),
         "image_path": target.get("image_path"),
         "primary_image_key": target.get("primary_image_key"),
         "shared_image_keys": target.get("shared_image_keys"),
         "shared_repeat_assignment": target.get("shared_repeat_assignment"),
+        "assignment_reason": target.get("assignment_reason"),
+        "assignment_reason_label": target.get("assignment_reason_label"),
+        "assignment_confidence": target.get("assignment_confidence"),
+        "assignment_summary": target.get("assignment_summary"),
         "display_time": target.get("display_time"),
+        "site_key": target.get("site_key"),
+        "site_image_key": target.get("site_image_key"),
+        "site_display": target.get("site_display"),
+        "site_summary": target.get("site_summary"),
+        "site_member_count": target.get("site_member_count"),
+        "site_trace_count": target.get("site_trace_count"),
+        "site_channel_count": target.get("site_channel_count"),
+        "site_channels": target.get("site_channels"),
+        "site_has_matrix": target.get("site_has_matrix"),
+        "site_has_z_stack": target.get("site_has_z_stack"),
+        "site_z_label": target.get("site_z_label"),
+        "site_z_min_nm": target.get("site_z_min_nm"),
+        "site_z_max_nm": target.get("site_z_max_nm"),
+        "site_x_nm": target.get("site_x_nm"),
+        "site_y_nm": target.get("site_y_nm"),
         "xy_stack_summary": target.get("xy_stack_summary"),
         "xy_stack_display": target.get("xy_stack_display"),
         "xy_stack_count": target.get("xy_stack_count"),
@@ -533,6 +709,10 @@ def _merge_payload_into_spec(target, payload):
     for key, value in preserved.items():
         if value not in (None, "", []):
             target[key] = value
+    if had_off_frame_direction:
+        target["off_frame_direction"] = off_frame_direction_val
+    if had_off_frame_distance:
+        target["off_frame_distance_nm"] = off_frame_distance_val
     target["available_channels"] = _spec_channel_names(target)
     trace_length = _spec_points_per_trace(target)
     if trace_length is not None:
@@ -572,7 +752,10 @@ def _save_spectro_manifest(cache_dir: Path | None, manifest_entries: dict):
             "entries": manifest_entries,
         }
         with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+            # Not meant to be human-read; on a real folder this file was
+            # 49.6MB pretty-printed vs 34.7MB compact (40% smaller) and
+            # json.dump was 5x faster (666ms vs 3333ms measured).
+            json.dump(payload, handle, separators=(',', ':'))
     except Exception:
         pass
 
@@ -611,10 +794,16 @@ def collect_folder_image_paths(viewer, folder: Path) -> list[Path]:
     folder = Path(folder)
     txts = sorted(folder.glob("*.txt"))
     if getattr(viewer, "convert_nanonis_enabled", True):
+        t_conv0 = time.perf_counter()
         converted = convert_nanonis(folder)
+        conv_ms = (time.perf_counter() - t_conv0) * 1000.0
         if converted:
             txts = sorted(list(txts) + list(converted), key=lambda p: str(p).lower())
             log_status(f"Converted {len(converted)} Nanonis scan(s)")
+            log_status(
+                f"[Perf] Nanonis conversion: {conv_ms:.0f} ms total, "
+                f"{conv_ms / max(1, len(converted)):.1f} ms/file avg"
+            )
     else:
             log_status("Skipping Nanonis .sxm conversion (disabled in config)")
     return txts
@@ -852,6 +1041,8 @@ def load_files(
             viewer.matrix_spectros = []
             viewer.matrix_datasets = {}
             viewer.spectros_by_image = defaultdict(list)
+            viewer.files_with_matrix = set()
+            viewer.files_with_spectra = set()
             try:
                 viewer._clear_multi_spec_selection()
             except Exception:
@@ -875,6 +1066,13 @@ def load_files(
         t_specs = time.perf_counter()
 
     QtCore.QTimer.singleShot(0, lambda: viewer.populate_thumbnails_for_channel(viewer.channel_dropdown.currentIndex()))
+    # Refresh toolbar action state now that files are loaded: no image is
+    # previewed yet (that path passes True), but the folder report only needs
+    # a loaded folder, so this enables it without requiring a thumbnail click.
+    try:
+        viewer._update_toolbar_actions(False)
+    except Exception:
+        pass
     log_status(f"{source_label.capitalize()} load complete.")
     log_status(
         f"[Perf] Load stages: headers { (t_headers - t0)*1000:.0f} ms | "
@@ -916,7 +1114,6 @@ def load_spectroscopy_files(viewer, files, folder_hint: Path | None = None, *, a
         files=files,
         image_paths=[str(p) for p in getattr(viewer, "files", []) or []],
         image_meta=getattr(viewer, "image_meta", None),
-        use_disk_cache=False,
     )
     if append:
         merged_specs = prev_specs + list(new_specs or [])
@@ -957,13 +1154,51 @@ def load_spectroscopy_files(viewer, files, folder_hint: Path | None = None, *, a
     return merged_specs
 
 
+@lru_cache(maxsize=4096)
+def _resolve_effective_mtime_cached(path_str: str) -> float:
+    path = Path(path_str)
+    try:
+        meta_path = path.parent / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            src_mtime = meta.get("mtime")
+            if src_mtime is not None:
+                return float(src_mtime)
+    except Exception:
+        pass
+    return path.stat().st_mtime
+
+
+def _resolve_effective_mtime(path: Path | str) -> float:
+    """Real-world mtime for time-based image sorting/matching (used for
+    'sort by file time' mode and as a tie-breaker for ambiguous header dates).
+
+    For a Nanonis-converted header, the header .txt file's own on-disk mtime
+    is when the conversion cache was last (re)written - completely unrelated
+    to acquisition time, and it changes every time the cache gets rebuilt
+    (e.g. after a cache-version bump or a stale/missing cache), which used to
+    make every converted image look like it was acquired "now". The converter
+    writes a sibling meta.json recording the ORIGINAL .sxm source file's
+    mtime at conversion time (providers/nanonis/adapter.py); prefer that
+    when present. Native (non-Nanonis) headers have no such sidecar and fall
+    through to the plain file mtime unchanged.
+
+    Cached: this is queried per-file on every thumbnail repopulate when
+    sorting by date (star/filter/tag changes, dialog closes, ...), so an
+    uncached version means re-reading and re-parsing meta.json off disk for
+    every image on every single repopulate. Nanonis cache paths already
+    embed a content hash, so a changed file gets a brand-new path rather than
+    reusing this one - a plain path-keyed cache is safe for the session."""
+    return _resolve_effective_mtime_cached(str(Path(path)))
+
+
 def _parse_header_datetime(viewer, header, path: Path | str | None = None):
     """Return a sortable key (float timestamp) parsed from header Date/Time if possible; otherwise 0.0.
     Accepts common formats and uses file mtime as a tie-breaker for ambiguous day/month formats."""
     try:
         if path and getattr(viewer, "image_time_source", None) == "mtime":
             try:
-                return Path(path).stat().st_mtime
+                return _resolve_effective_mtime(path)
             except Exception:
                 pass
         date = str(header.get('Date', '') or '').strip()
@@ -994,7 +1229,7 @@ def _parse_header_datetime(viewer, header, path: Path | str | None = None):
         file_dt = None
         if path:
             try:
-                file_dt = datetime.fromtimestamp(Path(path).stat().st_mtime)
+                file_dt = datetime.fromtimestamp(_resolve_effective_mtime(path))
             except Exception:
                 file_dt = None
         if file_dt:
@@ -1030,6 +1265,10 @@ def _load_spectro_disk_payload(cache_dir: Path | None, base_folder: Path | None,
                 "payload_meta": meta_file.name,
                 "payload_data": data_file.name,
                 "cache_key": cache_key,
+                "stored_unusable": (
+                    cache_meta.get("payload_usable") is False
+                    and cache_meta.get("cache_format_version") == _SPECTRO_DISK_CACHE_VERSION
+                ),
             }
         except Exception:
             continue
@@ -1048,10 +1287,15 @@ def _store_spectro_disk_payload(cache_dir: Path | None, base_folder: Path | None
             "size": int(fsize),
             "cached_at": datetime.utcnow().isoformat(),
             "spec_count": len(specs or []),
+            # Recorded so cache reads can tell "this file genuinely has no
+            # drawable data" (serve from cache) apart from "a usable payload
+            # got corrupted" (re-parse to heal).
+            "payload_usable": bool(_payload_specs_usable(specs)),
+            "cache_format_version": _SPECTRO_DISK_CACHE_VERSION,
             "relative_path": _spectro_relative_key(base_folder, filepath),
         }
         with open(meta_file, "w", encoding="utf-8") as handle:
-            json.dump(cache_meta, handle, indent=2)
+            json.dump(cache_meta, handle, separators=(',', ':'))
         serializable_specs = []
         for spec in specs or []:
             entry = dict(spec)
@@ -1077,8 +1321,49 @@ def _store_spectro_disk_payload(cache_dir: Path | None, base_folder: Path | None
         return None
 
 
+def _hoist_constant_spec_fields(spec_entries):
+    """Split a list of already-serialized (_serialize_cache_value'd) spec
+    metadata dicts into (file_meta, trimmed_specs): any key whose value is
+    identical across every spec in the file gets pulled out once into
+    file_meta and removed from each individual spec dict, instead of being
+    duplicated once per point. Real .3ds grid files had ~51% of their
+    per-spec manifest bytes be exactly this kind of duplication (image_key,
+    image_path, channel_name, AxisLabel, grid_rows/grid_cols, ...
+    identical on every grid point). Equality is checked explicitly per key
+    (not assumed from a hardcoded list) so a field that happens to vary for
+    some file - e.g. site_key, which encodes each point's own XY position -
+    is never incorrectly hoisted; reconstruction (_restore_spec_metadata_list)
+    is correct by construction regardless of which keys end up hoisted.
+    No-ops (returns ({}, spec_entries) unchanged) for 0-1 spec entries,
+    where hoisting has no benefit."""
+    if len(spec_entries) < 2:
+        return {}, spec_entries
+    common_keys = None
+    for spec in spec_entries:
+        keys = set(spec.keys())
+        common_keys = keys if common_keys is None else (common_keys & keys)
+    if not common_keys:
+        return {}, spec_entries
+    first = spec_entries[0]
+    rest = spec_entries[1:]
+    constant_keys = {
+        key for key in common_keys
+        if all(spec[key] == first[key] for spec in rest)
+    }
+    if not constant_keys:
+        return {}, spec_entries
+    file_meta = {key: first[key] for key in constant_keys}
+    trimmed = [
+        {key: value for key, value in spec.items() if key not in constant_keys}
+        for spec in spec_entries
+    ]
+    return file_meta, trimmed
+
+
 def _build_manifest_entry(base_folder: Path | None, filepath: Path, mtime: float, fsize: int, specs, payload_info=None):
     info = payload_info or {}
+    serialized_specs = [_serialize_cache_value(spec) for spec in _spec_metadata_list(specs or [])]
+    file_meta, trimmed_specs = _hoist_constant_spec_fields(serialized_specs)
     return {
         "relpath": _spectro_relative_key(base_folder, filepath),
         "filename": filepath.name,
@@ -1090,7 +1375,8 @@ def _build_manifest_entry(base_folder: Path | None, filepath: Path, mtime: float
         "cache_key": info.get("cache_key"),
         "spec_count": len(specs or []),
         "source_type": str((specs or [{}])[0].get("source") or ""),
-        "specs": [_serialize_cache_value(spec) for spec in _spec_metadata_list(specs or [])],
+        "file_meta": file_meta,
+        "specs": trimmed_specs,
     }
 
 
@@ -1102,6 +1388,8 @@ def _parse_spectro_file_payload(filepath: Path, mtime: float):
         try:
             spec_list = parse_nanonis_spectroscopy(filepath)
         except Exception:
+            spec_list = None
+        if not spec_list:
             spec_list = None
     elif ext == ".3ds":
         try:
@@ -1179,6 +1467,49 @@ def _parse_spectro_file_payload(filepath: Path, mtime: float):
     return spec_list, parse_error
 
 
+def _reconcile_spectro_path(viewer, filepath):
+    """Recover a spectrum whose recorded absolute path no longer exists.
+
+    Data copied between machines/locations (e.g. an old ``C:\\DATA\\...``
+    path after the folder was moved under the user profile) leaves specs
+    pointing at dead absolute paths, so hydration reads nothing -> the
+    Spectrum popup shows "No channels". Fall back to the same *filename*
+    inside a folder we currently know about (the loaded spec folder, the
+    last opened dir, or the parent of any already-resolved spectrum).
+    Returns a real ``Path`` or ``None``. This keeps spectroscopy openable
+    across moves without wiping the disk cache each time.
+    """
+    try:
+        name = filepath.name
+    except Exception:
+        name = ""
+    if not name:
+        return None
+    candidates = []
+    for attr in ("spec_folder_path", "last_dir"):
+        folder = getattr(viewer, attr, None)
+        if folder:
+            candidates.append(folder)
+    for spec in (getattr(viewer, "spectros", None) or []):
+        p = spec.get("path") if isinstance(spec, dict) else None
+        if p:
+            candidates.append(Path(p).parent)
+    seen = set()
+    for folder in candidates:
+        try:
+            folder = Path(folder)
+            key = str(folder).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cand = folder / name
+            if cand.exists():
+                return cand
+        except Exception:
+            continue
+    return None
+
+
 def hydrate_spectro_file(viewer, spec_or_path, *, log_perf: bool = True, return_stage: bool = False):
     if not spec_or_path:
         return None
@@ -1188,6 +1519,18 @@ def hydrate_spectro_file(viewer, spec_or_path, *, log_perf: bool = True, return_
         return None
     if not filepath:
         return None
+    # Self-heal stale absolute paths from a moved/synced data folder before
+    # anything keys off them (norm_key, caches, parse). Only pays the cost
+    # when the recorded file is actually missing.
+    try:
+        if not filepath.exists():
+            reconciled = _reconcile_spectro_path(viewer, filepath)
+            if reconciled is not None:
+                filepath = reconciled
+                if isinstance(spec_or_path, dict):
+                    spec_or_path["path"] = str(filepath)
+    except Exception:
+        pass
     norm_key = _normalize_spectro_path_key(filepath)
     try:
         st = filepath.stat()
@@ -1203,8 +1546,15 @@ def hydrate_spectro_file(viewer, spec_or_path, *, log_perf: bool = True, return_
     if cached and not cached.get("deferred"):
         try:
             if abs(float(cached.get("mtime", 0.0)) - float(mtime)) <= _SPECTRO_CACHE_MTIME_TOLERANCE:
+                if cached.get("empty") and not (cached.get("data") or []):
+                    # Cached negative result - the file has no drawable payload.
+                    return (None, "memory") if return_stage else None
                 candidate_specs = [_clone_payload_spec_entry(spec) for spec in (cached.get("data") or [])]
                 if _payload_specs_usable(candidate_specs):
+                    full_specs = candidate_specs
+                elif cached.get("usable") is False:
+                    # Stored straight from a parse that found no data arrays:
+                    # dataless is this file's true state, not cache corruption.
                     full_specs = candidate_specs
                 else:
                     viewer._spectro_cache.pop(norm_key, None)
@@ -1212,11 +1562,23 @@ def hydrate_spectro_file(viewer, spec_or_path, *, log_perf: bool = True, return_
                 viewer._spectro_cache.pop(norm_key, None)
         except Exception:
             full_specs = None
-    folder = getattr(viewer, "spec_folder_path", None) or getattr(viewer, "last_dir", None)
+    # Prefer the spectrum's own real parent folder for cache placement - a single global
+    # (spec_folder_path/last_dir) is wrong for a spectrum whose file lives elsewhere, e.g. a
+    # cross-folder collection. Falls back to the global only when the file's own parent isn't
+    # resolvable (matches prior behavior exactly for the plain single-folder case, where the
+    # file's parent and the global folder are the same directory anyway).
+    folder = None
     try:
-        folder = Path(folder) if folder else filepath.parent
+        if filepath.parent.exists():
+            folder = filepath.parent
     except Exception:
-        folder = filepath.parent
+        folder = None
+    if folder is None:
+        folder = getattr(viewer, "spec_folder_path", None) or getattr(viewer, "last_dir", None)
+        try:
+            folder = Path(folder) if folder else filepath.parent
+        except Exception:
+            folder = filepath.parent
     disk_cache_dir = None
     if getattr(viewer, "spectro_disk_cache_enabled", True):
         try:
@@ -1226,20 +1588,40 @@ def hydrate_spectro_file(viewer, spec_or_path, *, log_perf: bool = True, return_
     if full_specs is None:
         hydrate_stage = "disk"
         full_specs, payload_info = _load_spectro_disk_payload(disk_cache_dir, folder, filepath, mtime, fsize)
+        if full_specs is not None and len(full_specs) == 0:
+            # Cached negative result: this file is already known to contain no
+            # drawable payload - answer without re-parsing it.
+            viewer._spectro_cache[norm_key] = {"mtime": float(mtime), "data": [], "empty": True}
+            return (None, hydrate_stage) if return_stage else None
         if full_specs is not None and not _payload_specs_usable(full_specs):
-            full_specs = None
+            if (payload_info or {}).get("stored_unusable"):
+                # The payload was already dataless when it was stored, i.e. the
+                # file genuinely has no drawable data (metadata-only spectra).
+                # Serve it from cache instead of re-parsing on every request.
+                pass
+            else:
+                # Legacy or corrupted cache entry that should have had data -
+                # drop it and re-parse to heal.
+                full_specs = None
         if full_specs is None:
             hydrate_stage = "parse"
             full_specs, parse_error = _parse_spectro_file_payload(filepath, mtime)
             if parse_error is not None:
                 raise parse_error
             if not full_specs:
+                # Remember the empty outcome in both cache tiers. Without this,
+                # every payload-less .dat (e.g. aborted/limit-only KPFM curves)
+                # was re-parsed from scratch on every thumbnail repopulate -
+                # ~40 ms x hundreds of files froze the UI for over a minute.
+                viewer._spectro_cache[norm_key] = {"mtime": float(mtime), "data": [], "empty": True}
+                _store_spectro_disk_payload(disk_cache_dir, folder, filepath, mtime, fsize, [])
                 return (None, hydrate_stage) if return_stage else None
             payload_info = _store_spectro_disk_payload(disk_cache_dir, folder, filepath, mtime, fsize, full_specs)
         if full_specs:
             viewer._spectro_cache[norm_key] = {
                 "mtime": float(mtime),
                 "data": [_clone_payload_spec_entry(spec) for spec in full_specs],
+                "usable": bool(_payload_specs_usable(full_specs)),
             }
             if getattr(viewer, "spectro_manifest_cache_enabled", True):
                 manifest = getattr(viewer, "_spectro_manifest_entries", {}) or {}
@@ -1315,14 +1697,14 @@ def hydrate_spectro_entries(viewer, specs):
 def refresh_spectro_manifest_from_viewer(viewer):
     if not getattr(viewer, "spectro_manifest_cache_enabled", True):
         return
-    folder = getattr(viewer, "spec_folder_path", None) or getattr(viewer, "last_dir", None)
+    global_folder = getattr(viewer, "spec_folder_path", None) or getattr(viewer, "last_dir", None)
     try:
-        folder = Path(folder) if folder else None
+        global_folder = Path(global_folder) if global_folder else None
     except Exception:
-        folder = None
-    if folder is None:
+        global_folder = None
+    if global_folder is None:
         return
-    cache_dir = folder / ".sxmviewer_spectro_cache"
+    cache_dir = global_folder / ".sxmviewer_spectro_cache"
     manifest = dict(getattr(viewer, "_spectro_manifest_entries", {}) or {})
     grouped = defaultdict(list)
     for spec in getattr(viewer, "spectros", []) or []:
@@ -1336,6 +1718,18 @@ def refresh_spectro_manifest_from_viewer(viewer):
             filepath = Path(spec_list[0].get("path"))
         except Exception:
             continue
+        # Key each entry relative to the spectrum's own real parent folder when possible, not a
+        # single global folder - avoids misattributing/colliding cross-folder entries in a
+        # collection under one folder's relative-path namespace. The on-disk manifest file itself
+        # is still saved under the single global folder (see _flush_spectro_manifest_save in
+        # main_window.py); a fully per-folder manifest is out of scope here, so a cross-folder
+        # collection loses the bulk-manifest fast-path on reopen but never gets wrong data - it
+        # falls back to the per-file disk cache (already folder-correct, see hydrate_spectro_file)
+        # or a fresh parse.
+        try:
+            folder = filepath.parent if filepath.parent.exists() else global_folder
+        except Exception:
+            folder = global_folder
         rel_key = _spectro_relative_key(folder, filepath)
         previous = manifest.get(rel_key, {})
         mtime = previous.get("mtime")
@@ -1579,6 +1973,30 @@ def _scan_spectros(
         )
         return info
 
+    def _image_before_reference(candidates, ref_epoch):
+        if not candidates:
+            return None
+        if ref_epoch is None:
+            return candidates[0]
+        last_before = None
+        for item in candidates:
+            epoch = item.get("epoch")
+            if epoch is None:
+                continue
+            if epoch <= ref_epoch:
+                last_before = item
+            else:
+                break
+        if last_before is not None:
+            return last_before
+        try:
+            return min(
+                candidates,
+                key=lambda item: abs(float(item.get("epoch")) - float(ref_epoch)) if item.get("epoch") is not None else float("inf"),
+            )
+        except Exception:
+            return candidates[0]
+
     def _assign_matrix_reference(spec_list, headers, ref_mtime: float, image_paths=None, image_meta=None):
         """Attach a single reference image_key to all spectra in a matrix dataset.
         We only anchor to actual loaded images (thumbnails). If none exist, we skip anchoring.
@@ -1592,7 +2010,7 @@ def _scan_spectros(
                     p = str(img.get("path"))
                     if not p or "commands" in p.lower():
                         continue
-                    candidates.append((p, img.get("time")))
+                    candidates.append({"path": p, "time": img.get("time")})
         except Exception:
             candidates = []
         if not candidates:
@@ -1600,12 +2018,12 @@ def _scan_spectros(
                 if image_paths:
                     for p in image_paths:
                         if p and "commands" not in str(p).lower():
-                            candidates.append((str(p), None))
+                            candidates.append({"path": str(p), "time": None})
             except Exception:
                 candidates = []
         if not candidates:
             return None
-        valid_paths_lower = {p.lower(): p for p, _ in candidates}
+        valid_paths_lower = {str(item["path"]).lower(): str(item["path"]) for item in candidates}
         ref_epoch = None
         try:
             st = spec_list[0].get("time")
@@ -1615,27 +2033,130 @@ def _scan_spectros(
             ref_epoch = None
         if ref_epoch is None:
             ref_epoch = ref_mtime if ref_mtime is not None else None
-        best_key = None
-        best_delta = None
-        # Prefer loaded images (using image_meta time if available, else file mtime)
-        for pth, tval in candidates:
-            delta = None
+        enriched = []
+        for item in candidates:
+            pth = str(item.get("path") or "")
+            if not pth:
+                continue
+            epoch = None
+            tval = item.get("time")
             try:
                 if isinstance(tval, datetime):
-                    delta = abs(tval.timestamp() - ref_epoch) if ref_epoch is not None else None
-                if delta is None:
-                    ht = Path(pth).stat().st_mtime
-                    delta = abs(ht - ref_epoch) if ref_epoch is not None else None
+                    epoch = float(tval.timestamp())
+                elif tval is not None:
+                    epoch = float(tval)
             except Exception:
-                delta = None
-            if delta is None:
+                epoch = None
+            if epoch is None:
+                try:
+                    epoch = float(Path(pth).stat().st_mtime)
+                except Exception:
+                    epoch = None
+            try:
+                header, _fds = headers.get(str(pth), (None, None))
+                extent = viewer._header_extent(header or {}) if header is not None else None
+                angle = viewer._header_scan_angle(header or {}) if header is not None else 0.0
+            except Exception:
+                extent = None
+                angle = 0.0
+            enriched.append({"path": pth, "epoch": epoch, "extent": extent, "angle": angle})
+        enriched.sort(key=lambda item: item.get("epoch") if item.get("epoch") is not None else float("-inf"))
+
+        best_key = None
+        xy_specs = []
+        for spec in spec_list:
+            try:
+                xy_specs.append((float(spec.get("x")), float(spec.get("y"))))
+            except Exception:
                 continue
-            if best_delta is None or delta < best_delta:
-                best_delta = delta
-                best_key = pth
-        # Final fallback: first candidate
+        if xy_specs:
+            # Vectorized containment check: this loop runs once per candidate
+            # reference image (commonly 100s in a folder), and used to check
+            # every spectrum in the matrix (100s-1000s) one at a time in pure
+            # Python, an uncached O(images x spectra) cost paid on every load
+            # regardless of how "warm" the spectro cache is. Building the xy
+            # array once and testing all spectra per candidate in one numpy
+            # call instead turns that inner loop into a single vectorized op.
+            #
+            # Rotation-aware: a naive axis-aligned bbox test (the previous
+            # version of this check) silently misjudges any candidate whose
+            # scan Angle is non-zero, since a rotated image's real footprint
+            # is a rotated parallelogram, not the box XScanRange/YScanRange
+            # describe when centered unrotated. Confirmed on real data: a
+            # grid genuinely acquired just after a small rotated zoom scan
+            # was anchored instead to an unrelated, much larger, older
+            # overview scan whose oversized unrotated bbox happened to
+            # geometrically swallow the grid's points, repeatedly, across
+            # many different grids in the same folder. Mirrors the same
+            # rotate-then-normalize convention as _spec_within_extent
+            # (gui/spectroscopy/controller.py) - kept as a separate
+            # vectorized copy here rather than calling that per-point
+            # function in a loop, since this runs once per (candidate image
+            # x whole grid) pair, not once per point.
+            xy_arr = np.asarray(xy_specs, dtype=float)
+            xs = xy_arr[:, 0]
+            ys = xy_arr[:, 1]
+            n_specs = float(xs.size)
+            margin_frac = 0.02
+            scored = []
+            for item in enriched:
+                extent = item.get("extent")
+                if not extent:
+                    continue
+                try:
+                    x0, x1, y1, y0 = extent
+                    xspan = x1 - x0
+                    yspan = y1 - y0
+                    if xspan <= 0 or yspan <= 0:
+                        continue
+                    cx = 0.5 * (x0 + x1)
+                    cy = 0.5 * (y0 + y1)
+                    dx = xs - cx
+                    dy = ys - cy
+                    angle_deg = item.get("angle") or 0.0
+                    if angle_deg:
+                        theta = math.radians(angle_deg)
+                        cos_t, sin_t = math.cos(theta), math.sin(theta)
+                        u = dx * cos_t - dy * sin_t
+                        v = dx * sin_t + dy * cos_t
+                    else:
+                        u, v = dx, dy
+                    bound = 0.5 + margin_frac
+                    mask = (
+                        (u >= -bound * xspan) & (u <= bound * xspan)
+                        & (v >= -bound * yspan) & (v <= bound * yspan)
+                    )
+                    hits = int(np.count_nonzero(mask))
+                except Exception:
+                    continue
+                if hits > 0:
+                    scored.append((hits / n_specs, hits, item))
+            if scored:
+                # Prefer candidates that contain (nearly) the whole grid over
+                # whichever candidate merely has the highest raw hit count -
+                # otherwise a big, older overview scan that happens to
+                # geometrically overlap part of many different grids
+                # systematically outranks the small, correct, just-preceding
+                # zoom scan that actually and fully contains any one of them.
+                # Only fall back to "best partial coverage" when nothing
+                # comes close to full containment (e.g. the grid genuinely
+                # straddles an image edge).
+                FULL_COVERAGE = 0.98
+                full_candidates = [item for coverage, _hits, item in scored if coverage >= FULL_COVERAGE]
+                if full_candidates:
+                    chosen = _image_before_reference(full_candidates, ref_epoch)
+                else:
+                    max_hits = max(hits for _coverage, hits, _item in scored)
+                    spatial_candidates = [item for _coverage, hits, item in scored if hits == max_hits]
+                    chosen = _image_before_reference(spatial_candidates, ref_epoch)
+                if chosen is not None:
+                    best_key = chosen.get("path")
         if not best_key:
-            best_key = candidates[0][0]
+            chosen = _image_before_reference(enriched, ref_epoch)
+            if chosen is not None:
+                best_key = chosen.get("path")
+        if not best_key and enriched:
+            best_key = enriched[0]["path"]
         if best_key:
             key_norm = best_key
             if key_norm.lower() in valid_paths_lower:
@@ -1661,7 +2182,9 @@ def _scan_spectros(
             disk_cache_dir = None
     manifest_enabled = bool(getattr(viewer, "spectro_manifest_cache_enabled", True))
     lazy_payload = bool(getattr(viewer, "spectro_lazy_payload_enabled", True))
+    _manifest_load_t0 = time.perf_counter()
     manifest_entries = _load_spectro_manifest(disk_cache_dir) if manifest_enabled else {}
+    stats["manifest_load_ms"] = (time.perf_counter() - _manifest_load_t0) * 1000.0
     manifest_changed = False
     cache = viewer._spectro_cache
     seen_keys = set()
@@ -1711,10 +2234,17 @@ def _scan_spectros(
     bulk_manifest_ready = False
     if manifest_enabled and lazy_payload and file_records:
         try:
-            bulk_manifest_ready = all(
-                _manifest_entry_valid(manifest_entries.get(record["rel_key"]), mtime=record["mtime"], fsize=record["size"])
-                for record in file_records
-            )
+            invalid_records = [
+                record for record in file_records
+                if not _manifest_entry_valid(manifest_entries.get(record["rel_key"]), mtime=record["mtime"], fsize=record["size"])
+            ]
+            bulk_manifest_ready = not invalid_records
+            if invalid_records:
+                log_status(
+                    f"[Perf] Bulk manifest path skipped ({len(invalid_records)}/{len(file_records)} file(s) "
+                    f"invalidated it): {', '.join(r['path'].name for r in invalid_records[:5])}"
+                    + (" ..." if len(invalid_records) > 5 else "")
+                )
         except Exception:
             bulk_manifest_ready = False
 
@@ -1733,7 +2263,7 @@ def _scan_spectros(
                 stats['dat_files'] += 1
             seen_keys.add(norm_key)
             entry = manifest_entries.get(record["rel_key"]) or {}
-            spec_list = [_restore_spec_metadata(spec_entry) for spec_entry in (entry.get("specs") or [])]
+            spec_list = _restore_spec_metadata_list(entry)
             specs.extend(spec_list)
             stats["manifest_hits"] = stats.get("manifest_hits", 0) + 1
         stats["manifest_ms"] += (time.perf_counter() - t_manifest) * 1000.0
@@ -1759,8 +2289,14 @@ def _scan_spectros(
             manifest_changed = True
         viewer._spectro_manifest_entries = manifest_entries
         if manifest_changed:
+            # Don't call viewer._schedule_spectro_manifest_save() directly here:
+            # _scan_spectros can run on a background thread (see
+            # _run_pending_spectro_load_async in main_window.py), and that
+            # method starts a QTimer owned by the GUI thread - unsafe to
+            # start from any other thread. Callers apply this flag back on
+            # the main thread once _scan_spectros returns.
             if hasattr(viewer, "_schedule_spectro_manifest_save"):
-                viewer._schedule_spectro_manifest_save()
+                viewer._spectro_manifest_pending_save = True
             else:
                 _save_spectro_manifest(disk_cache_dir, manifest_entries)
         specs.sort(key=lambda s: s.get('time') or datetime.min)
@@ -1773,10 +2309,11 @@ def _scan_spectros(
             f"  Spectra: {stats['total_specs']} total  |  from singles: {stats['single_entries']} traces  |  from matrices: {stats['matrix_specs']} traces"
         )
         log_status(
-            f"  Cache: {len(file_records)}/{len(file_records)} files (100% hit rate)  |  memory: 0  |  manifest: {stats.get('manifest_hits', 0)}  |  disk: 0  |  parsed: 0"
+            f"  [Perf] Cache: {len(file_records)}/{len(file_records)} files (100% hit rate)  |  memory: 0  |  manifest: {stats.get('manifest_hits', 0)}  |  disk: 0  |  parsed: 0"
         )
         log_status(
-            f"  Timings: discovery {stats.get('discovery_ms', 0.0):.0f} ms  |  manifest {stats.get('manifest_ms', 0.0):.0f} ms  |  disk payload 0 ms  |  raw parse 0 ms"
+            f"  [Perf] Timings: manifest load {stats.get('manifest_load_ms', 0.0):.0f} ms  |  discovery {stats.get('discovery_ms', 0.0):.0f} ms  |  "
+            f"manifest {stats.get('manifest_ms', 0.0):.0f} ms  |  disk payload 0 ms  |  raw parse 0 ms  |  matrix anchor {stats.get('anchor_ms', 0.0):.0f} ms"
         )
         try:
             json_line = {
@@ -1795,6 +2332,7 @@ def _scan_spectros(
             pass
         return specs, stats
 
+    _loop_t0 = time.perf_counter()
     for idx, record in enumerate(file_records, 1):
         spec_list = None
         parse_error = None
@@ -1821,7 +2359,7 @@ def _scan_spectros(
         if viewer.spectro_eager_limit and idx > viewer.spectro_eager_limit:
             if manifest_entry and _manifest_entry_valid(manifest_entry, mtime=mtime, fsize=fsize):
                 t_manifest = time.perf_counter()
-                spec_list = [_restore_spec_metadata(entry) for entry in (manifest_entry.get("specs") or [])]
+                spec_list = _restore_spec_metadata_list(manifest_entry)
                 stats["manifest_ms"] += (time.perf_counter() - t_manifest) * 1000.0
                 stats["manifest_hits"] = stats.get("manifest_hits", 0) + 1
             elif disk_cache_dir:
@@ -1836,7 +2374,6 @@ def _scan_spectros(
             if not spec_list:
                 stats['deferred_files'] += 1
                 cache[norm_key] = {'mtime': mtime, 'deferred': True, 'path': str(p)}
-                viewer._spectro_deferred.add(norm_key)
                 continue
 
         if cached and abs(cached.get('mtime', 0.0) - mtime) <= _SPECTRO_CACHE_MTIME_TOLERANCE and not cached.get('deferred'):
@@ -1845,11 +2382,25 @@ def _scan_spectros(
             spec_list = _spec_metadata_list(restored) if lazy_payload else [_clone_spec_entry(entry) for entry in restored]
             stats["cache_hits"] = stats.get("cache_hits", 0) + 1
         else:
+            # Tracks whether spec_list came from the manifest or the per-file
+            # disk cache (both already-persisted, metadata-only-or-better
+            # sources) as opposed to a genuine fresh parse. Only a fresh parse
+            # may be written (back) to the in-memory cache / disk payload
+            # cache below - manifest restores are metadata-only by design
+            # (never carry channels/V), so writing one to the disk payload
+            # cache would permanently overwrite a file's real cached curve
+            # data with a false "no usable payload" negative. This was a real
+            # bug: it silently poisoned the disk cache (and this run's
+            # in-memory viewer._spectro_cache, since `cache` is that same
+            # dict) for the vast majority of files on affected folders,
+            # making previously-working spectra fail to open.
+            restored_from_persisted_source = False
             if manifest_entry and _manifest_entry_valid(manifest_entry, mtime=mtime, fsize=fsize):
                 t_manifest = time.perf_counter()
-                spec_list = [_restore_spec_metadata(entry) for entry in (manifest_entry.get("specs") or [])]
+                spec_list = _restore_spec_metadata_list(manifest_entry)
                 stats["manifest_ms"] += (time.perf_counter() - t_manifest) * 1000.0
                 stats["manifest_hits"] = stats.get("manifest_hits", 0) + 1
+                restored_from_persisted_source = True
             elif disk_cache_dir:
                 t_disk = time.perf_counter()
                 disk_cached, payload_info = _load_spectro_disk_payload(disk_cache_dir, folder_path, p, mtime, fsize)
@@ -1859,6 +2410,7 @@ def _scan_spectros(
                     manifest_changed = True
                     spec_list = _spec_metadata_list(disk_cached) if lazy_payload else [_clone_spec_entry(entry) for entry in disk_cached]
                     stats["disk_cache_hits"] = stats.get("disk_cache_hits", 0) + 1
+                    restored_from_persisted_source = True
             if spec_list is None and disk_cache_dir and cache_miss_logged < 10:
                 cache_miss_logged += 1
                 try:
@@ -1880,15 +2432,25 @@ def _scan_spectros(
                 continue
             if not spec_list:
                 stats['empty_files'] += 1
+                if not restored_from_persisted_source:
+                    # Remember the empty outcome so the next folder load's bulk
+                    # manifest path (see bulk_manifest_ready above) doesn't treat
+                    # this file as "never scanned" and fall back to the slow
+                    # per-file loop for the whole folder just because of it.
+                    cache[norm_key] = {'mtime': mtime, 'data': [], 'empty': True}
+                    if manifest_enabled:
+                        manifest_entries[rel_key] = _build_manifest_entry(folder_path, p, mtime, fsize, [])
+                        manifest_changed = True
                 continue
-            cache[norm_key] = {'mtime': mtime, 'data': [_clone_payload_spec_entry(spec) for spec in spec_list]}
-            if disk_cache_dir:
-                payload_info = _store_spectro_disk_payload(disk_cache_dir, folder_path, p, mtime, fsize, spec_list)
-            if manifest_enabled:
-                manifest_entries[rel_key] = _build_manifest_entry(folder_path, p, mtime, fsize, spec_list, payload_info=payload_info)
-                manifest_changed = True
-            if lazy_payload:
-                spec_list = _spec_metadata_list(spec_list)
+            if not restored_from_persisted_source:
+                cache[norm_key] = {'mtime': mtime, 'data': [_clone_payload_spec_entry(spec) for spec in spec_list]}
+                if disk_cache_dir:
+                    payload_info = _store_spectro_disk_payload(disk_cache_dir, folder_path, p, mtime, fsize, spec_list)
+                if manifest_enabled:
+                    manifest_entries[rel_key] = _build_manifest_entry(folder_path, p, mtime, fsize, spec_list, payload_info=payload_info)
+                    manifest_changed = True
+                if lazy_payload:
+                    spec_list = _spec_metadata_list(spec_list)
         for spec in spec_list or []:
             _reset_spec_classification(spec)
         specs.extend(spec_list or [])
@@ -1897,8 +2459,13 @@ def _scan_spectros(
             grid_rows = info.get("grid_rows") or 1
             grid_cols = info.get("grid_cols") or 1
             _ensure_grid_indices(spec_list, grid_rows, grid_cols, zero_based=info.get("zero_based", True))
-            # Anchor all points of the matrix to a single reference image to avoid scatter
+            # Anchor all points of the matrix to a single reference image to avoid scatter.
+            # This is an uncached O(candidate_images x spectra_in_matrix) scan (see
+            # _assign_matrix_reference's inner containment loop) that reruns in full
+            # on every load regardless of how "warm" the spectro cache is.
+            t_anchor = time.perf_counter()
             chosen_key = _assign_matrix_reference(spec_list, viewer.headers, mtime, image_paths=image_paths, image_meta=getattr(viewer, "image_meta", None))
+            stats["anchor_ms"] = stats.get("anchor_ms", 0.0) + (time.perf_counter() - t_anchor) * 1000.0
             if not chosen_key and image_paths:
                 fallback_key = image_paths[0]
                 for s in spec_list:
@@ -1954,6 +2521,7 @@ def _scan_spectros(
         if total and (idx % progress_step == 0 or idx == total):
             pct = idx / total * 100.0
             log_status(f"  - spectroscopy load {idx}/{total} ({pct:4.0f}%)")
+    stats["loop_total_ms"] = (time.perf_counter() - _loop_t0) * 1000.0
     try:
         log_status("  - spectroscopy finalize metadata...")
     except Exception:
@@ -1969,8 +2537,10 @@ def _scan_spectros(
             manifest_changed = True
         viewer._spectro_manifest_entries = manifest_entries
         if manifest_changed:
+            # See the matching comment above in the bulk-manifest-path branch:
+            # deferred to a flag since this can run on a background thread.
             if hasattr(viewer, "_schedule_spectro_manifest_save"):
-                viewer._schedule_spectro_manifest_save()
+                viewer._spectro_manifest_pending_save = True
             else:
                 _save_spectro_manifest(disk_cache_dir, manifest_entries)
     try:
@@ -2001,10 +2571,13 @@ def _scan_spectros(
     if total:
         cache_pct = (total_cached / max(total, 1)) * 100
         log_status(
-            f"  Cache: {total_cached}/{total} files ({cache_pct:.0f}% hit rate)  |  memory: {cache_hits}  |  manifest: {manifest_hits}  |  disk: {disk_hits}  |  parsed: {cache_miss}"
+            f"  [Perf] Cache: {total_cached}/{total} files ({cache_pct:.0f}% hit rate)  |  memory: {cache_hits}  |  manifest: {manifest_hits}  |  disk: {disk_hits}  |  parsed: {cache_miss}"
         )
         log_status(
-            f"  Timings: discovery {stats.get('discovery_ms', 0.0):.0f} ms  |  manifest {stats.get('manifest_ms', 0.0):.0f} ms  |  disk payload {stats.get('disk_cache_ms', 0.0):.0f} ms  |  raw parse {stats.get('parse_ms', 0.0):.0f} ms"
+            f"  [Perf] Timings: manifest load {stats.get('manifest_load_ms', 0.0):.0f} ms  |  discovery {stats.get('discovery_ms', 0.0):.0f} ms  |  "
+            f"manifest {stats.get('manifest_ms', 0.0):.0f} ms  |  disk payload {stats.get('disk_cache_ms', 0.0):.0f} ms  |  "
+            f"raw parse {stats.get('parse_ms', 0.0):.0f} ms  |  matrix anchor {stats.get('anchor_ms', 0.0):.0f} ms  |  "
+            f"per-file loop total {stats.get('loop_total_ms', 0.0):.0f} ms"
         )
     if viewer.matrix_datasets:
         log_status("  Matrix datasets:")

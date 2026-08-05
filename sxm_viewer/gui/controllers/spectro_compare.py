@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ..._shared import QtCore, QtWidgets
 from ..spectroscopy import popups as spectro_popups
+from ..spectroscopy.controller import _format_position_nm
 
 
 class SpectroCompareController:
@@ -64,8 +65,6 @@ class SpectroCompareController:
         self.update_spec_selection_label()
         if not viewer._multi_spec_selection:
             viewer._multi_single_popup_anchor = None
-        if len(viewer._multi_spec_selection) >= 2:
-            self.open_multi_popup()
 
     def clear_multi_spec_selection(self):
         viewer = self.viewer
@@ -86,6 +85,23 @@ class SpectroCompareController:
         count = len(getattr(viewer, "_multi_spec_selection", []))
         if hasattr(viewer, 'spec_selection_label'):
             viewer.spec_selection_label.setText(f"Selected: {count}")
+        tray = getattr(viewer, "spec_selection_tray", None)
+        if tray is not None:
+            try:
+                tray.setVisible(count >= 1)
+                label = getattr(viewer, "spec_selection_tray_label", None)
+                if label is not None:
+                    label.setText("1 spectrum selected" if count == 1 else f"{count} spectra selected")
+                compare_btn = getattr(viewer, "spec_selection_tray_compare_btn", None)
+                if compare_btn is not None:
+                    compare_btn.setEnabled(count >= 2)
+                    compare_btn.setToolTip(
+                        "Open the selected spectra together in a comparison window"
+                        if count >= 2
+                        else "Shift+click a second marker to compare"
+                    )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def prime_multi_selection_anchor(self, current_spec):
@@ -103,11 +119,22 @@ class SpectroCompareController:
             return
         viewer._multi_spec_selection.append(candidate)
         viewer._multi_spec_selection_keys.add(key)
+        # If the spec plain-clicked right before this Ctrl+click already has
+        # its own open popup, adopt it as this group's anchor - otherwise
+        # the upcoming append_spec_to_single_popup(current_spec) call finds
+        # no anchor and opens a second, disconnected popup instead of
+        # joining the one already on screen, breaking "Ctrl+click builds a
+        # single comparison group" whenever the very first click wasn't
+        # itself a Ctrl+click.
+        if not getattr(viewer, "_multi_single_popup_anchor", None):
+            existing_dlg = self._single_popup_for_key(key)
+            if existing_dlg is not None:
+                viewer._multi_single_popup_anchor = key
         self.update_spec_selection_label()
         viewer._last_clicked_spec = None
 
     # ------------------------------------------------------------------
-    def append_spec_to_single_popup(self, spec):
+    def append_spec_to_single_popup(self, spec, initial_color=None):
         viewer = self.viewer
         if not spec:
             return
@@ -116,7 +143,7 @@ class SpectroCompareController:
             return
         dlg = self._active_single_popup()
         if dlg is None:
-            dlg = self.ensure_single_popup(spec)
+            dlg = self.ensure_single_popup(spec, initial_color=initial_color)
             if dlg:
                 viewer._multi_single_popup_anchor = key
             return
@@ -124,11 +151,11 @@ class SpectroCompareController:
             return
         if hasattr(dlg, "add_external_spectrum"):
             try:
-                dlg.add_external_spectrum(spec)
+                dlg.add_external_spectrum(spec, color=initial_color)
             except Exception:
                 pass
 
-    def ensure_single_popup(self, spec):
+    def ensure_single_popup(self, spec, initial_color=None):
         viewer = self.viewer
         if not spec:
             return None
@@ -143,13 +170,13 @@ class SpectroCompareController:
                     except Exception:
                         pass
                     return dlg
-        return self.open_single_popup(spec)
+        return self.open_single_popup(spec, initial_color=initial_color)
 
-    def open_single_popup(self, spec):
+    def open_single_popup(self, spec, initial_color=None):
         viewer = self.viewer
         if not viewer._spectros_loaded:
             viewer.ensure_spectros_loaded(refresh=False)
-        return spectro_popups._open_spectroscopy_popup(viewer, spec)
+        return spectro_popups._open_spectroscopy_popup(viewer, spec, initial_color=initial_color)
 
     def open_stack_popup(self, spec, file_key=""):
         viewer = self.viewer
@@ -159,13 +186,65 @@ class SpectroCompareController:
         if not viewer._spectros_loaded:
             viewer.ensure_spectros_loaded(refresh=False)
         title = self._stack_popup_title(spec, len(specs))
-        return spectro_popups._open_spectroscopy_compare_popup(viewer, specs, title=title)
+        dlg = spectro_popups._open_spectroscopy_compare_popup(viewer, specs, title=title)
+        self._configure_compare_popup(dlg, spec, specs)
+        return dlg
+
+    def open_site_popup(self, spec, file_key=""):
+        viewer = self.viewer
+        specs = self.site_specs_for_popup(spec, file_key=file_key)
+        if len(specs) < 2:
+            if viewer._is_matrix_spec(spec) and file_key:
+                return viewer._open_matrix_explorer_for_file(file_key)
+            return self.open_single_popup(spec)
+        if not viewer._spectros_loaded:
+            viewer.ensure_spectros_loaded(refresh=False)
+        title = self._site_popup_title(spec, len(specs))
+        dlg = spectro_popups._open_spectroscopy_compare_popup(viewer, specs, title=title)
+        self._configure_compare_popup(dlg, spec, specs)
+        return dlg
 
     def open_multi_popup(self):
         viewer = self.viewer
         if not viewer._spectros_loaded:
             viewer.ensure_spectros_loaded(refresh=False)
         return spectro_popups._open_multi_spectroscopy_popup(viewer)
+
+    def all_specs_for_image(self, file_key):
+        """All non-matrix (solo/site) spectra assigned to one image, deduped
+        by identity - matrix/grid points are excluded since they belong in
+        the Grid Map Explorer, not a trace-comparison plot."""
+        viewer = self.viewer
+        file_key = str(file_key or "")
+        if not file_key:
+            return []
+        bucket = list((getattr(viewer, "spectros_by_image", {}) or {}).get(file_key, []) or [])
+        deduped = []
+        seen = set()
+        for entry in bucket:
+            if viewer._is_matrix_spec(entry):
+                continue
+            ident = self.spec_identity_key(entry) or str(Path(str(entry.get("path") or "")))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            deduped.append(entry)
+        deduped.sort(key=self._stack_sort_key)
+        return deduped
+
+    def open_all_specs_popup(self, file_key):
+        viewer = self.viewer
+        specs = self.all_specs_for_image(file_key)
+        if not specs:
+            return None
+        if len(specs) < 2:
+            return self.open_single_popup(specs[0])
+        if not viewer._spectros_loaded:
+            viewer.ensure_spectros_loaded(refresh=False)
+        title = f"All spectra on this image ({len(specs)})"
+        dlg = spectro_popups._open_spectroscopy_compare_popup(viewer, specs, title=title)
+        self._configure_compare_popup(dlg, specs[0], specs)
+        return dlg
 
     def stack_specs_for_popup(self, spec, file_key=""):
         if not spec:
@@ -200,18 +279,79 @@ class SpectroCompareController:
         members.sort(key=self._stack_sort_key)
         return members
 
+    def site_specs_for_popup(self, spec, file_key=""):
+        if not spec:
+            return []
+        site_key = str(spec.get("site_key") or "").strip()
+        if not site_key:
+            return self.stack_specs_for_popup(spec, file_key=file_key)
+        viewer = self.viewer
+        site_index = getattr(viewer, "spectro_site_index", {}) or {}
+        site = site_index.get(site_key)
+        members = list(site.get("members") or []) if isinstance(site, dict) else []
+        if not members:
+            bucket = list((getattr(viewer, "spectros_by_image", {}) or {}).get(str(file_key or spec.get("image_key") or ""), []) or [])
+            members = [entry for entry in bucket if str(entry.get("site_key") or "").strip() == site_key]
+        deduped = []
+        seen = set()
+        for entry in members:
+            ident = self.spec_identity_key(entry) or str(Path(str(entry.get("path") or "")))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            deduped.append(entry)
+        if not deduped:
+            return [spec]
+        deduped.sort(key=self._stack_sort_key)
+        return deduped
+
     def _stack_popup_title(self, spec, count):
         display = str(spec.get("xy_stack_display") or "").strip() or f"x{count}"
-        x_val = spec.get("x")
-        y_val = spec.get("y")
+        position = _format_position_nm(spec.get("x"), spec.get("y"))
+        if position:
+            return f"Z series ({display}) - {position}"
+        return f"Z series ({display})"
+
+    def _site_popup_title(self, spec, count):
+        display = str(spec.get("site_display") or "").strip()
+        if not display:
+            display = _format_position_nm(spec.get("x"), spec.get("y"))
+        if display:
+            return f"{display} ({count} spectra)"
+        return f"Spectra at one position ({count})"
+
+    def _configure_compare_popup(self, dlg, seed_spec, specs):
+        if dlg is None:
+            return
+        preferred_channel = str((seed_spec or {}).get("channel_name") or "").strip()
         try:
-            if x_val is not None and y_val is not None:
-                position = f" ({float(x_val):.1f}, {float(y_val):.1f}) nm"
-            else:
-                position = ""
+            if preferred_channel and hasattr(dlg, "channel_combo"):
+                idx = dlg.channel_combo.findText(preferred_channel)
+                if idx >= 0 and dlg.channel_combo.currentIndex() != idx:
+                    dlg.channel_combo.setCurrentIndex(idx)
         except Exception:
-            position = ""
-        return f"Spectroscopy stack: {display}{position}"
+            pass
+        has_z_stack = any(bool(spec.get("site_has_z_stack") or spec.get("xy_stack_z_varies")) for spec in list(specs or []))
+        if not has_z_stack:
+            return
+        try:
+            if hasattr(dlg, "position_inset_cb") and not dlg.position_inset_cb.isChecked():
+                dlg.position_inset_cb.setChecked(True)
+        except Exception:
+            pass
+        try:
+            if hasattr(dlg, "waterfall_cb") and not dlg.waterfall_cb.isChecked():
+                dlg.waterfall_cb.setChecked(True)
+        except Exception:
+            pass
+        try:
+            if hasattr(dlg, "offset_spin") and hasattr(dlg, "_estimate_channel_scale") and hasattr(dlg, "channel_combo"):
+                channel = dlg.channel_combo.currentText()
+                scale = float(dlg._estimate_channel_scale(channel))
+                if math.isfinite(scale) and scale > 0 and abs(float(dlg.offset_spin.value())) <= 1e-18:
+                    dlg.offset_spin.setValue(scale * 0.35)
+        except Exception:
+            pass
 
     @staticmethod
     def _stack_sort_key(spec):
@@ -236,7 +376,15 @@ class SpectroCompareController:
         viewer = self.viewer
         if not spec or not viewer.show_spectra:
             return False
-        if modifiers & QtCore.Qt.ShiftModifier:
+        # Shift still works where it isn't otherwise claimed (thumbnail
+        # marker clicks); Ctrl is the multi-select trigger on the main/popup
+        # preview canvas, where Shift is reserved for the crop-rectangle
+        # drag (see detail_preview_canvas.py's _on_base_click). Matrix/grid
+        # points are excluded here so Ctrl+click on one still falls through
+        # to the original "force matrix explorer" behavior below instead of
+        # being added to a compare-plot selection they don't belong in.
+        multi_select_requested = bool(modifiers & (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier))
+        if multi_select_requested and spec.get('matrix_index') is None:
             self.prime_multi_selection_anchor(spec)
             key = self.spec_identity_key(spec) if spec else None
             already_selected = bool(key and key in getattr(viewer, "_multi_spec_selection_keys", set()))
@@ -304,8 +452,28 @@ class SpectroCompareController:
         if event is None:
             return mods
         try:
-            if hasattr(event, "modifiers"):
-                return event.modifiers()
+            raw = getattr(event, "modifiers", None)
+            if callable(raw):
+                # A genuine Qt event (e.g. thumbnail marker clicks) - modifiers()
+                # is a real bound method here.
+                return raw()
+            if isinstance(raw, (frozenset, set, list, tuple)):
+                # A matplotlib MouseEvent (preview/popup canvas marker clicks):
+                # `.modifiers` is a plain collection of lowercase modifier-name
+                # strings ("ctrl", "shift", "alt", ...), NOT a callable -
+                # `event.modifiers()` raised TypeError here and was silently
+                # swallowed below, so Ctrl/Shift-click never actually registered
+                # for markers on this canvas.
+                names = {str(m).lower() for m in raw}
+                if "ctrl" in names or "control" in names:
+                    mods |= QtCore.Qt.ControlModifier
+                if "shift" in names:
+                    mods |= QtCore.Qt.ShiftModifier
+                if "alt" in names:
+                    mods |= QtCore.Qt.AltModifier
+                if "super" in names or "meta" in names or "cmd" in names:
+                    mods |= QtCore.Qt.MetaModifier
+                return mods
             gui_evt = getattr(event, "guiEvent", None)
             if gui_evt is not None and hasattr(gui_evt, "modifiers"):
                 return gui_evt.modifiers()

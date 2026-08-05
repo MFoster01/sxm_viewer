@@ -5,9 +5,12 @@ the GUI and the native (Omicron/Anfatec) pipeline.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import math
+import os
 import re
 import shutil
 import sys
@@ -33,7 +36,19 @@ except ImportError:  # pragma: no cover - python <3.5 not supported, safeguard o
 
 
 NANONIS_CACHE_DIRNAME = ".sxmviewer_nanonis"
-NANONIS_CACHE_VERSION = 2
+# Bumped: ScanTimeForward[s]/ScanTimeBackward[s] were previously never written
+# to the cached header (isinstance(scan_time, (list, tuple)) silently missed
+# nanonispy2's numpy-array scan_time) - existing caches need rebuilding to
+# pick up the fix.
+#
+# v5: the Direction=up row flip (see _extract_scan_channels) was added
+# WITHOUT bumping this version, so every up-scan converted before that fix
+# kept serving a vertically mirrored array from its cache - confirmed
+# against Nanonis's own Scan Inspector on real data (K1202, Direction=up,
+# cache generated 4 days before the flip commit). Any change to the
+# conversion's data-orientation semantics MUST bump this constant, or the
+# fix silently applies only to never-before-converted files.
+NANONIS_CACHE_VERSION = 5
 _NANONIS_READ = None
 _IMPORT_ERROR = None
 
@@ -45,6 +60,17 @@ class ChannelExport:
     phys_unit: str
     scale: float = 1.0
     offset: float = 0.0
+
+
+_NANONIS_CONVERT_MAX_WORKERS = min(8, max(1, (os.cpu_count() or 4)))
+
+
+def _convert_one_scan_safe(reader, scan_path: Path, cache_root: Path) -> Optional[Path]:
+    try:
+        return _convert_scan_file(reader, scan_path, cache_root)
+    except Exception as exc:
+        log(f"[Nanonis] Failed to convert {scan_path.name}: {exc}")
+        return None
 
 
 def prepare_nanonis_folder(folder: Path | str) -> List[Path]:
@@ -59,15 +85,18 @@ def prepare_nanonis_folder(folder: Path | str) -> List[Path]:
         return []
     cache_root = folder / NANONIS_CACHE_DIRNAME
     cache_root.mkdir(exist_ok=True)
-    generated: List[Path] = []
-    for scan_path in scan_files:
-        try:
-            header_path = _convert_scan_file(reader, scan_path, cache_root)
-        except Exception as exc:
-            log(f"[Nanonis] Failed to convert {scan_path.name}: {exc}")
-            continue
-        if header_path is not None:
-            generated.append(header_path)
+    # Each scan file converts into its own hashed cache subdirectory (see
+    # _cache_dir_for), so conversions are fully independent of each other —
+    # a first-time load of a folder full of never-before-seen scans (no
+    # cache hits at all) was previously converting them one at a time at
+    # ~75-85 ms/file, which adds up to many seconds for a few hundred files.
+    # ThreadPoolExecutor.map still returns results in `scan_files` order.
+    with ThreadPoolExecutor(max_workers=_NANONIS_CONVERT_MAX_WORKERS) as executor:
+        results = executor.map(
+            lambda scan_path: _convert_one_scan_safe(reader, scan_path, cache_root),
+            scan_files,
+        )
+        generated = [header_path for header_path in results if header_path is not None]
     return generated
 
 
@@ -76,7 +105,7 @@ def prepare_nanonis_files(paths: Iterable[Path | str]) -> List[Path]:
     reader = _ensure_nanonis_reader()
     if reader is None:
         return []
-    generated: List[Path] = []
+    jobs: List[Tuple[Path, Path]] = []
     seen = set()
     for raw_path in paths or []:
         scan_path = Path(raw_path)
@@ -91,13 +120,15 @@ def prepare_nanonis_files(paths: Iterable[Path | str]) -> List[Path]:
         seen.add(key)
         cache_root = scan_path.parent / NANONIS_CACHE_DIRNAME
         cache_root.mkdir(exist_ok=True)
-        try:
-            header_path = _convert_scan_file(reader, scan_path, cache_root)
-        except Exception as exc:
-            log(f"[Nanonis] Failed to convert {scan_path.name}: {exc}")
-            continue
-        if header_path is not None:
-            generated.append(header_path)
+        jobs.append((scan_path, cache_root))
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=_NANONIS_CONVERT_MAX_WORKERS) as executor:
+        results = executor.map(
+            lambda job: _convert_one_scan_safe(reader, job[0], job[1]),
+            jobs,
+        )
+        generated = [header_path for header_path in results if header_path is not None]
     return generated
 
 
@@ -180,7 +211,11 @@ def _extract_scan_header(scan) -> Dict[str, object]:
         or ""
     )
     scan_time = hdr.get("scan_time")
-    if isinstance(scan_time, (list, tuple)):
+    # nanonispy2 parses this as a numpy array (its own entries_to_be_floated
+    # coercion), never a plain list/tuple - a plain isinstance(list, tuple)
+    # check silently misses it for every real file, so ScanTimeForward[s]/
+    # ScanTimeBackward[s] never got populated at all.
+    if isinstance(scan_time, (list, tuple, np.ndarray)):
         if len(scan_time) >= 1:
             header["ScanTimeForward[s]"] = _safe_float(scan_time[0])
         if len(scan_time) >= 2:
@@ -212,6 +247,16 @@ def _extract_scan_channels(scan, cache_dir: Path) -> List[ChannelExport]:
     # include calibration/offset. Integer formats require manual scaling.
     data_dtype = np.dtype(getattr(scan, "data_format", np.float32))
     needs_calibration = data_dtype.kind in ("i", "u")
+    # A scan's slow-axis "Direction" header (up/down) records which way the
+    # tip physically swept while acquiring lines, and rows are stored in
+    # acquisition order - for direction='up' the tip starts at the bottom of
+    # the frame, so row 0 is the *south*-most line, not the north-most one
+    # our origin='upper' display (and _map_spec_to_pixels's row-0-is-north
+    # convention) expects. Confirmed on real data (K1030, Direction=up):
+    # spectroscopy points independently verified against Nanonis's own
+    # viewer landed on the wrong blobs without this flip. direction='down'
+    # already starts at the top, so it needs no flip.
+    scan_dir = str((scan.header or {}).get("scan_dir", "")).strip().lower()
     for idx in range(total):
         name = str(names[idx]).strip()
         unit = str(units[idx]).strip()
@@ -231,15 +276,16 @@ def _extract_scan_channels(scan, cache_dir: Path) -> List[ChannelExport]:
                 continue
             if needs_calibration:
                 arr = arr * scale + offset
+            if scan_dir == "up":
+                arr = np.flipud(arr)
+            # Store converted channels as native float32 arrays to avoid the
+            # expensive ASCII round-trip on subsequent viewer loads.
+            arr = np.asarray(arr, dtype=np.float32)
             safe_channel = _safe_token(name)
             suffix = "fwd" if dir_key == "forward" else "bwd"
-            data_name = f"{scan.basename}_{safe_channel}_{suffix}.dat"
+            data_name = f"{scan.basename}_{safe_channel}_{suffix}.npy"
             data_path = cache_dir / data_name
-            try:
-                with open(data_path, "w", encoding="utf-8", newline="\n") as fh:
-                    np.savetxt(fh, arr, fmt="%.9e")
-            except UnicodeEncodeError:
-                np.savetxt(data_path, arr, fmt="%.9e")
+            np.save(data_path, arr, allow_pickle=False)
             caption_dir = "Forward" if dir_key == "forward" else "Backward"
             caption = _pretty_caption(name, caption_dir)
             exports.append(
@@ -290,6 +336,46 @@ def _write_sxm_style_header(
 # Utility helpers                                                             #
 # --------------------------------------------------------------------------- #
 
+def _fast_spec_load_data(self):
+    """Drop-in replacement for nanonispy2/nanonispy's Spec._load_data.
+
+    The original parses a .dat file's ASCII data block with
+    numpy.genfromtxt, whose per-value type-inference dominates cold-scan
+    time on large folders (measured: ~28s of a ~29s cold scan across 1655
+    real .dat files, ~40M calls into genfromtxt's internal _loose_call).
+    It also opens the file about three times per call, including a full
+    separate readlines() just to count header lines for genfromtxt's
+    skip_header - redundant, since self.byte_offset (already computed by
+    NanonisFile.__init__'s header parser) already points exactly at the
+    start of the column-names line.
+
+    This reuses that byte_offset to seek once and parses the data with
+    np.loadtxt on the same open, already-seeked handle. Verified
+    byte-for-byte identical output against the original genfromtxt path
+    across all 1655 .dat files in a real reference dataset (0 mismatches),
+    ~2.9x faster. Applied as a monkeypatch (see _ensure_nanonis_reader)
+    rather than edited into the vendored copy - the vendor/ directory
+    mirrors upstream nanonispy2 and must stay untouched (see CLAUDE.md).
+    """
+    with open(self.fname, 'r') as f:
+        f.seek(self.byte_offset)
+        column_names = f.readline().strip('\n').split('\t')
+        specdata = np.loadtxt(f, delimiter='\t', ndmin=2)
+    data_dict = {}
+    for i, name in enumerate(column_names):
+        data_dict[name] = specdata[:, i]
+    return data_dict
+
+
+def _patch_fast_spec_loader(reader_module) -> None:
+    try:
+        spec_cls = getattr(reader_module, "Spec", None)
+        if spec_cls is not None and hasattr(spec_cls, "_load_data"):
+            spec_cls._load_data = _fast_spec_load_data
+    except Exception as exc:
+        log(f"[Nanonis] Could not install fast .dat parser, falling back to default: {exc}")
+
+
 def _ensure_nanonis_reader():
     """Return the ``nanonispy.read`` module or ``None`` if unavailable."""
     global _NANONIS_READ, _IMPORT_ERROR
@@ -300,6 +386,7 @@ def _ensure_nanonis_reader():
         try:
             _NANONIS_READ = import_module(mod_name) if import_module else None
             if _NANONIS_READ:
+                _patch_fast_spec_loader(_NANONIS_READ)
                 return _NANONIS_READ
         except Exception:
             continue
@@ -310,6 +397,7 @@ def _ensure_nanonis_reader():
         try:
             _NANONIS_READ = import_module("nanonispy2.read") if import_module else None
             if _NANONIS_READ:
+                _patch_fast_spec_loader(_NANONIS_READ)
                 return _NANONIS_READ
         except Exception as exc:
             _IMPORT_ERROR = exc
@@ -686,6 +774,19 @@ def _try_parse_datetime(text: str) -> Optional[datetime]:
     return None
 
 
+# Threshold above which an embedded spectroscopy "Start time" is treated as
+# implausible and the file's own disk mtime is trusted instead. Confirmed on
+# real data: every single-spectrum .dat file in one dataset had its embedded
+# Start time running a consistent ~58-59 minutes *ahead* of its own disk
+# mtime (spanning files from different days, so not a one-off DST fluke),
+# while every image in the same folder had an embedded time matching its
+# own file's mtime exactly (0.0 min difference) - proving mtime is reliable
+# in that environment and the embedded field is specifically wrong for
+# spectroscopy. A real acquisition's file write happens seconds after the
+# measurement finishes, so any large gap is a red flag, not normal jitter.
+_SPEC_TIME_SANITY_THRESHOLD_S = 600
+
+
 def _nanonis_spec_metadata(header: Dict[str, str], path: Path) -> Dict[str, object]:
     meta: Dict[str, object] = {}
     date_txt = (
@@ -700,6 +801,13 @@ def _nanonis_spec_metadata(header: Dict[str, str], path: Path) -> Dict[str, obje
         dt = _try_parse_datetime(date_txt) or _try_parse_datetime(time_txt)
     if dt is not None:
         meta["time"] = dt
+        try:
+            mtime = datetime.fromtimestamp(Path(path).stat().st_mtime)
+            if abs((dt - mtime).total_seconds()) > _SPEC_TIME_SANITY_THRESHOLD_S:
+                meta["time"] = mtime
+                meta["time_source_fallback"] = "mtime_sanity_check"
+        except Exception:
+            pass
     x_nm = _meters_to_nm_value(header.get("X (m)"))
     y_nm = _meters_to_nm_value(header.get("Y (m)"))
     if x_nm is not None:
@@ -760,10 +868,37 @@ def _select_z_axis(signals: Dict[str, np.ndarray]) -> Tuple[Optional[str], Optio
 
 
 def _select_z_rel_axis(signals: Dict[str, np.ndarray]) -> Tuple[Optional[str], Optional[np.ndarray]]:
-    """Select a relative Z axis if present (z_rel naming)."""
+    """Select a relative Z axis if present (z_rel naming, e.g. "Z rel (m)")."""
     for name, data in signals.items():
         low = name.lower()
-        if "z_rel" in low or "rel z" in low:
+        if "z_rel" in low or "zrel" in low or "rel z" in low or "z rel" in low:
+            return name, data
+    return None, None
+
+
+def _select_topo_axis(signals: Dict[str, np.ndarray]) -> Tuple[Optional[str], Optional[np.ndarray]]:
+    """Best-effort selection of an absolute Z/piezo axis, distinct from a
+    relative-Z channel (see `_select_z_rel_axis`) - i.e. the same candidate
+    list as `_select_z_axis` but excluding anything "rel"-named."""
+    candidates = [
+        "Z (m)",
+        "Z",
+        "Delta Z (m)",
+        "Z offset (m)",
+        "Z offset",
+        "Z piezo (m)",
+        "Z piezo",
+        "Distance (m)",
+        "Distance",
+    ]
+    for name in candidates:
+        if name in signals:
+            return name, signals[name]
+    for name, data in signals.items():
+        low = name.lower()
+        if "rel" in low:
+            continue
+        if low.startswith("z") or "z " in low or " z" in low or "distance" in low:
             return name, data
     return None, None
 
@@ -780,6 +915,29 @@ def _select_bias_axis(signals: Dict[str, np.ndarray]) -> Tuple[Optional[str], Op
             return name, signals[name]
     for name, data in signals.items():
         if "(V)" in name or name.lower().startswith("bias"):
+            return name, data
+    return None, None
+
+
+def _select_true_bias_axis(signals: Dict[str, np.ndarray]) -> Tuple[Optional[str], Optional[np.ndarray]]:
+    """Like `_select_bias_axis`, but without the broad "any (V)-named
+    column" fallback - used only for the Axis dropdown's "Bias" choice,
+    where mislabeling an unrelated voltage channel (e.g. an oscillation
+    excitation amplitude, which also happens to be measured in volts) as
+    "Bias" would be actively misleading. `_select_bias_axis`'s broader match
+    stays as-is for picking the file's *primary* sweep axis, where a
+    best-effort guess is better than failing to parse the file at all."""
+    candidates = [
+        "Bias calc (V)",
+        "Sample bias (V)",
+        "Bias (V)",
+        "Tip bias (V)",
+    ]
+    for name in candidates:
+        if name in signals:
+            return name, signals[name]
+    for name, data in signals.items():
+        if name.lower().startswith("bias"):
             return name, data
     return None, None
 
@@ -858,6 +1016,98 @@ def parse_nanonis_spectroscopy(path: Path | str) -> List[Dict[str, object]]:
             unit_map[label] = unit_guess
     if not channels:
         return []
+
+    # Build a richer, always-available AxisChoices list (bias / relative-Z /
+    # absolute-Z), independent of the `prefer_z` filename heuristic above -
+    # that heuristic only picks the *default* axis; a relative-Z channel
+    # (e.g. "Z rel (m)") should be selectable in the Axis dropdown whenever
+    # it's present, not just for files whose name flags them as Z-spectroscopy.
+    axes_choices: List[Dict[str, object]] = []
+    bias_choice = None
+    bias_name, bias_data = _select_true_bias_axis(spec.signals)
+    if bias_name is not None and bias_data is not None:
+        bias_choice = {
+            "key": "bias",
+            "label": re.sub(r"\s*\(.*?\)", "", bias_name).strip() or "Bias",
+            "unit": "V",
+            "values": np.asarray(bias_data, dtype=float).copy(),
+        }
+    else:
+        # No per-point Bias column - common for a pure Z-sweep, where bias
+        # is held fixed for the whole spectrum rather than swept. Fall back
+        # to the header's own fixed scalar bias value as a constant-valued
+        # choice, instead of silently omitting "Bias" from the Axis list.
+        fixed_bias = None
+        for hdr_key in ("Bias>Bias (V)", "Bias (V)"):
+            try:
+                if hdr_key in (spec.header or {}):
+                    fixed_bias = float(spec.header[hdr_key])
+                    break
+            except Exception:
+                continue
+        if fixed_bias is not None and axis.size:
+            bias_choice = {
+                "key": "bias",
+                "label": "Bias",
+                "unit": "V",
+                "values": np.full(axis.shape, fixed_bias, dtype=float),
+            }
+    zrel_choice = None
+    zrel_values = None
+    zrel_name, zrel_data = _select_z_rel_axis(spec.signals)
+    if zrel_name is not None and zrel_data is not None:
+        zrel_values = np.asarray(zrel_data, dtype=float).copy()
+        try:
+            if np.nanmax(np.abs(zrel_values)) < 1e-6:
+                zrel_values = zrel_values * 1e9  # assume meters -> nm
+        except Exception:
+            pass
+        zrel_choice = {
+            "key": "z",
+            "label": re.sub(r"\s*\(.*?\)", "", zrel_name).strip() or "Z rel",
+            "unit": "nm",
+            "values": zrel_values,
+        }
+    topo_choice = None
+    topo_values = None
+    topo_name, topo_data = _select_topo_axis(spec.signals)
+    if topo_name is not None and topo_data is not None and topo_name != zrel_name:
+        topo_values = np.asarray(topo_data, dtype=float).copy()
+        try:
+            if np.nanmax(np.abs(topo_values)) < 1e-6:
+                topo_values = topo_values * 1e9  # assume meters -> nm
+        except Exception:
+            pass
+        topo_choice = {
+            "key": "topo",
+            "label": re.sub(r"\s*\(.*?\)", "", topo_name).strip() or "Topo",
+            "unit": "nm",
+            "values": topo_values,
+        }
+    # When both a relative-Z and an absolute-Z axis exist, record the
+    # constant offset between them so combining multiple spectra can add it
+    # back to each one's own relative-Z values, keeping their true relative
+    # height differences meaningful instead of every trace starting at zero.
+    if zrel_choice is not None and topo_choice is not None:
+        try:
+            diff = topo_values - zrel_values
+            finite = diff[np.isfinite(diff)]
+            if finite.size:
+                zrel_choice["origin_abs"] = float(np.nanmedian(finite))
+        except Exception:
+            pass
+    # For Z-spectroscopy files the meaningful sweep axis is Z itself, so list
+    # absolute Z first, then relative Z, then Bias last (Bias is normally
+    # held fixed during a Z sweep - still offered, just the least useful
+    # default here). Bias-spectroscopy files keep the conventional opposite
+    # order (Bias first).
+    ordered_choices = (
+        [topo_choice, zrel_choice, bias_choice]
+        if prefer_z
+        else [bias_choice, zrel_choice, topo_choice]
+    )
+    axes_choices.extend(choice for choice in ordered_choices if choice is not None)
+
     meta = _nanonis_spec_metadata(spec.header or {}, Path(path))
     if meta.get("z_level_nm") is None:
         z_nm, z_label = _extract_constant_signal_z_level_nm(spec.signals)
@@ -870,6 +1120,7 @@ def parse_nanonis_spectroscopy(path: Path | str) -> List[Dict[str, object]]:
         "V": axis.copy(),
         "AxisLabel": axis_label,
         "AxisUnit": axis_unit,
+        "AxisChoices": axes_choices or None,
         "AltAxis": alt_axis.copy() if alt_axis is not None else None,
         "AltAxisLabel": re.sub(r"\s*\(.*?\)", "", alt_axis_name).strip() if alt_axis_name else None,
         "AltAxisUnit": alt_axis_unit,
@@ -986,11 +1237,35 @@ def _parse_nanonis_3ds_grid(grid, path: Path | str, chans: Dict[str, object]) ->
         ry_nm = float(ry) * 1e9 if abs(ry) < 1e-3 else float(ry)
         cx_nm = float(cx) * 1e9 if abs(cx) < 1e-3 else float(cx)
         cy_nm = float(cy) * 1e9 if abs(cy) < 1e-3 else float(cy)
-        x_offsets = np.linspace(cx_nm - rx_nm / 2, cx_nm + rx_nm / 2, nx)
-        y_offsets = np.linspace(cy_nm - ry_nm / 2, cy_nm + ry_nm / 2, ny)
+        # A grid can be acquired at any rotation, independent of whatever
+        # image it later gets anchored to (nanonispy2 exposes this as
+        # grid.header['angle'], parsed from the raw file's "Grid settings"
+        # field - see nanonispy2/read.py). Building x_offsets/y_offsets as
+        # a naive axis-aligned linspace (the previous behavior) silently
+        # discarded that angle, fabricating x/y as if the grid were
+        # unrotated - confirmed wrong against real rotated data (a grid
+        # sharing its anchor image's exact center/size/angle round-tripped
+        # to exactly the image's own pixel bounds only once this rotation
+        # was applied; the unrotated version did not). Local per-pixel
+        # offsets are rotated into true absolute (x, y) here, using the
+        # same rotation convention _map_spec_to_pixels (main_window.py)
+        # uses to go the other way (absolute -> local for display).
+        angle_deg = _safe_float(grid.header.get("angle"), default=0.0)
+        local_x = np.linspace(-rx_nm / 2, rx_nm / 2, nx)
+        local_y = np.linspace(-ry_nm / 2, ry_nm / 2, ny)
+        lx_grid, ly_grid = np.meshgrid(local_x, local_y)  # shape (ny, nx)
+        if angle_deg:
+            theta = math.radians(angle_deg)
+            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            abs_dx = lx_grid * cos_t + ly_grid * sin_t
+            abs_dy = -lx_grid * sin_t + ly_grid * cos_t
+        else:
+            abs_dx, abs_dy = lx_grid, ly_grid
+        x_abs = cx_nm + abs_dx
+        y_abs = cy_nm + abs_dy
     except Exception:
-        x_offsets = np.arange(nx, dtype=float)
-        y_offsets = np.arange(ny, dtype=float)
+        x_abs = np.tile(np.arange(nx, dtype=float), (ny, 1))
+        y_abs = np.tile(np.arange(ny, dtype=float).reshape(-1, 1), (1, nx))
     dataset_key = Path(path).stem
     # acquisition time from header if available
     spec_time = _parse_time(grid.header.get("start_time")) or _parse_time(grid.header.get("end_time"))
@@ -1030,8 +1305,12 @@ def _parse_nanonis_3ds_grid(grid, path: Path | str, chans: Dict[str, object]) ->
         return entries
 
     rows, cols, pts = next(iter(channel_data.values())).shape
-    x_coords = x_offsets if len(x_offsets) == cols else np.linspace(0, cols - 1, cols)
-    y_coords = y_offsets if len(y_offsets) == rows else np.linspace(0, rows - 1, rows)
+    if x_abs.shape == (rows, cols) and y_abs.shape == (rows, cols):
+        x_coords_2d, y_coords_2d = x_abs, y_abs
+    else:
+        x_coords_2d, y_coords_2d = np.meshgrid(
+            np.arange(cols, dtype=float), np.arange(rows, dtype=float)
+        )
     channel_count = len(channel_data)
     idx = 0
     for y in range(rows):
@@ -1046,8 +1325,8 @@ def _parse_nanonis_3ds_grid(grid, path: Path | str, chans: Dict[str, object]) ->
                 "matrix_index": idx - 1,
                 "grid_rows": rows,
                 "grid_cols": cols,
-                "x": float(x_coords[x]),
-                "y": float(y_coords[y]),
+                "x": float(x_coords_2d[y, x]),
+                "y": float(y_coords_2d[y, x]),
                 "channels": chan_vals,
                 "channel_name": None,
                 "channel_code": None,

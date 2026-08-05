@@ -129,19 +129,19 @@ def _shift_view_relative_zero(owner, view, enabled: bool):
                 except Exception:
                     return None
             return None
+        # clim here has already been shifted into the new zero-referenced
+        # coordinate space by the caller - preserve it as-is (whether it came
+        # from Reset, Auto, or a manual drag) instead of discarding the low
+        # bound and re-deriving it from the array's own extent, which used to
+        # silently overwrite any custom contrast range back to (0, data max)
+        # on every toggle.
         try:
-            _lo, _hi = clim
-            hi_val = float(_hi)
+            lo_val, hi_val = float(clim[0]), float(clim[1])
         except Exception:
             return None
-        finite = np.asarray(arr, dtype=float)
-        finite = finite[np.isfinite(finite)]
-        if finite.size:
-            hi_val = max(hi_val, float(np.nanmax(finite)))
-        hi_val = max(hi_val, 0.0)
-        if hi_val <= 0.0:
+        if hi_val <= lo_val:
             return None
-        return (0.0, hi_val)
+        return (lo_val, hi_val)
 
     new_view = owner._copy_view_for_popup(view)
     arr = new_view.get("arr")
@@ -313,8 +313,9 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
             canvas._fit_to_canvas = False
             canvas._view_layout = str(getattr(source_canvas, "_view_layout", "grid") or "grid")
             canvas._show_profile_overlays = bool(getattr(source_canvas, "_show_profile_overlays", True))
+            canvas._show_spectra_overlays = bool(getattr(source_canvas, "_show_spectra_overlays", True))
             canvas._show_angle_overlays = bool(getattr(source_canvas, "_show_angle_overlays", True))
-            canvas._show_shortcut_hint = bool(getattr(source_canvas, "_show_shortcut_hint", True))
+            canvas._show_shortcut_hint = bool(getattr(source_canvas, "_show_shortcut_hint", False))
             canvas._show_molecule_gizmo = bool(getattr(source_canvas, "_show_molecule_gizmo", getattr(owner, "show_molecule_gizmo", False)))
             canvas._detail_dark = bool(getattr(owner, "detail_dark_view", False))
             canvas._detail_grid = bool(getattr(owner, "detail_grid_view", False))
@@ -372,7 +373,8 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
         try:
             canvas.set_show_profile_overlays(getattr(source_canvas, "_show_profile_overlays", True))
             canvas.set_show_angle_overlays(getattr(source_canvas, "_show_angle_overlays", True))
-            canvas.set_show_shortcut_hint(getattr(source_canvas, "_show_shortcut_hint", True))
+            canvas.set_show_shortcut_hint(getattr(source_canvas, "_show_shortcut_hint", False))
+            canvas._show_spectra_overlays = bool(getattr(source_canvas, "_show_spectra_overlays", True))
         except Exception:
             pass
         try:
@@ -575,6 +577,12 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
         except Exception:
             pass
     canvas.set_views_callback(_on_popup_canvas_state_changed)
+    if hasattr(owner, "_on_preview_spec_click"):
+        canvas.set_spectra_click_callback(owner._on_preview_spec_click)
+    if hasattr(owner, "spectro_compare_controller"):
+        canvas.set_spectra_compare_all_callback(
+            lambda file_key: owner.spectro_compare_controller.open_all_specs_popup(file_key)
+        )
     canvas.set_crop_callback(lambda v, c=canvas: owner._on_preview_crop(v, c))
     canvas.set_virtual_copy_callback(lambda v: owner._create_virtual_copy_from_popup_view(v))
     # Double-click on the popup canvas is disabled to prevent recursive
@@ -613,7 +621,9 @@ def spawn_preview_popup(owner, views, title=None, *, show_immediately=True, rest
     if hasattr(owner, "quick_crop_controller"):
         owner.quick_crop_controller.register_popup(seq, dlg)
     canvas.enable_fixed_crop_quick_mode(owner.quick_crop_mode)
-    canvas.show_fixed_crop_template(bool(owner.show_crop_template_overlay))
+    # Popups manage crop-template editing locally via their own quick-menu actions.
+    # The main-window "Crop template" toggle is preview-only and should not bleed into pop-outs.
+    canvas.show_fixed_crop_template(False)
     canvas.show_fixed_crop_history(owner.show_crop_history_overlay)
     try:
         canvas.set_molecule_palette_callback(owner._on_molecule_palette_changed)

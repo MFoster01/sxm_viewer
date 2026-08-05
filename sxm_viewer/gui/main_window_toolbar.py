@@ -99,11 +99,18 @@ def create_main_toolbar(viewer):
     viewer.toolbar_collection_menu = QtWidgets.QMenu(viewer.toolbar_collection_btn)
     viewer.toolbar_collection_current_path_act = viewer.toolbar_collection_menu.addAction("Current collection: none")
     viewer.toolbar_collection_current_path_act.setEnabled(False)
-    viewer.toolbar_collection_menu.addAction("Choose Current Collection...", viewer.on_choose_current_collection)
+    viewer.toolbar_collection_menu.addAction("Create a Collection...", viewer.on_create_collection)
+    viewer.toolbar_collection_menu.addAction("Open a Collection...", viewer.on_browse_collections)
     viewer.toolbar_collection_clear_target_act = viewer.toolbar_collection_menu.addAction("Clear Current Collection Target", viewer.on_clear_current_collection)
     viewer.toolbar_collection_menu.addSeparator()
-    viewer.toolbar_collection_menu.addAction("Open Collection...", viewer.on_open_collection)
+    viewer.toolbar_recent_collections_menu = viewer.toolbar_collection_menu.addMenu("Recent Collections")
     viewer.toolbar_collection_menu.addAction("Show Collection Tray", viewer.on_show_collection_tray)
+    viewer.toolbar_collection_add_selected_act = viewer.toolbar_collection_menu.addAction(
+        "Add Selected Thumbnails...", viewer.on_add_selected_thumbnails_to_collection
+    )
+    viewer.toolbar_collection_add_selected_to_act = viewer.toolbar_collection_menu.addAction(
+        "Add Selected Thumbnails to...", viewer.on_add_selected_thumbnails_to_collection_picker
+    )
     viewer.toolbar_collection_menu.addAction("Add Current Preview...", viewer.on_add_current_preview_to_collection)
     viewer.toolbar_collection_menu.addAction("Add Active Pop-up...", viewer.on_add_active_popup_to_collection)
     viewer.toolbar_collection_menu.addAction("Add All Open Pop-ups...", viewer.on_add_all_popups_to_collection)
@@ -111,6 +118,7 @@ def create_main_toolbar(viewer):
     viewer.toolbar_collection_menu.addSeparator()
     viewer.toolbar_collection_menu.addAction("What Is a Collection?", viewer.on_collection_help)
     viewer.toolbar_collection_btn.setMenu(viewer.toolbar_collection_menu)
+    viewer.toolbar_collection_menu.aboutToShow.connect(viewer._refresh_collection_toolbar_menu_labels)
     toolbar.addWidget(viewer.toolbar_collection_btn)
     try:
         viewer._refresh_collection_ui()
@@ -143,6 +151,14 @@ def create_main_toolbar(viewer):
     viewer.toolbar_export_xyz_act = toolbar.addAction(_icon("document-save"), "Export XYZ")
     viewer.toolbar_export_xyz_act.triggered.connect(viewer.on_export_xyz_files)
 
+    viewer.toolbar_report_act = toolbar.addAction(_icon("x-office-document"), "Report")
+    viewer.toolbar_report_act.setToolTip(
+        "Generate a PDF report of the loaded folder: session overview map, images "
+        "with spectroscopy positions and curves, grid maps with curve clustering, "
+        "and a needs-attention appendix")
+    viewer.toolbar_report_act.triggered.connect(
+        lambda: viewer.report_controller.generate_folder_report())
+
     toolbar.addSeparator()
     viewer.toolbar_image_btn = QtWidgets.QToolButton(toolbar)
     viewer.toolbar_image_btn.setText("Image")
@@ -158,8 +174,28 @@ def create_main_toolbar(viewer):
     viewer.toolbar_histogram_reset_act.triggered.connect(lambda: viewer._reset_contrast(viewer.preview_canvas))
     viewer.toolbar_image_menu.addSeparator()
     viewer.toolbar_crop_rotate_act = viewer.toolbar_image_menu.addAction("Crop/Rotate...")
-    viewer.toolbar_crop_rotate_act.setToolTip("Open crop, rotate, flip, clipping, gamma, and colormap controls")
+    viewer.toolbar_crop_rotate_act.setToolTip(
+        "Crop/rotate/flip into a new virtual copy (the original is never "
+        "altered); clip, gamma, and colormap stay live on this image")
     viewer.toolbar_crop_rotate_act.triggered.connect(viewer.on_adjust_image)
+    viewer.toolbar_reset_adjust_act = viewer.toolbar_image_menu.addAction("Reset display adjustments")
+    viewer.toolbar_reset_adjust_act.setToolTip(
+        "Clear the previewed image's clip/gamma display adjustments (Ctrl+Z restores)")
+    viewer.toolbar_reset_adjust_act.triggered.connect(viewer.on_reset_image_adjustments)
+
+    def _sync_image_menu():
+        act = getattr(viewer, "toolbar_reset_adjust_act", None)
+        if act is None:
+            return
+        has_spec = False
+        try:
+            if viewer.last_preview:
+                has_spec = bool(viewer._get_adjust_spec(*viewer.last_preview))
+        except Exception:
+            has_spec = False
+        act.setEnabled(has_spec)
+
+    viewer.toolbar_image_menu.aboutToShow.connect(_sync_image_menu)
     viewer.toolbar_image_btn.setMenu(viewer.toolbar_image_menu)
     toolbar.addWidget(viewer.toolbar_image_btn)
 
@@ -214,6 +250,16 @@ def create_main_toolbar(viewer):
     viewer.toolbar_spectro_menu = QtWidgets.QMenu(viewer.toolbar_spectro_btn)
     viewer.toolbar_spectro_menu.setToolTipsVisible(True)
     viewer.toolbar_spectro_menu.addAction("Open browser", lambda: viewer.open_spectro_browser())
+    viewer.toolbar_spectro_menu.addAction("Open current position", viewer.on_open_current_spectro_site)
+    viewer.toolbar_spectro_review_low_conf_act = viewer.toolbar_spectro_menu.addAction("Review low confidence")
+    viewer.toolbar_spectro_review_low_conf_act.setToolTip("Open the spectroscopy browser filtered to low-confidence image assignments")
+    viewer.toolbar_spectro_review_low_conf_act.triggered.connect(viewer.on_review_low_conf_spectros)
+    viewer.toolbar_spectro_review_current_image_act = viewer.toolbar_spectro_menu.addAction("Review low confidence (current image)")
+    viewer.toolbar_spectro_review_current_image_act.setToolTip("Review low-confidence spectroscopy assignments that affect the current preview image")
+    viewer.toolbar_spectro_review_current_image_act.triggered.connect(lambda: viewer.on_review_low_conf_spectros(current_image_only=True))
+    viewer.toolbar_spectro_review_off_frame_act = viewer.toolbar_spectro_menu.addAction("Review off-frame spectroscopies")
+    viewer.toolbar_spectro_review_off_frame_act.setToolTip("Open the spectroscopy browser filtered to spectra whose real position falls outside every image")
+    viewer.toolbar_spectro_review_off_frame_act.triggered.connect(viewer.on_review_off_frame_spectros)
     viewer.toolbar_spectro_menu.addSeparator()
     viewer.toolbar_spectro_repeat_share_act = viewer.toolbar_spectro_menu.addAction("Share across repeat scans")
     viewer.toolbar_spectro_repeat_share_act.setCheckable(True)
@@ -263,6 +309,9 @@ def create_main_toolbar(viewer):
     marker_menu = viewer.toolbar_spectro_menu.addMenu("Marker style")
     if hasattr(viewer, "_populate_marker_style_menu"):
         viewer._populate_marker_style_menu(marker_menu)
+    viewer.toolbar_spectro_marker_legend_act = viewer.toolbar_spectro_menu.addAction("What do these markers mean?")
+    viewer.toolbar_spectro_marker_legend_act.setToolTip("Show a legend of the spectroscopy marker symbols, rings, and badges")
+    viewer.toolbar_spectro_marker_legend_act.triggered.connect(viewer._show_spectro_marker_legend)
     viewer.toolbar_spectro_menu.addSeparator()
     viewer.toolbar_spectro_grid_as_matrix_act = viewer.toolbar_spectro_menu.addAction("NxN singles as matrix")
     viewer.toolbar_spectro_grid_as_matrix_act.setCheckable(True)
@@ -290,6 +339,14 @@ def update_toolbar_actions(viewer, enabled: bool):
     for act in (viewer.toolbar_export_png_act, viewer.toolbar_export_xyz_act):
         if act is not None:
             act.setEnabled(bool(enabled))
+    # The folder report describes the whole loaded folder, not the previewed
+    # image, so it must be clickable as soon as a folder is loaded - gate it
+    # on whether any files are present rather than on a preview/thumbnail
+    # selection (the `enabled` flag, which only goes True once an image is
+    # previewed).
+    report_act = getattr(viewer, "toolbar_report_act", None)
+    if report_act is not None:
+        report_act.setEnabled(bool(getattr(viewer, "files", None)))
     btn = getattr(viewer, "preview_adjust_btn", None)
     if btn is not None:
         btn.setEnabled(bool(enabled))

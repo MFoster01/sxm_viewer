@@ -64,7 +64,6 @@ from ...config import (
     CH_SAMPLE_POINTS,
     CHANNEL_DATA_CACHE_LIMIT,
     FILTERED_CACHE_LIMIT,
-    THUMB_DISK_CACHE_DIR,
     load_config,
     save_config,
     load_header_cache,
@@ -136,6 +135,7 @@ from ..profile_links import (
     profile_ref_key,
 )
 from .profile_data import axis_label, format_marker_delta, format_stats_text, fmt_length
+from .. import theme as ui_theme
 
 _PROFILE_COMPOSITE_MIME = "application/x-sxm-profile-composite"
 
@@ -1070,9 +1070,9 @@ class ProfileDialog(QtWidgets.QDialog):
         text = self._metadata_text(dataset)
         if not text:
             return
-        dark = bool(self._dark_background)
-        box_face = "#111111" if dark else "#ffffff"
-        text_color = "#f5f5f5" if dark else "#111111"
+        chrome = self._plot_chrome()
+        box_face = chrome["box_face"]
+        text_color = chrome["text"]
         try:
             self._metadata_artist = self.canvas.figure.text(
                 0.02,
@@ -1122,51 +1122,25 @@ class ProfileDialog(QtWidgets.QDialog):
             self.advanced_toggle_btn.blockSignals(False)
 
     def _apply_toggle_button_styles(self):
-        dark = bool(self._dark_background)
-        if dark:
-            inactive_bg = "#1e2430"
-            inactive_border = "#46556e"
-            inactive_text = "#d4deee"
-            active_bg = "#2f6fcb"
-            active_border = "#79a9f2"
-            active_text = "#ffffff"
-            hint_color = "#b9c6d8"
-            compose_button_bg = "#202633"
-            compose_button_border = "#5a6880"
-            compose_button_text = "#e4ebf7"
-            compose_button_hover_border = "#82aef1"
-            compose_drop_bg = "#26477a"
-            compose_drop_border = "#a8ceff"
-        else:
-            inactive_bg = "#f3f5f9"
-            inactive_border = "#aeb7c5"
-            inactive_text = "#1f2a3d"
-            active_bg = "#1f6fd7"
-            active_border = "#5b97e8"
-            active_text = "#ffffff"
-            hint_color = "#4b5b73"
-            compose_button_bg = "#f5f7fa"
-            compose_button_border = "#b8c2cf"
-            compose_button_text = "#314056"
-            compose_button_hover_border = "#5b97e8"
-            compose_drop_bg = "#e6f0ff"
-            compose_drop_border = "#4f8fe3"
+        # Chrome palette follows the app theme (amber wins), falling back to
+        # the historical blue dark/light sets — see theme.toggle_pill_palette.
+        p = ui_theme.toggle_pill_palette(bool(self._dark_background))
         style = (
             "QToolButton#profileToggleButton {"
-            f"background-color: {inactive_bg};"
-            f"color: {inactive_text};"
-            f"border: 1px solid {inactive_border};"
-            "border-radius: 12px;"
+            f"background-color: {p['inactive_bg']};"
+            f"color: {p['inactive_text']};"
+            f"border: 1px solid {p['inactive_border']};"
+            f"border-radius: {p['radius']};"
             "padding: 4px 12px;"
             "font-weight: 600;"
             "}"
             "QToolButton#profileToggleButton:checked {"
-            f"background-color: {active_bg};"
-            f"color: {active_text};"
-            f"border: 1px solid {active_border};"
+            f"background-color: {p['active_bg']};"
+            f"color: {p['active_text']};"
+            f"border: 1px solid {p['active_border']};"
             "}"
             "QToolButton#profileToggleButton:hover {"
-            f"border: 1px solid {active_border};"
+            f"border: 1px solid {p['active_border']};"
             "}"
         )
         for btn in self._toggle_buttons:
@@ -1176,28 +1150,28 @@ class ProfileDialog(QtWidgets.QDialog):
                 pass
         hint = self.findChild(QtWidgets.QLabel, "profileControlsHint")
         if hint is not None:
-            hint.setStyleSheet(f"color: {hint_color};")
+            hint.setStyleSheet(f"color: {p['hint_color']};")
         compose_btn = getattr(self, "compose_drag_btn", None)
         if compose_btn is not None:
             drop_active = bool(compose_btn.property("dropActive"))
-            button_bg = compose_drop_bg if drop_active else compose_button_bg
-            button_border = compose_drop_border if drop_active else compose_button_border
+            button_bg = p['compose_drop_bg'] if drop_active else p['compose_button_bg']
+            button_border = p['compose_drop_border'] if drop_active else p['compose_button_border']
             button_style = (
                 "QToolButton#profileComposeButton {"
                 f"background-color: {button_bg};"
-                f"color: {compose_button_text};"
+                f"color: {p['compose_button_text']};"
                 f"border: 1px solid {button_border};"
                 "border-radius: 10px;"
                 "padding: 4px 10px;"
                 "font-weight: 600;"
                 "}"
                 "QToolButton#profileComposeButton:hover {"
-                f"border: 1px solid {compose_button_hover_border};"
+                f"border: 1px solid {p['compose_button_hover_border']};"
                 "}"
                 "QToolButton#profileComposeButton:disabled {"
-                f"background-color: {inactive_bg};"
-                f"color: {hint_color};"
-                f"border: 1px solid {inactive_border};"
+                f"background-color: {p['inactive_bg']};"
+                f"color: {p['hint_color']};"
+                f"border: 1px solid {p['inactive_border']};"
                 "}"
             )
             try:
@@ -1419,7 +1393,7 @@ class ProfileDialog(QtWidgets.QDialog):
             except Exception:
                 pass
         self._marker_lines = []
-        line_color = '#f5f5f5' if self._dark_background else '#202020'
+        line_color = self._plot_chrome()["accent"]
         colors = [line_color, line_color]
         for idx, pos in enumerate(self._marker_positions):
             line = self.ax.axvline(
@@ -1455,7 +1429,7 @@ class ProfileDialog(QtWidgets.QDialog):
         else:
             raw_positions = [xmin + 0.3 * span, xmin + 0.7 * span]
         self._marker_positions = [self._clamp_marker(pos) for pos in raw_positions]
-        line_color = '#f5f5f5' if self._dark_background else '#202020'
+        line_color = self._plot_chrome()["accent"]
         colors = [line_color, line_color]
         for idx, pos in enumerate(self._marker_positions):
             line = self.ax.axvline(
@@ -1579,11 +1553,12 @@ class ProfileDialog(QtWidgets.QDialog):
             y_level = y_min + 0.05 * (y_max - y_min)
         y_level = max(y_min + 0.01*(y_max-y_min), min(y_max - 0.01*(y_max-y_min), y_level))
         self._marker_arrow_y = y_level
-        arrow_color = "#f5f5f5" if self._dark_background else "#111111"
+        _chrome = self._plot_chrome()
+        arrow_color = _chrome["accent"]
         display_value, display_unit = self._format_marker_delta(axis_delta)
         text = f"{display_value:.3f} {display_unit}"
         label_size = 9.0 * getattr(self, '_font_scale', 1.0)
-        bbox_face = "#050506" if self._dark_background else "white"
+        bbox_face = _chrome["box_face"] if self._dark_background else "white"
         bbox_alpha = 0.7 if not self._dark_background else 0.6
 
         if self._marker_arrow is not None:
@@ -2628,9 +2603,9 @@ class ProfileDialog(QtWidgets.QDialog):
         self._legend_artist = legend
         if legend is None:
             return
-        dark = bool(self._dark_background)
-        ax_face = '#14161c' if dark else '#ffffff'
-        text = '#f5f5f5' if dark else '#111111'
+        chrome = self._plot_chrome()
+        ax_face = chrome["ax_face"]
+        text = chrome["text"]
         try:
             legend.set_visible(bool(self._legend_visible))
             if self._legend_custom_anchor is not None:
@@ -2650,13 +2625,40 @@ class ProfileDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-    def _apply_plot_theme(self):
+    def _plot_chrome(self):
+        """Plot chrome colors for the current dark flag + app theme.
+
+        Chrome only (backgrounds, ticks, labels, markers, legend frame) —
+        the profile trace colors themselves are user/palette-driven and
+        never touched here.  ``accent`` is for measurement markers/arrows.
+        """
         dark = bool(self._dark_background)
-        fig_face = '#111217' if dark else '#ffffff'
-        ax_face = '#14161c' if dark else '#ffffff'
-        text = '#f5f5f5' if dark else '#111111'
+        if dark and ui_theme.current_theme() == ui_theme.THEME_AMBER:
+            c = ui_theme.mpl_chrome_colors(ui_theme.THEME_AMBER)
+            return {
+                "fig_face": c["fig_face"],
+                "ax_face": c["ax_face"],
+                "text": c["text"],
+                "grid": c["grid"],
+                "accent": ui_theme.AMBER["amber_bright"],
+                "box_face": ui_theme.AMBER["panel_bg"],
+            }
+        return {
+            "fig_face": '#111217' if dark else '#ffffff',
+            "ax_face": '#14161c' if dark else '#ffffff',
+            "text": '#f5f5f5' if dark else '#111111',
+            "grid": '#4f5a64' if dark else '#b0b0b0',
+            "accent": '#f5f5f5' if dark else '#202020',
+            "box_face": '#111111' if dark else '#ffffff',
+        }
+
+    def _apply_plot_theme(self):
+        chrome = self._plot_chrome()
+        fig_face = chrome["fig_face"]
+        ax_face = chrome["ax_face"]
+        text = chrome["text"]
         grid_on = bool(self.grid_cb.isChecked()) if hasattr(self, 'grid_cb') else False
-        grid_color = '#4f5a64' if dark else '#b0b0b0'
+        grid_color = chrome["grid"]
         try:
             self.canvas.figure.set_facecolor(fig_face)
             self.canvas.figure.set_edgecolor(fig_face)

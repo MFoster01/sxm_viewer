@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from ..._shared import (
     QtCore,
@@ -37,7 +38,7 @@ from ..._shared import (
 from ...data.spectroscopy import is_matrix_file_entry
 
 
-def _shared_repeat_spec_targets(viewer, spec, primary_key, repeat_groups, image_extents):
+def _shared_repeat_spec_targets(viewer, spec, primary_key, repeat_groups, image_extents, image_angles=None):
     primary_key = str(primary_key or "")
     group_keys = list(repeat_groups.get(primary_key) or [primary_key])
     if len(group_keys) <= 1:
@@ -48,7 +49,8 @@ def _shared_repeat_spec_targets(viewer, spec, primary_key, repeat_groups, image_
     if sx is not None and sy is not None:
         for key in group_keys:
             ext = image_extents.get(str(key))
-            if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=0.04):
+            angle = (image_angles or {}).get(str(key)) or 0.0
+            if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=0.04, angle_deg=angle):
                 shared.append(str(key))
     if not shared:
         shared = [str(key) for key in group_keys]
@@ -148,6 +150,38 @@ def _assign_spec_to_image_bucket(viewer, spec, image_key, image_time_index, *, s
     specs_for_image.append(spec)
 
 
+def _assignment_payload(reason, confidence, summary, *, image_key=None, off_frame_offset=None):
+    reason_labels = {
+        "manual_override": "Manual override",
+        "preset_image_key": "Preset image reference",
+        "xy_inside_extent_causal_time": "Inside image bounds + acquisition order",
+        "xy_inside_extent": "Inside image bounds",
+        "causal_time": "Acquisition order",
+        "name_hint": "Filename/session hint",
+        "xy_nearest_extent": "Nearest plausible image footprint",
+        "closest_time_fallback": "Closest-time fallback",
+        "first_image_fallback": "First-image fallback",
+        "unknown": "Unknown",
+    }
+    payload = {
+        "assignment_reason": str(reason or ""),
+        "assignment_reason_label": str(reason_labels.get(str(reason or ""), str(reason or "").replace("_", " ").strip())),
+        "assignment_confidence": str(confidence or ""),
+        "assignment_summary": str(summary or ""),
+        "assignment_image_key": str(image_key or ""),
+    }
+    # off_frame_direction/off_frame_distance_nm let overlays.py and the
+    # spectroscopy browser show/filter off-frame markers without
+    # recomputing the geometry (_spec_frame_offset_info) on every render.
+    if off_frame_offset:
+        payload["off_frame_direction"] = off_frame_offset.get("direction")
+        payload["off_frame_distance_nm"] = off_frame_offset.get("distance_nm")
+    else:
+        payload["off_frame_direction"] = None
+        payload["off_frame_distance_nm"] = None
+    return payload
+
+
 def _assign_spectros_to_images(viewer):
     """Assign spectroscopy entries to images using time and spatial sanity (prefer in-extent matches)."""
     viewer.spectros_by_image = defaultdict(list)
@@ -156,15 +190,20 @@ def _assign_spectros_to_images(viewer):
     if not images or not specs:
         return
     image_time_index = {str(img.get("path")): img.get("time") for img in images}
-    # precompute extents for images
+    # precompute extents (and rotation angles, for a rotation-aware containment
+    # check) for images
     image_extents = {}
+    image_angles = {}
     for img in images:
         try:
             header, _fds = viewer.headers.get(str(img['path']), (None, None))
             extent = viewer._header_extent(header or {}) if header is not None else None
+            angle = viewer._header_scan_angle(header or {}) if header is not None else 0.0
         except Exception:
             extent = None
+            angle = 0.0
         image_extents[str(img['path'])] = extent
+        image_angles[str(img['path'])] = angle
     try:
         images.sort(key=lambda img: img.get('time') or datetime.min)
     except Exception:
@@ -184,37 +223,147 @@ def _assign_spectros_to_images(viewer):
 
     for spec in specs:
         primary_match = None
+        assignment_meta = None
+        override_key = spec.get("assignment_override_image_key")
+        if override_key:
+            mapped = image_paths_lower.get(str(override_key).lower())
+            if mapped:
+                primary_match = image_by_key.get(mapped)
+                assignment_meta = _assignment_payload(
+                    "manual_override",
+                    "high",
+                    "Assigned to an image selected manually by the user.",
+                    image_key=mapped,
+                )
         preset_key = spec.get('image_key')
-        if preset_key:
+        # Trust a cached image_key only for matrix (.3ds/grid) points, whose
+        # single shared anchor is computed once by the dedicated matrix-
+        # anchoring pass at scan time (_assign_matrix_reference in loader.py) -
+        # re-running full per-point image matching wouldn't even apply the same
+        # logic to them. Plain single spectra always re-match below instead of
+        # trusting a preset: with nested overview/zoom scans (e.g. a 400 nm
+        # overview and dozens of few-nm close-ups), the overview's extent
+        # legitimately contains every zoomed-in position too, so "is this point
+        # inside the preset image" can't tell a stale/coarse assignment from a
+        # correct one - only the causal-time-aware matching below (which
+        # prefers the most specific, chronologically-appropriate image among
+        # ALL containing candidates) can, and it is cheap enough to redo on
+        # every load. A stale preset on a single spectrum would otherwise
+        # self-perpetuate forever, since every rescan re-persists whatever
+        # image_key a spec dict currently carries into the manifest/disk cache.
+        is_matrix_point = spec.get('matrix_index') is not None or is_matrix_file_entry(spec)
+        if primary_match is None and preset_key and is_matrix_point:
             mapped = image_paths_lower.get(str(preset_key).lower())
             if mapped:
                 primary_match = image_by_key.get(mapped)
+                assignment_meta = _assignment_payload(
+                    "preset_image_key",
+                    "high",
+                    "Assigned from an existing image reference already stored on this spectrum.",
+                    image_key=mapped,
+                )
             else:
                 if spec.get('source') == 'nanonis_3ds':
                     debug_nanonis["total"] += 1
                     debug_nanonis["missing"] += 1
-        match = primary_match or viewer._choose_image_for_spec(spec, images, image_extents)
+        match = primary_match
+        if match is None:
+            match, assignment_meta = viewer._choose_image_for_spec(spec, images, image_extents, image_angles=image_angles, with_details=True)
         if not match and images:
             # Fallback: pick closest by time, otherwise first image to avoid dropping markers.
             st = _spec_time_for_assignment(spec)
             if st is not None:
                 try:
                     match = min(images, key=lambda img: abs((img.get('time') or datetime.min) - st))
+                    assignment_meta = _assignment_payload(
+                        "closest_time_fallback",
+                        "low",
+                        "Fallback assignment to the closest image in time because stronger spatial or filename cues were unavailable.",
+                        image_key=str(match.get("path") or ""),
+                    )
                 except Exception:
                     match = images[0]
+                    assignment_meta = _assignment_payload(
+                        "first_image_fallback",
+                        "low",
+                        "Fallback assignment to the first available image because the time-based fallback failed.",
+                        image_key=str(match.get("path") or ""),
+                    )
             else:
                 match = images[0]
+                assignment_meta = _assignment_payload(
+                    "first_image_fallback",
+                    "low",
+                    "Fallback assignment to the first available image because this spectrum had no usable assignment time.",
+                    image_key=str(match.get("path") or ""),
+                )
         if not match and images:
             match = images[0]
+            assignment_meta = _assignment_payload(
+                "first_image_fallback",
+                "low",
+                "Fallback assignment to the first available image because no stronger match was found.",
+                image_key=str(match.get("path") or ""),
+            )
         if not match:
             continue
         image_key = str(match['path'])
+        assignment_meta = assignment_meta or _assignment_payload(
+            "unknown",
+            "low",
+            "Assigned without recorded provenance.",
+            image_key=image_key,
+        )
+        spec.update(assignment_meta)
+        # Off-frame status is computed against the FINAL assigned image
+        # regardless of which path chose it - _choose_image_for_spec's own
+        # "xy_nearest_extent" reason only fires when nothing else claimed
+        # the spec first, but for .dat singles the causal_time fallback
+        # almost always wins before that geometric pass is even reached, so
+        # relying on assignment_reason alone silently misses the common
+        # real case (a reference spectrum acquired off to the side, whose
+        # nearest image in time still doesn't actually contain it).
+        #
+        # This used to skip matrix/grid points entirely (is_matrix_point),
+        # on the assumption a grid's own anchored image always contains it.
+        # That's not true once anchoring prefers the smaller, correct,
+        # just-preceding zoom scan over an oversized overview image (see
+        # _assign_matrix_reference in loader.py) - a grid can legitimately
+        # be physically larger than the specific scan it was centered on.
+        # Without off_frame_direction set, _map_spec_to_pixels (main_window.py)
+        # had no way to tell "genuinely off this image's edge" from "normal
+        # in-frame point" for grid points, so it routed every out-of-frame
+        # grid point through its spec-cloud bounding-box fallback instead of
+        # clamping to the true nearest edge - confirmed on real data as a
+        # visible warped/fanned cluster of points where the two populations
+        # (normally-mapped vs. cloud-fallback-mapped) met.
+        ext = image_extents.get(image_key)
+        angle = image_angles.get(image_key) or 0.0
+        offset = viewer._spec_frame_offset_info(spec.get('x'), spec.get('y'), ext, angle_deg=angle) if ext else None
+        if offset:
+            spec['off_frame_direction'] = offset.get('direction')
+            spec['off_frame_distance_nm'] = offset.get('distance_nm')
+            if not is_matrix_point:
+                distance_txt = _off_frame_distance_text(offset)
+                if distance_txt and 'off-frame' not in (spec.get('assignment_summary') or '').lower():
+                    spec['assignment_summary'] = (
+                        f"{spec.get('assignment_summary') or ''} Real position is {distance_txt} - "
+                        "likely a reference point acquired off-frame, not a placement error."
+                    ).strip()
+        else:
+            spec.setdefault('off_frame_direction', None)
+            spec.setdefault('off_frame_distance_nm', None)
         target_keys = [image_key]
         if share_repeat_scans:
             target_keys = _shared_repeat_spec_targets(viewer, spec, image_key, repeat_groups, image_extents)
         spec["primary_image_key"] = image_key
         spec["shared_image_keys"] = list(target_keys)
         spec["shared_repeat_assignment"] = len(target_keys) > 1
+        if spec["shared_repeat_assignment"]:
+            spec["assignment_summary"] = (
+                f"{spec.get('assignment_summary') or 'Assigned to one primary image.'} "
+                "Also shown on overlapping repeat scans."
+            ).strip()
         _assign_spec_to_image_bucket(viewer, spec, image_key, image_time_index, shared_keys=target_keys)
         for shared_key in target_keys:
             if str(shared_key) == image_key:
@@ -231,7 +380,13 @@ def _assign_spectros_to_images(viewer):
         for idx, spec in enumerate(specs, 1):
             target_keys = [image_key]
             if share_repeat_scans:
-                target_keys = _shared_repeat_spec_targets(viewer, spec, image_key, repeat_groups, image_extents)
+                target_keys = _shared_repeat_spec_targets(viewer, spec, image_key, repeat_groups, image_extents, image_angles)
+            spec.update(_assignment_payload(
+                "first_image_fallback",
+                "low",
+                "Fallback assignment to the first available image because no spectra could be matched normally.",
+                image_key=image_key,
+            ))
             spec["primary_image_key"] = image_key
             spec["shared_image_keys"] = list(target_keys)
             spec["shared_repeat_assignment"] = len(target_keys) > 1
@@ -246,6 +401,7 @@ def _assign_spectros_to_images(viewer):
             s.get('display_time') or s.get('time') or datetime.min,
             s.get('order_idx') or 0,
         ))
+    _reassign_split_measurement_series(viewer)
     _annotate_xy_stacks(viewer)
 
     # Debug log for nanonis 3ds assignments
@@ -266,12 +422,21 @@ def _spec_time_for_assignment(spec):
     return spec.get('time')
 
 
+@lru_cache(maxsize=4096)
+def _normalized_path_str(base):
+    return str(Path(base))
+
+
 def _spec_identity_key(spec):
     if not spec:
         return None
     base = spec.get("path")
+    # Cached: a folder's specs share a small number of distinct file paths
+    # (e.g. ~1440 spectra from one matrix file all have the same "path"),
+    # so normalizing it fresh through Path() on every single spec is
+    # thousands of redundant reconstructions of the same few strings.
     try:
-        base = str(Path(base))
+        base = _normalized_path_str(base)
     except Exception:
         base = str(base)
     idx = spec.get("matrix_index")
@@ -329,16 +494,26 @@ def _constant_axis_value_nm(values, unit_hint="nm", tol_nm=1e-3):
     return None
 
 
+_Z_LEVEL_TOKENS = ("z-controller", "absolute z", "z absolute", "z_abs", "abs z", "topo", "topography", "piezo")
+_Z_LEVEL_TOKEN_RE = re.compile("|".join(re.escape(token) for token in _Z_LEVEL_TOKENS))
+_Z_LEVEL_EXACT_LABELS = frozenset({"z", "z (m)", "z_nm"})
+
+
 def _metadata_z_from_spec(spec):
     if not spec:
         return None, None, None
     best = None
-    for key, value in list((spec or {}).items()):
+    for key, value in (spec or {}).items():
         label = str(key or "").strip()
         if not label:
             continue
         label_low = label.lower()
-        if not any(token in label_low for token in ("z-controller", "absolute z", "z absolute", "z_abs", "abs z", "topo", "topography", "piezo")) and label_low not in {"z", "z (m)", "z_nm"}:
+        # This runs across every key of every spec (most of which aren't
+        # z-channel related at all), so the token check needs to be cheap
+        # for the common non-matching case: a single compiled-once regex
+        # search instead of looping over a freshly-built tuple of substrings
+        # with `any(...)` on every call.
+        if not _Z_LEVEL_TOKEN_RE.search(label_low) and label_low not in _Z_LEVEL_EXACT_LABELS:
             continue
         unit_hint = ""
         if "(m)" in label_low:
@@ -443,6 +618,491 @@ def _extract_spec_z_level(spec):
     return None, None, None
 
 
+def _clear_site_annotations(spec):
+    for key in (
+        "site_key",
+        "site_image_key",
+        "site_display",
+        "site_summary",
+        "site_member_count",
+        "site_trace_count",
+        "site_channel_count",
+        "site_channels",
+        "site_has_matrix",
+        "site_has_z_stack",
+        "site_z_label",
+        "site_z_min_nm",
+        "site_z_max_nm",
+        "site_x_nm",
+        "site_y_nm",
+    ):
+        spec.pop(key, None)
+
+
+def _site_sort_tuple(site):
+    try:
+        return (
+            float(site.get("y_nm")) if site.get("y_nm") is not None else float("inf"),
+            float(site.get("x_nm")) if site.get("x_nm") is not None else float("inf"),
+            str(site.get("display") or ""),
+        )
+    except Exception:
+        return (float("inf"), float("inf"), str(site.get("display") or ""))
+
+
+def _site_key_for_spec(spec, *, image_key, xy_tol_nm=0.05):
+    image_key = str(image_key or "")
+    try:
+        sx = float(spec.get("x"))
+        sy = float(spec.get("y"))
+        qx = int(round(sx / xy_tol_nm))
+        qy = int(round(sy / xy_tol_nm))
+        return f"{image_key}::xy:{qx}:{qy}", sx, sy
+    except Exception:
+        pass
+    if spec.get('matrix_index') is not None or is_matrix_file_entry(spec):
+        row = spec.get("grid_row")
+        col = spec.get("grid_col")
+        if row is not None and col is not None:
+            return f"{image_key}::grid:{row}:{col}", None, None
+    identity = _spec_identity_key(spec) or f"{image_key}::spec:{id(spec)}"
+    return f"{image_key}::spec:{identity}", None, None
+
+
+def _format_position_nm(x_nm, y_nm):
+    """User-facing name for an XY measurement position, e.g. 'Position 12.3/45.6 nm'."""
+    try:
+        if x_nm is None or y_nm is None:
+            return ""
+        return f"Position {float(x_nm):.1f}/{float(y_nm):.1f} nm"
+    except Exception:
+        return ""
+
+
+def _derive_site_payload(site_key, image_key, members, x_nm, y_nm):
+    member_count = len(members)
+    channels = []
+    channel_seen = set()
+    has_matrix = False
+    has_z_stack = False
+    z_values = []
+    z_label = None
+    for spec in members:
+        is_matrix_member = spec.get("matrix_index") is not None or is_matrix_file_entry(spec)
+        has_matrix = has_matrix or bool(is_matrix_member)
+        has_z_stack = has_z_stack or bool(spec.get("xy_stack_z_varies"))
+        for name in list((spec.get("channels") or {}).keys()) + list(spec.get("available_channels") or []):
+            name = str(name or "").strip()
+            if not name or name in channel_seen:
+                continue
+            channel_seen.add(name)
+            channels.append(name)
+        if is_matrix_member:
+            # xy_stack_z_varies (checked above) is only ever set on non-matrix
+            # specs (_annotate_xy_stacks explicitly skips matrix entries), so
+            # a matrix member can never make has_z_stack true and its Z level
+            # is never read below - skip the (expensive, metadata-key-scanning)
+            # extraction entirely. On a grid-heavy folder this is thousands of
+            # wasted regex scans per site-building pass.
+            continue
+        level, label, _unit = _extract_spec_z_level(spec)
+        if level is not None:
+            z_values.append(float(level))
+            if z_label is None and label:
+                z_label = str(label)
+    channel_count = len(channels)
+    if x_nm is not None and y_nm is not None:
+        display = _format_position_nm(x_nm, y_nm) or f"Position {site_key.split('::')[-1]}"
+    elif has_matrix and member_count == 1:
+        spec0 = members[0]
+        display = f"Grid point {spec0.get('grid_row', '?')}/{spec0.get('grid_col', '?')}"
+    else:
+        display = f"Position {site_key.split('::')[-1]}"
+    parts = [f"{member_count} " + ("spectrum" if member_count == 1 else "spectra")]
+    if channel_count:
+        parts.append(f"{channel_count} channel" + ("" if channel_count == 1 else "s"))
+    if has_matrix:
+        parts.append("grid map")
+    if has_z_stack and z_values:
+        z_min = min(z_values)
+        z_max = max(z_values)
+        parts.append(f"{z_label or 'Z'} series {z_min:.3f}-{z_max:.3f} nm")
+    elif has_z_stack:
+        parts.append("Z series")
+    summary = f"{display}\n" + " | ".join(parts)
+    payload = {
+        "site_key": site_key,
+        "site_image_key": str(image_key or ""),
+        "site_display": display,
+        "site_summary": summary,
+        "site_member_count": member_count,
+        "site_trace_count": member_count,
+        "site_channel_count": channel_count,
+        "site_channels": list(channels),
+        "site_has_matrix": bool(has_matrix),
+        "site_has_z_stack": bool(has_z_stack),
+        "site_z_label": str(z_label or ""),
+        "site_z_min_nm": min(z_values) if z_values else None,
+        "site_z_max_nm": max(z_values) if z_values else None,
+        "site_x_nm": x_nm,
+        "site_y_nm": y_nm,
+    }
+    return payload
+
+
+def _build_spectro_sites(viewer):
+    originals = list(getattr(viewer, "spectros", []) or [])
+    entries_by_image = getattr(viewer, "spectros_by_image", {}) or {}
+    if not originals and not entries_by_image:
+        viewer.spectro_sites_by_image = defaultdict(list)
+        viewer.spectro_site_index = {}
+        return
+    for spec in originals:
+        _clear_site_annotations(spec)
+    groups_by_image = OrderedDict()
+    primary_site_payloads = {}
+    site_index = {}
+    for image_key, entries in list(entries_by_image.items()):
+        image_key = str(image_key or "")
+        groups = OrderedDict()
+        for spec in list(entries or []):
+            _clear_site_annotations(spec)
+            site_key, sx, sy = _site_key_for_spec(spec, image_key=image_key)
+            group = groups.setdefault(site_key, {"members": [], "x_nm": sx, "y_nm": sy})
+            if group.get("x_nm") is None and sx is not None:
+                group["x_nm"] = sx
+            if group.get("y_nm") is None and sy is not None:
+                group["y_nm"] = sy
+            group["members"].append(spec)
+        sites = []
+        for site_key, group in groups.items():
+            payload = _derive_site_payload(site_key, image_key, group["members"], group.get("x_nm"), group.get("y_nm"))
+            site = {
+                "key": site_key,
+                "image_key": image_key,
+                "display": payload["site_display"],
+                "summary": payload["site_summary"],
+                "members": list(group["members"]),
+                "x_nm": payload["site_x_nm"],
+                "y_nm": payload["site_y_nm"],
+                "channels": list(payload["site_channels"]),
+                "channel_count": payload["site_channel_count"],
+                "trace_count": payload["site_trace_count"],
+                "has_matrix": payload["site_has_matrix"],
+                "has_z_stack": payload["site_has_z_stack"],
+                "z_label": payload["site_z_label"],
+                "z_min_nm": payload["site_z_min_nm"],
+                "z_max_nm": payload["site_z_max_nm"],
+            }
+            sites.append(site)
+            site_index[site_key] = site
+            for spec in group["members"]:
+                spec.update(payload)
+                if str(spec.get("primary_image_key") or spec.get("image_key") or "") == image_key:
+                    identity = _spec_identity_key(spec)
+                    if identity:
+                        primary_site_payloads[identity] = dict(payload)
+        sites.sort(key=_site_sort_tuple)
+        groups_by_image[image_key] = sites
+    for spec in originals:
+        identity = _spec_identity_key(spec)
+        payload = primary_site_payloads.get(identity)
+        if payload:
+            spec.update(payload)
+    viewer.spectro_sites_by_image = defaultdict(list, groups_by_image)
+    viewer.spectro_site_index = site_index
+
+
+# Cluster detection tuning: kept as module constants rather than viewer config
+# since these are geometry heuristics, not user preferences.
+_GROUP_CLUSTER_MIN_MEMBERS = 4  # below this a "shape" isn't visually distinct from plain markers
+_GROUP_CLUSTER_MAX_SITES = 400  # perf guard against the O(n^2) nearest-neighbor pass
+_GROUP_CLUSTER_NN_FACTOR = 3.0  # sites within (factor x median nearest-neighbor distance) join a cluster
+
+
+def _cluster_sites_by_proximity(sites):
+    """Group sites into spatial clusters via single-linkage on nearest-neighbor
+    distance, auto-scaled to this image's own spectrum spacing - a fixed nm
+    threshold can't generalize across wildly different scan ranges. Sites that
+    are each far from every other site stay singleton clusters, so a handful
+    of occasional points scattered across an otherwise empty image are left
+    alone rather than being forced into a group."""
+    n = len(sites)
+    if n < 2:
+        return [[i] for i in range(n)]
+    xs = [float(s["x_nm"]) for s in sites]
+    ys = [float(s["y_nm"]) for s in sites]
+    nn_dists = []
+    for i in range(n):
+        best = None
+        for j in range(n):
+            if i == j:
+                continue
+            d2 = (xs[i] - xs[j]) ** 2 + (ys[i] - ys[j]) ** 2
+            if best is None or d2 < best:
+                best = d2
+        if best is not None:
+            nn_dists.append(math.sqrt(best))
+    if not nn_dists:
+        return [[i] for i in range(n)]
+    nn_dists.sort()
+    median_nn = nn_dists[len(nn_dists) // 2]
+    threshold2 = max(median_nn * _GROUP_CLUSTER_NN_FACTOR, 1e-6) ** 2
+
+    parent = list(range(n))
+
+    def _find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            d2 = (xs[i] - xs[j]) ** 2 + (ys[i] - ys[j]) ** 2
+            if d2 <= threshold2:
+                _union(i, j)
+    clusters = defaultdict(list)
+    for i in range(n):
+        clusters[_find(i)].append(i)
+    return list(clusters.values())
+
+
+def _axis_bin_count(values):
+    """Number of distinct positions along one axis, after merging values that
+    are within a data-driven tolerance of each other (raster grid coordinates
+    are rarely bit-exact, but cluster tightly around a handful of steps)."""
+    uniq = sorted(set(values))
+    if len(uniq) <= 1:
+        return len(uniq)
+    gaps = sorted(uniq[i + 1] - uniq[i] for i in range(len(uniq) - 1))
+    median_gap = gaps[len(gaps) // 2]
+    tol = max(median_gap * 0.4, 1e-9)
+    bins = 1
+    for i in range(1, len(uniq)):
+        if uniq[i] - uniq[i - 1] > tol:
+            bins += 1
+    return bins
+
+
+def _classify_cluster_shape(member_sites):
+    """Classify a spatial cluster of sites as a raster grid, a line, or an
+    irregular cloud, purely from XY geometry (acquisition order is not used).
+    Grid detection: quantize x/y independently into columns/rows and check the
+    point count against columns x rows (allowing ~40% missing for aborted
+    grids). Line vs. cloud: a highly elongated bounding box reads as a line;
+    everything else is a cloud. Diagonal lines can still read as a cloud in
+    this v1 heuristic - an acceptable simplification, not a correctness bug."""
+    xs = [float(s["x_nm"]) for s in member_sites]
+    ys = [float(s["y_nm"]) for s in member_sites]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    dx = max(xmax - xmin, 1e-9)
+    dy = max(ymax - ymin, 1e-9)
+    n_cols = _axis_bin_count(xs)
+    n_rows = _axis_bin_count(ys)
+    total = len(member_sites)
+    if n_cols >= 2 and n_rows >= 2 and total >= 0.6 * n_cols * n_rows:
+        return "grid", n_rows, n_cols
+    if min(dx, dy) <= 0.2 * max(dx, dy):
+        return "line", None, None
+    return "cloud", None, None
+
+
+def _detect_spectro_groups(viewer):
+    """Cluster each image's non-grid-map (i.e. loose .dat) spectroscopy sites
+    into spatial groups - a manual NxM grid of separate files, a line of
+    positions, or a cloud concentrated in one area of the image - so the UI
+    can show at a glance WHERE spectra were acquired instead of an undifferentiated
+    scatter of markers. Isolated points with no nearby neighbors are left
+    ungrouped and keep rendering as plain single markers. Must run after
+    _build_spectro_sites (consumes viewer.spectro_sites_by_image)."""
+    sites_by_image = getattr(viewer, "spectro_sites_by_image", {}) or {}
+    groups_by_image = defaultdict(list)
+    group_index = {}
+    for spec in list(getattr(viewer, "spectros", []) or []):
+        spec.pop("spectro_group_key", None)
+        spec.pop("spectro_group_kind", None)
+        spec.pop("spectro_group_display", None)
+    for image_key, sites in sites_by_image.items():
+        usable = [
+            s for s in sites
+            if not s.get("has_matrix") and s.get("x_nm") is not None and s.get("y_nm") is not None
+        ]
+        if len(usable) < _GROUP_CLUSTER_MIN_MEMBERS or len(usable) > _GROUP_CLUSTER_MAX_SITES:
+            continue
+        clusters = _cluster_sites_by_proximity(usable)
+        group_idx = 0
+        for idx_list in clusters:
+            member_sites = [usable[i] for i in idx_list]
+            if len(member_sites) < _GROUP_CLUSTER_MIN_MEMBERS:
+                continue
+            kind, grid_rows, grid_cols = _classify_cluster_shape(member_sites)
+            xs = [float(s["x_nm"]) for s in member_sites]
+            ys = [float(s["y_nm"]) for s in member_sites]
+            members = [spec for s in member_sites for spec in s["members"]]
+            group_key = f"{image_key}::sgroup:{group_idx}"
+            group_idx += 1
+            point_count = len(member_sites)
+            if kind == "grid":
+                display = f"{grid_cols}x{grid_rows} grid ({point_count} points)"
+            elif kind == "line":
+                display = f"Line of {point_count} points"
+            else:
+                display = f"Cloud of {point_count} points"
+            channels = []
+            seen_ch = set()
+            for spec in members:
+                for name in list((spec.get("channels") or {}).keys()) + list(spec.get("available_channels") or []):
+                    name = str(name or "").strip()
+                    if name and name not in seen_ch:
+                        seen_ch.add(name)
+                        channels.append(name)
+            group = {
+                "group_key": group_key,
+                "image_key": image_key,
+                "kind": kind,
+                "site_keys": [s["key"] for s in member_sites],
+                "members": members,
+                "x_nm": sum(xs) / len(xs),
+                "y_nm": sum(ys) / len(ys),
+                "bbox_nm": (min(xs), max(xs), min(ys), max(ys)),
+                "grid_rows": grid_rows,
+                "grid_cols": grid_cols,
+                "point_count": point_count,
+                "trace_count": len(members),
+                "channels": channels,
+                "display": display,
+                "summary": (
+                    f"{display}\n{len(members)} spectra | "
+                    f"{len(channels)} channel" + ("" if len(channels) == 1 else "s")
+                ),
+            }
+            groups_by_image[image_key].append(group)
+            group_index[group_key] = group
+            for spec in members:
+                spec["spectro_group_key"] = group_key
+                spec["spectro_group_kind"] = kind
+                spec["spectro_group_display"] = display
+    viewer.spectro_groups_by_image = groups_by_image
+    viewer.spectro_group_index = group_index
+
+
+def _reassign_split_measurement_series(viewer):
+    """Fix up repeated-measurement (XY-stack/Z-stack) series that got split
+    across multiple images by the per-spec causal-time assignment above.
+
+    That assignment operates per-file: each spectrum is attached to "the
+    most recent image acquired before it". A series of repeats at one
+    physical site is normally taken in quick succession (seconds apart),
+    but if a new reference image happens to get captured partway through
+    the series, the repeats before that image and the repeats after it
+    resolve to two different images - even though they're all one
+    measurement. Confirmed on real data: a 41-repeat Z-stack split into
+    "1 spec on image A" + "40 specs on image B" because one new image was
+    captured 8 seconds after the first repeat and 14 seconds before the
+    second.
+
+    Fix: after the causal-time pass, regroup by physical site (matching
+    _annotate_xy_stacks's own site definition: rounded XY position, no
+    per-image scoping) and majority-vote - reassign every member of a
+    split site onto whichever image already holds the most of its repeats,
+    so _annotate_xy_stacks (right after this) sees one consistent owner
+    and produces one combined "Zx41" label instead of two fragments.
+    Matrix/grid entries are excluded (matches _annotate_xy_stacks's own
+    exclusion) - those are anchored as a whole grid by a separate,
+    dedicated pass, not per-point, so they can't be split this way.
+    """
+    specs = list(getattr(viewer, "spectros", []) or [])
+    if not specs:
+        return
+    xy_tol_nm = 0.05  # matches _annotate_xy_stacks's own site tolerance
+    groups = OrderedDict()
+    for spec in specs:
+        # is_matrix_file_entry alone only catches Omicron/Anfatec matrix
+        # .dat files (by filename); Nanonis .3ds grid points are flagged via
+        # matrix_index instead - matching the is_matrix_point pattern used
+        # above in _assign_spectros_to_images (both checks are needed to
+        # exclude every matrix/grid spec). Confirmed the hard way: without
+        # the matrix_index check, grid files that happen to share raster-
+        # aligned XY coordinates (common - multiple grids scanning the same
+        # sample region with similar pixel pitch) got treated as "split
+        # sites" and shuffled between images by the thousands.
+        if spec.get('matrix_index') is not None or is_matrix_file_entry(spec):
+            continue
+        try:
+            sx = float(spec.get("x"))
+            sy = float(spec.get("y"))
+        except Exception:
+            continue
+        qx = int(round(sx / xy_tol_nm))
+        qy = int(round(sy / xy_tol_nm))
+        groups.setdefault((qx, qy), []).append(spec)
+
+    for members in groups.values():
+        if len(members) <= 1:
+            continue
+        counts = {}
+        for spec in members:
+            key = str(spec.get("image_key") or "")
+            counts[key] = counts.get(key, 0) + 1
+        if len(counts) <= 1:
+            continue  # not split - every member already agrees
+        max_count = max(counts.values())
+        candidates = [key for key, cnt in counts.items() if cnt == max_count]
+        if len(candidates) == 1:
+            majority_key = candidates[0]
+        else:
+            # Deterministic tie-break: prefer whichever candidate image
+            # holds the earliest-timestamped member of this site, rather
+            # than relying on dict iteration order.
+            first_time_by_key = {}
+            for spec in members:
+                key = str(spec.get("image_key") or "")
+                if key not in candidates:
+                    continue
+                t = spec.get("time") or spec.get("display_time")
+                if t is not None and (key not in first_time_by_key or t < first_time_by_key[key]):
+                    first_time_by_key[key] = t
+            majority_key = min(candidates, key=lambda k: first_time_by_key.get(k) or datetime.max)
+        if not majority_key:
+            continue
+
+        for spec in members:
+            old_key = str(spec.get("image_key") or "")
+            if old_key == majority_key:
+                continue
+            bucket = viewer.spectros_by_image.get(old_key)
+            if bucket is not None:
+                try:
+                    bucket.remove(spec)
+                except ValueError:
+                    pass
+            spec["image_key"] = majority_key
+            spec["primary_image_key"] = majority_key
+            if spec.get("shared_image_keys") == [old_key]:
+                spec["shared_image_keys"] = [majority_key]
+            spec["assignment_reason"] = "zstack_series_majority"
+            spec["assignment_confidence"] = "high"
+            spec["assignment_summary"] = (
+                "Consolidated onto the image most of this repeated-measurement "
+                "series belongs to (the series was split across images because "
+                "a new reference image was captured mid-series)."
+            )
+            viewer.spectros_by_image.setdefault(majority_key, []).append(spec)
+
+    for k in list(viewer.spectros_by_image.keys()):
+        viewer.spectros_by_image[k].sort(key=lambda s: (
+            s.get('display_time') or s.get('time') or datetime.min,
+            s.get('order_idx') or 0,
+        ))
+
+
 def _annotate_xy_stacks(viewer):
     originals = list(getattr(viewer, "spectros", []) or [])
     if not originals:
@@ -466,7 +1126,14 @@ def _annotate_xy_stacks(viewer):
     z_tol_nm = 1e-3
     groups = OrderedDict()
     for spec in originals:
-        if is_matrix_file_entry(spec):
+        # Both checks needed - is_matrix_file_entry alone only catches
+        # Omicron/Anfatec matrix .dat files, not Nanonis .3ds grid points
+        # (flagged via matrix_index instead). See
+        # _reassign_split_measurement_series's comment for how this gap
+        # manifests if left unfixed: grid files sharing raster-aligned XY
+        # coordinates and the same image owner would get merged into one
+        # bogus "Zx" xy-stack.
+        if spec.get('matrix_index') is not None or is_matrix_file_entry(spec):
             continue
         try:
             sx = float(spec.get("x"))
@@ -500,10 +1167,10 @@ def _annotate_xy_stacks(viewer):
         z_min = min(z_values) if z_values else None
         z_max = max(z_values) if z_values else None
         if z_varies and z_min is not None and z_max is not None:
-            summary = f"Z-stack: {len(members)} spectra at one XY\n{z_label or 'Z'} {z_min:.3f} to {z_max:.3f} nm"
+            summary = f"Z series: {len(members)} spectra at one position\n{z_label or 'Z'} {z_min:.3f}-{z_max:.3f} nm"
             display = f"Zx{len(members)}"
         else:
-            summary = f"Coincident spectra: {len(members)} at one XY"
+            summary = f"Repeated spectra: {len(members)} at one position"
             display = f"x{len(members)}"
         for spec in members:
             identity = _spec_identity_key(spec)
@@ -530,28 +1197,62 @@ def _annotate_xy_stacks(viewer):
             ann = annotations.get(identity)
             if ann:
                 spec.update(ann)
+    _build_spectro_sites(viewer)
+    _detect_spectro_groups(viewer)
 
 
-def _choose_image_for_spec(viewer, spec, images, image_extents):
+def _choose_image_for_spec(viewer, spec, images, image_extents, *, image_angles=None, with_details=False):
     """Pick the best image for a spectroscopy based on extent containment first, then time/hint."""
+    def _result(match, reason, confidence, summary):
+        image_key = str(match.get("path") or "") if match else ""
+        details = _assignment_payload(reason, confidence, summary, image_key=image_key)
+        if with_details:
+            return match, details
+        return match
+
     st = _spec_time_for_assignment(spec)
     sx = spec.get('x'); sy = spec.get('y')
+    # Computed once and reused by both the .dat-specific branch below and the
+    # generic fallback path further down - they used to run this same O(images)
+    # containment scan twice for any spec that matched neither (e.g. one whose
+    # position falls outside every image's extent), doubling the cost of the
+    # single most expensive part of assignment for no different result.
+    containment_candidates = None
+    if sx is not None and sy is not None:
+        containment_candidates = []
+        for img in images:
+            ext = image_extents.get(str(img['path']))
+            angle = (image_angles or {}).get(str(img['path'])) or 0.0
+            if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=0.02, angle_deg=angle):
+                containment_candidates.append(img)
     if _is_dat_spec(spec):
         # Prefer spatial matching for .dat when coordinates are available.
         if sx is not None and sy is not None:
-            candidates = []
-            for img in images:
-                ext = image_extents.get(str(img['path']))
-                if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=0.02):
-                    candidates.append(img)
+            candidates = containment_candidates
             if candidates:
-                if st:
-                    candidates.sort(key=lambda img: abs((img.get('time') or datetime.min) - st))
-                return candidates[0]
+                timed_match = _image_before_spec_time(candidates, st)
+                if timed_match is not None:
+                    return _result(
+                        timed_match,
+                        "xy_inside_extent_causal_time",
+                        "high",
+                        "Assigned to an image whose field of view contains the spectrum position, then resolved by acquisition order.",
+                    )
+                return _result(
+                    candidates[0],
+                    "xy_inside_extent",
+                    "high",
+                    "Assigned to an image whose field of view contains the spectrum position.",
+                )
         # Next, prefer time ordering for .dat when coordinates don't match extents.
         time_match = _image_before_spec_time(images, st)
         if time_match is not None:
-            return time_match
+            return _result(
+                time_match,
+                "causal_time",
+                "medium",
+                "Assigned to the latest image acquired at or before the spectrum time.",
+            )
         hint_match = None
         hint_score = -1
         try:
@@ -560,20 +1261,38 @@ def _choose_image_for_spec(viewer, spec, images, image_extents):
             # Backward compatibility if viewer overrides without new arg
             hint_match = viewer._match_spec_to_image_by_hint(spec, images)
         if hint_match is not None and hint_score is not None and hint_score >= 60:
-            return hint_match
+            return _result(
+                hint_match,
+                "name_hint",
+                "medium",
+                "Assigned by a strong filename/session naming hint after spatial and time checks were inconclusive.",
+            )
         if hint_match is not None:
-            return hint_match
-    candidates = []
+            return _result(
+                hint_match,
+                "name_hint",
+                "low",
+                "Assigned by a weak filename/session naming hint because stronger cues were unavailable.",
+            )
     # First pass: images whose extents contain the point (with a small margin)
-    if sx is not None and sy is not None:
-        for img in images:
-            ext = image_extents.get(str(img['path']))
-            if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=0.02):
-                candidates.append(img)
-        if candidates:
-            if st:
-                candidates.sort(key=lambda img: abs((img.get('time') or datetime.min) - st))
-            return candidates[0]
+    # - already computed above as containment_candidates; a .dat spec that
+    # reaches this point already had its (empty) result, so no need to redo it.
+    candidates = containment_candidates or []
+    if sx is not None and sy is not None and candidates:
+        timed_match = _image_before_spec_time(candidates, st)
+        if timed_match is not None:
+            return _result(
+                timed_match,
+                "xy_inside_extent_causal_time",
+                "high",
+                "Assigned to an image whose field of view contains the spectrum position, then resolved by acquisition order.",
+            )
+        return _result(
+            candidates[0],
+            "xy_inside_extent",
+            "high",
+            "Assigned to an image whose field of view contains the spectrum position.",
+        )
     # Second pass: closest by space (even if slightly outside), then by time
     if sx is not None and sy is not None:
         scored = []
@@ -592,7 +1311,17 @@ def _choose_image_for_spec(viewer, spec, images, image_extents):
             best = scored[0][1]
             # ensure distance is not absurdly large compared to image span
             ext = image_extents.get(str(best['path']))
-            if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=1.0):
+            angle = (image_angles or {}).get(str(best['path'])) or 0.0
+            if ext and viewer._spec_within_extent(sx, sy, ext, margin_frac=1.0, angle_deg=angle):
+                offset = viewer._spec_frame_offset_info(sx, sy, ext, angle_deg=angle)
+                distance_txt = _off_frame_distance_text(offset)
+                summary = "Assigned to the nearest plausible image footprint because the spectrum fell outside all image bounds."
+                if distance_txt:
+                    summary = f"{summary} Real position is {distance_txt} - likely a reference point acquired off-frame, not a placement error."
+                image_key = str(best.get("path") or "")
+                details = _assignment_payload("xy_nearest_extent", "medium", summary, image_key=image_key, off_frame_offset=offset)
+                if with_details:
+                    return best, details
                 return best
     # Fallback: time-ordered + name hints
     if st:
@@ -605,8 +1334,23 @@ def _choose_image_for_spec(viewer, spec, images, image_extents):
         except Exception:
             match = None
         if match:
-            return match
-    return viewer._match_spec_to_image_by_hint(spec, images)
+            return _result(
+                match,
+                "causal_time",
+                "medium",
+                "Assigned to the latest image acquired at or before the spectrum time.",
+            )
+    hint_match = viewer._match_spec_to_image_by_hint(spec, images)
+    if hint_match is not None:
+        return _result(
+            hint_match,
+            "name_hint",
+            "low",
+            "Assigned by filename/session naming similarity because spatial and time cues were unavailable.",
+        )
+    if with_details:
+        return None, None
+    return None
 
 
 def _image_before_spec_time(images, spec_time):
@@ -637,17 +1381,108 @@ def _extent_center(viewer, extent):
         return 0.0, 0.0
 
 
-def _spec_within_extent(viewer, sx, sy, extent, margin_frac=0.05):
+def _spec_within_extent(viewer, sx, sy, extent, margin_frac=0.05, angle_deg=0.0):
+    """Check whether (sx, sy) falls inside an image's footprint.
+
+    Rotates the offset into the image's own local frame (same convention as
+    _map_spec_to_pixels) before testing against its half-width/half-height,
+    instead of a plain axis-aligned bbox check - a rotated scan's real
+    footprint extends beyond its unrotated x/y range, so the old
+    axis-aligned check wrongly rejected legitimate in-frame points on any
+    meaningfully-rotated image (confirmed on a real 42.77deg scan: a spectrum
+    clearly inside the image, per Nanonis's own viewer, fell outside the
+    naive bbox and got assigned to a neighboring image instead). Reduces to
+    the exact old axis-aligned check when angle_deg is 0.
+    """
     try:
         x0, x1, y1, y0 = extent
-        xmin, xmax = sorted((x0, x1))
-        ymin, ymax = sorted((y0, y1))
-        mx = (xmax - xmin) * margin_frac
-        my = (ymax - ymin) * margin_frac
-        xmin -= mx; xmax += mx; ymin -= my; ymax += my
-        return xmin <= float(sx) <= xmax and ymin <= float(sy) <= ymax
+        xspan = x1 - x0
+        yspan = y1 - y0
+        if xspan <= 0 or yspan <= 0:
+            return False
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        dx = float(sx) - cx
+        dy = float(sy) - cy
+        if angle_deg:
+            theta = math.radians(angle_deg)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            u_nm = dx * cos_t - dy * sin_t
+            v_nm = dx * sin_t + dy * cos_t
+        else:
+            u_nm, v_nm = dx, dy
+        u = u_nm / xspan
+        v = v_nm / yspan
+        bound = 0.5 + margin_frac
+        return -bound <= u <= bound and -bound <= v <= bound
     except Exception:
         return False
+
+
+def _spec_frame_offset_info(viewer, sx, sy, extent, angle_deg=0.0):
+    """How far (sx, sy) sits outside an image's own footprint, and in which
+    direction - a diagnostic companion to _spec_within_extent (same rotate-
+    then-normalize convention, kept as a deliberate second copy since this
+    computes a distance/direction rather than a yes/no, and the assignment
+    path this feeds is cold - run once per spec at scan time, not per-frame
+    render). Returns None if (sx, sy) is inside the footprint, or geometry
+    is degenerate.
+    """
+    try:
+        x0, x1, y1, y0 = extent
+        xspan = x1 - x0
+        yspan = y1 - y0
+        if xspan <= 0 or yspan <= 0:
+            return None
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        dx = float(sx) - cx
+        dy = float(sy) - cy
+        if angle_deg:
+            theta = math.radians(angle_deg)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            u_nm = dx * cos_t - dy * sin_t
+            v_nm = dx * sin_t + dy * cos_t
+        else:
+            u_nm, v_nm = dx, dy
+        u = u_nm / xspan
+        v = v_nm / yspan
+    except Exception:
+        return None
+    if -0.5 <= u <= 0.5 and -0.5 <= v <= 0.5:
+        return None
+    over_x_nm = max(0.0, abs(u) - 0.5) * xspan
+    over_y_nm = max(0.0, abs(v) - 0.5) * yspan
+    parts = []
+    if over_y_nm > 1e-9:
+        parts.append("N" if v > 0 else "S")
+    if over_x_nm > 1e-9:
+        parts.append("E" if u > 0 else "W")
+    return {
+        "u": u,
+        "v": v,
+        "over_x_nm": over_x_nm,
+        "over_y_nm": over_y_nm,
+        "distance_nm": math.hypot(over_x_nm, over_y_nm),
+        "direction": "".join(parts) or None,
+    }
+
+
+def _off_frame_distance_text(offset):
+    if not offset:
+        return ""
+    distance = offset.get("distance_nm")
+    direction = offset.get("direction")
+    if distance is None:
+        return ""
+    dir_names = {
+        "N": "north", "S": "south", "E": "east", "W": "west",
+        "NE": "northeast", "NW": "northwest", "SE": "southeast", "SW": "southwest",
+    }
+    where = dir_names.get(direction, "of frame")
+    return f"≈{distance:.2f} nm {where} of the frame edge"
 
 
 def _match_spec_to_image_by_hint(viewer, spec, images, *, with_score=False):

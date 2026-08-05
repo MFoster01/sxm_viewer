@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 from pathlib import Path
 from ..._shared import QtWidgets, QtCore, QtGui
+from ... import cmap_registry
 
 # Atom palettes (simplified, hex)
 CPK_COLORS = {
@@ -54,6 +55,18 @@ ATOM_PALETTES = {
         'Zn': '#7d80b0', 'Si': '#DA8B45', 'B': '#FFB5B5'
     }
 }
+
+# Curated colormap categories for coloring bonds by a data value. The
+# lists themselves now live in the central registry
+# (sxm_viewer/cmap_registry.py _FEATURED) — these are thin aliases kept
+# for existing importers.
+DIVERGING_COLORMAPS = cmap_registry.featured_cmap_names("molecule_diverging")
+SEQUENTIAL_COLORMAPS = cmap_registry.featured_cmap_names("molecule_sequential")
+QUANTITATIVE_COLORMAPS = DIVERGING_COLORMAPS + SEQUENTIAL_COLORMAPS
+
+# Qualitative/discrete colormaps, for categorical data (bond order, binned
+# length categories) where color shouldn't imply a magnitude ordering.
+QUALITATIVE_COLORMAPS = cmap_registry.featured_cmap_names("molecule_qualitative")
 
 MOLECULE_RENDER_STYLE_OPTIONS = [
     ("Shaded", "shaded"),

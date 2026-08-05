@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import functools
-import itertools
 import json
 import math
 import time
@@ -62,10 +61,13 @@ from ..figure_layout_presets import (
     save_figure_with_dialog,
 )
 from ..mpl_compat import InsetPosition
+from ..qt_helpers import set_silent
+from . import potential_fits
 try:
     from scipy import signal as _scipy_signal
 except Exception:  # pragma: no cover
     _scipy_signal = None
+from ... import cmap_registry
 from ...config import (
     CONFIG_PATH,
     HEADER_CACHE_PATH,
@@ -74,7 +76,6 @@ from ...config import (
     CH_SAMPLE_POINTS,
     CHANNEL_DATA_CACHE_LIMIT,
     FILTERED_CACHE_LIMIT,
-    THUMB_DISK_CACHE_DIR,
     load_config,
     save_config,
     load_header_cache,
@@ -140,6 +141,241 @@ from ..thumbnail_render import (
 )
 from .matrix_fit import MatrixFitDialog
 from ..spectroscopy import overlays as spectro_overlays
+from .. import theme as ui_theme
+
+
+def _style_plot_chrome(owner, fig):
+    """Follow the app theme for a dialog figure's chrome (backgrounds,
+    ticks, labels — never data artists or colormaps).  Light mode is a
+    no-op so the historical white look stays byte-identical."""
+    mode = ui_theme.plot_chrome_mode(owner)
+    if mode != ui_theme.THEME_LIGHT:
+        ui_theme.style_figure_chrome(fig, mode)
+
+_INSET_MARKER_SYMBOLS = ("circle", "square", "triangle", "diamond")
+_INSET_MPL_MARKER_BY_SYMBOL = {"circle": "o", "square": "s", "triangle": "^", "diamond": "D"}
+_INSET_RESIZE_HANDLE_PX = 10
+_INSET_MIN_SIZE = 0.10
+_INSET_MAX_SIZE = 0.85
+
+# nm-per-unit for length axes (base unit is always "nm" - see
+# data/spectroscopy.py and providers/nanonis/adapter.py) and V-per-unit for
+# voltage axes (base unit is always "V"). Only the units actually offered in
+# the Axis-unit selector need entries here.
+_LENGTH_NM_PER_UNIT = {"pm": 1e-3, "Å": 0.1, "nm": 1.0, "µm": 1e3}
+_VOLTAGE_V_PER_UNIT = {"µV": 1e-6, "mV": 1e-3, "V": 1.0}
+
+
+def _axis_unit_choices_for(base_unit):
+    """Selectable display units for a given axis's native/base unit, in
+    display order. Length axes (base "nm") offer pm/Å/nm/µm; voltage axes
+    (base "V", or "mV" - see the mislabeled-mV heuristic in
+    _on_axis_changed, which relabels without rescaling) offer µV/mV/V. Any
+    other axis (Hz, A, ...) offers nothing - it's shown as-is."""
+    u = (base_unit or "").strip()
+    if u.lower() == "nm":
+        return ["pm", "Å", "nm", "µm"]
+    if u.lower() == "v" or u in _VOLTAGE_V_PER_UNIT:
+        return ["µV", "mV", "V"]
+    return []
+
+
+def _axis_unit_scale_for(base_unit, target_unit):
+    """Multiplier to convert a value already in `base_unit` into
+    `target_unit`. `base_unit` is normally "nm" or "V", but can also be
+    "mV" (see the mislabeled-mV heuristic in _on_axis_changed, which
+    relabels large-magnitude "V" data as "mV" without rescaling it)."""
+    u = (base_unit or "").strip()
+    if u.lower() == "nm" and target_unit in _LENGTH_NM_PER_UNIT:
+        return 1.0 / _LENGTH_NM_PER_UNIT[target_unit]
+    base_v_per_unit = _VOLTAGE_V_PER_UNIT.get(u)
+    if base_v_per_unit is None and u.lower() == "v":
+        base_v_per_unit = _VOLTAGE_V_PER_UNIT["V"]
+    if base_v_per_unit is not None and target_unit in _VOLTAGE_V_PER_UNIT:
+        return base_v_per_unit / _VOLTAGE_V_PER_UNIT[target_unit]
+    return 1.0
+
+
+def _near_resize_handle(bbox, x, y):
+    """True when (x, y) - in the same display-pixel space as bbox - is near
+    the inset's bottom-right corner (its resize grip)."""
+    try:
+        return abs(x - bbox.x1) <= _INSET_RESIZE_HANDLE_PX and abs(y - bbox.y0) <= _INSET_RESIZE_HANDLE_PX
+    except Exception:
+        return False
+
+
+def _resize_inset_bbox(parent_ax, resize_start, event_x, event_y):
+    """Compute a new [x0, y0, w, h] inset bbox (axes-fraction units) from a
+    bottom-right-corner drag. `resize_start` is (corner_offset_x,
+    corner_offset_y, start_bbox): the pixel-space offset between the press
+    point and the inset's true bottom-right corner (captured on mouse press,
+    so grabbing slightly off-corner doesn't snap), plus the bbox at press
+    time.
+
+    The inset's top-left corner (x0, y0+h0) is held fixed and the
+    bottom-right corner is made to track the cursor directly (1:1, modulo
+    the captured offset) - matching where the visible resize-grip glyph
+    actually sits, so dragging it down/right grows the box toward the
+    cursor and dragging up/left shrinks it, instead of the box growing away
+    from the corner being dragged.
+    """
+    if not resize_start:
+        return None
+    offset_x, offset_y, start_bbox = resize_start
+    try:
+        inv = parent_ax.transAxes.inverted()
+        corner = inv.transform((event_x - offset_x, event_y - offset_y))
+    except Exception:
+        return None
+    x0, y0, w0, h0 = start_bbox
+    y_top = y0 + h0
+    new_w = min(max(corner[0] - x0, _INSET_MIN_SIZE), _INSET_MAX_SIZE, 1.0 - x0)
+    new_h = min(max(y_top - corner[1], _INSET_MIN_SIZE), _INSET_MAX_SIZE, y_top)
+    new_y0 = y_top - new_h
+    return [x0, new_y0, new_w, new_h]
+
+
+def _draw_inset_resize_handle(inset_ax):
+    """Draw a small grip glyph in the inset's bottom-right corner marking
+    the drag-to-resize hotspot."""
+    try:
+        inset_ax.plot(
+            [1.0], [0.0],
+            marker=(3, 0, -135),
+            markersize=7,
+            markerfacecolor="#ffffff",
+            markeredgecolor="#00000080",
+            markeredgewidth=0.6,
+            transform=inset_ax.transAxes,
+            clip_on=False,
+            zorder=6,
+            alpha=0.85,
+        )
+    except Exception:
+        pass
+
+
+def _preview_channel_cmap_for_file(viewer, file_key):
+    """Resolve the (channel_idx, cmap_name) the main Preview canvas is
+    currently showing for `file_key`, so the Position inset can be a
+    faithful copy of what's on screen rather than defaulting to whatever
+    the independent thumbnail-grid channel/cmap selectors happen to be set
+    to.
+    """
+    file_key = str(file_key)
+    channel_idx = None
+    cmap = None
+    canvas = getattr(viewer, "preview_canvas", None)
+    for view in (getattr(canvas, "views", None) or []):
+        try:
+            if str(view.get("path")) == file_key:
+                channel_idx = int(view.get("channel_idx"))
+                cmap = view.get("cmap")
+                break
+        except Exception:
+            continue
+    if channel_idx is None:
+        last_preview = getattr(viewer, "last_preview", None)
+        if last_preview and str(last_preview[0]) == file_key:
+            try:
+                channel_idx = int(last_preview[1])
+            except Exception:
+                channel_idx = None
+    if channel_idx is None:
+        try:
+            channel_idx = int(viewer.channel_dropdown.currentIndex()) if hasattr(viewer, "channel_dropdown") else 0
+        except Exception:
+            channel_idx = 0
+    if not cmap:
+        try:
+            cmap = (getattr(viewer, "per_file_channel_cmap", {}) or {}).get((file_key, int(channel_idx)))
+        except Exception:
+            cmap = None
+    if not cmap:
+        cmap = getattr(viewer, "preview_cmap", None) or getattr(viewer, "thumb_cmap", "viridis")
+    return int(channel_idx or 0), str(cmap)
+
+
+def _render_inset_background(viewer, file_key, width, height):
+    """Render the Position inset's background as a faithful color copy of
+    whatever channel/cmap the main Preview is currently showing for this
+    file (falling back sanely when the file isn't open in the Preview),
+    instead of the thumbnail grid's own channel/cmap desaturated to gray.
+
+    Returns (rgb array in [0,1] shaped (h,w,3), crop_info dict-or-None).
+    """
+    if not viewer or not file_key:
+        return None, None
+    channel_idx, cmap = _preview_channel_cmap_for_file(viewer, file_key)
+    try:
+        thumb = viewer._thumbnail_pixmap_for_file(str(file_key), channel_idx, width, height, cmap)
+    except Exception:
+        thumb = None
+    if thumb is None:
+        return None, None
+    crop_info = None
+    try:
+        header, fds = viewer.headers.get(str(file_key), (None, None))
+        if header is not None and fds and 0 <= channel_idx < len(fds):
+            data_key = viewer._thumbnail_data_key(str(file_key), channel_idx, fds[channel_idx], width, height)
+            with viewer._thumb_data_lock:
+                crop_info = viewer._thumb_crop_cache.get(data_key)
+    except Exception:
+        crop_info = None
+    qimg = thumb.toImage().convertToFormat(QtGui.QImage.Format_RGBA8888)
+    ptr = qimg.bits()
+    ptr.setsize(qimg.byteCount())
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((qimg.height(), qimg.width(), 4))
+    rgb = np.clip(arr[..., :3].astype(np.float64) / 255.0, 0.0, 1.0)
+    return rgb, crop_info
+
+
+def _spec_display_coords(viewer, spec, header, file_key, disp_w, disp_h, crop_info=None):
+    """Map a spec's position onto a *displayed* (possibly downsampled and
+    row-cropped) thumbnail image of size (disp_w, disp_h).
+
+    `_map_spec_to_pixels` returns pixel coordinates in the *original*,
+    uncropped header pixel grid (xPixel/yPixel) - not the on-screen thumbnail
+    size. The main thumbnail grid's own marker overlays
+    (`_render_spectroscopy_overlays`) account for this by scaling separately
+    per axis: w_scale from the full column count, h_scale from the cropped
+    row count (when `detect_valid_scan_region` trimmed blank rows off a
+    partial/aborted scan) or the full row count otherwise. Position insets
+    must use the same two-step transform, or markers land outside the
+    displayed image entirely whenever the underlying thumbnail was cropped.
+    """
+    if not viewer or not file_key or spec is None or header is None:
+        return None
+    try:
+        xpix = int(header.get('xPixel', 128))
+        ypix = int(header.get('yPixel', xpix))
+    except Exception:
+        return None
+    try:
+        c = viewer._map_spec_to_pixels(spec, header, xpix, ypix, file_key=file_key, thumb_crop=crop_info)
+    except Exception:
+        c = None
+    if c is None:
+        return None
+    col, row = c
+    crop_rows = None
+    if crop_info:
+        try:
+            r0 = int(crop_info.get("r0"))
+            r1 = int(crop_info.get("r1"))
+            if r1 > r0:
+                crop_rows = r1 - r0 + 1
+        except Exception:
+            crop_rows = None
+    y_denom = max(1, (crop_rows - 1)) if crop_rows else max(1, ypix - 1)
+    w_scale = max(2, int(disp_w)) / max(1, xpix - 1)
+    h_scale = max(2, int(disp_h)) / y_denom
+    try:
+        return (float(col) * w_scale, float(row) * h_scale)
+    except Exception:
+        return None
+
 
 def _normalize_topo_axis(values: np.ndarray, unit_hint: str | None) -> tuple[np.ndarray, str]:
     arr = np.asarray(values, dtype=float)
@@ -161,6 +397,53 @@ def _normalize_topo_axis(values: np.ndarray, unit_hint: str | None) -> tuple[np.
             return arr * 1e9, "nm"
         return arr, (unit if unit else "nm")
     return arr, unit
+
+
+def _zrel_group_common_origin(specs):
+    """The reference "zero" for a combined Z_rel view: the MOST NEGATIVE
+    absolute-Z sweep-start (origin_abs, see data/spectroscopy.py and
+    providers/nanonis/adapter.py) across every spectrum in `specs` that has
+    one. Returns None if fewer than one spec carries an origin_abs (or the
+    group has only one spectrum) - the single-spectrum case is meant to stay
+    trivial (plain Nanonis-native Z_rel, unchanged)."""
+    origins = []
+    for spec in specs or []:
+        if not spec:
+            continue
+        for ax in spec.get("AxisChoices") or []:
+            if ax.get("key") == "z" and ax.get("origin_abs") is not None:
+                try:
+                    origins.append(float(ax["origin_abs"]))
+                except Exception:
+                    pass
+                break
+    if len(origins) < 2:
+        return None
+    return min(origins)
+
+
+def _apply_zrel_origin(vals: np.ndarray, ax_choice: dict, key, common_origin=None) -> np.ndarray:
+    """When `key` is the relative-Z axis and its AxisChoice carries a
+    precomputed absolute-Z origin (see data/spectroscopy.py and
+    providers/nanonis/adapter.py, both key "z"), shift this spectrum's own
+    Z_rel by (its own origin_abs - the group's common origin), so combining
+    several spectra aligns every trace relative to whichever one's own sweep
+    started deepest (most negative absolute Z) - not to absolute zero, which
+    just reconstructs the Z(abs) axis and defeats the point of a *relative*
+    view. `common_origin` should be `_zrel_group_common_origin` computed over
+    every spectrum currently combined together; when None (a single,
+    uncombined spectrum, or no other spec carries an origin_abs), the shift
+    is trivially zero - the plain Nanonis-native Z_rel curve, unchanged."""
+    if key != "z" or not isinstance(ax_choice, dict):
+        return vals
+    origin_abs = ax_choice.get("origin_abs")
+    if origin_abs is None:
+        return vals
+    reference = common_origin if common_origin is not None else origin_abs
+    try:
+        return vals + float(origin_abs - reference)
+    except Exception:
+        return vals
 
 
 def _topo_axis_from_spec(spec: dict | None) -> dict | None:
@@ -367,6 +650,132 @@ def _style_kwargs(style_state: dict | None = None) -> dict:
         "underline": bool(style_state.get("underline", False)),
     }
 
+
+def _spectro_assignment_text(spec: dict | None) -> str:
+    if not spec:
+        return ""
+    summary = str(spec.get("assignment_summary") or "").strip()
+    confidence = str(spec.get("assignment_confidence") or "").strip()
+    if not summary:
+        return ""
+    if confidence:
+        return f"Assignment: {summary} ({confidence} confidence)"
+    return f"Assignment: {summary}"
+
+
+def _spectro_site_text(spec: dict | None) -> str:
+    if not spec:
+        return ""
+    summary = str(spec.get("site_summary") or "").strip()
+    if summary:
+        return summary
+    display = str(spec.get("site_display") or "").strip()
+    if display:
+        return display
+    return ""
+
+
+def _apply_signal_filter_chain(x_vals, y_vals, y_unit, x_unit, filter_cfg):
+    """Apply the gaussian/median/savgol/fft/notch/derive filter chain
+    described by filter_cfg to y_vals, returning (filtered_y, unit).
+
+    Pure/module-level (no `self`) so it can run identically from a
+    QThread-based fit worker as from the GUI-thread plotting code that
+    originally only lived as SpectroscopyPopup._apply_data_filters and
+    SpectroscopyCompareDialog._apply_data_filters - both of which now
+    delegate here instead of keeping their own duplicate copy of this
+    logic, matching what fits get: without a single shared implementation,
+    "fit" silently reading raw data while "plot" reads filtered data (see
+    _SpectroFitWorker) would have been an easy discrepancy to reintroduce.
+    """
+    filter_cfg = filter_cfg or {}
+    data = np.asarray(y_vals, dtype=float)
+    x_arr = np.asarray(x_vals, dtype=float) if np.size(x_vals) == data.size else np.linspace(0, data.size - 1, data.size)
+    if data.size == 0:
+        return data, y_unit
+    result = data.copy()
+    dx = float(np.nanmean(np.diff(x_arr))) if x_arr.size > 1 else 1.0
+    if not math.isfinite(dx) or dx == 0:
+        dx = 1.0
+
+    def _odd(value, minimum):
+        v = max(minimum, int(value) or minimum)
+        return v + 1 if v % 2 == 0 else v
+
+    gauss = filter_cfg.get("gaussian", {})
+    if gauss.get("enabled"):
+        sigma = max(0.1, float(gauss.get("sigma", 1.0)))
+        if _scipy_ndimage is not None:
+            result = _scipy_ndimage.gaussian_filter1d(result, sigma=max(0.05, sigma), mode="nearest")
+        else:
+            radius = max(1, int(3 * sigma))
+            xs = np.arange(-radius, radius + 1)
+            kernel = np.exp(-(xs ** 2) / (2.0 * sigma ** 2))
+            kernel /= kernel.sum() or 1.0
+            result = np.convolve(result, kernel, mode="same")
+
+    median = filter_cfg.get("median", {})
+    if median.get("enabled"):
+        size = _odd(median.get("size", 3), 3)
+        if _scipy_ndimage is not None:
+            result = _scipy_ndimage.median_filter(result, size=size, mode="nearest")
+        else:
+            pad = size // 2
+            padded = np.pad(result, pad, mode="edge")
+            out = np.empty_like(result)
+            for i in range(result.size):
+                out[i] = np.median(padded[i:i + size])
+            result = out
+
+    sav_cfg = filter_cfg.get("savgol", {})
+    if sav_cfg.get("enabled"):
+        window = _odd(sav_cfg.get("window", 11), 5)
+        window = min(window, result.size - 1 if result.size % 2 == 0 else result.size)
+        window = max(5, window if window % 2 == 1 else window - 1)
+        poly = max(2, min(int(sav_cfg.get("poly", 3)), window - 1))
+        if window >= 3 and window <= result.size:
+            if _scipy_signal is not None:
+                result = _scipy_signal.savgol_filter(result, window, poly, mode="interp")
+            else:
+                result = np.convolve(result, np.ones(window) / float(window), mode="same")
+
+    fft_cfg = filter_cfg.get("fft", {})
+    if fft_cfg.get("enabled") and result.size >= 8:
+        cutoff = min(max(float(fft_cfg.get("cutoff", 0.15)), 0.0), 0.5)
+        if cutoff > 0.0:
+            centered = result - np.nanmean(result)
+            freq = np.fft.rfftfreq(result.size, d=dx)
+            spectrum = np.fft.rfft(centered)
+            nyquist = 0.5 / dx
+            spectrum *= (np.abs(freq) <= cutoff * nyquist)
+            result = np.fft.irfft(spectrum, n=result.size) + np.nanmean(result)
+
+    notch = filter_cfg.get("notch", {})
+    if notch.get("enabled") and result.size >= 8:
+        freq = abs(float(notch.get("freq", 50.0)))
+        width = max(0.0001, abs(float(notch.get("width", 5.0))))
+        if freq > 0.0:
+            centered = result - np.nanmean(result)
+            spectrum = np.fft.rfft(centered)
+            freqs = np.fft.rfftfreq(result.size, d=dx)
+            spectrum *= ~(np.abs(freqs - freq) < width)
+            result = np.fft.irfft(spectrum, n=result.size) + np.nanmean(result)
+
+    deriv = filter_cfg.get("derive", {})
+    unit = y_unit
+    if deriv.get("enabled"):
+        window = _odd(deriv.get("window", 11), 5)
+        window = min(window, result.size - 1 if result.size % 2 == 0 else result.size)
+        window = max(5, window if window % 2 == 1 else window - 1)
+        poly = max(2, min(int(deriv.get("poly", 3)), window - 1))
+        if _scipy_signal is not None and window >= 5 and window <= result.size:
+            result = _scipy_signal.savgol_filter(result, window, poly, deriv=1, delta=dx, mode="interp")
+        else:
+            result = np.gradient(result, x_arr)
+        unit = f"d({unit or 'arb'})/d({x_unit or 'x'})"
+    return result, unit
+
+
 class SpectroscopyPopup(QtWidgets.QDialog):
     """Popup window showing spectroscopy curves for a given file."""
     SCIENCE_PALETTE = [
@@ -380,15 +789,17 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         "#f96855", "#56a3a6", "#9f5f9d", "#2d5d82", "#73c2ff", "#ffaec9",
         "#000000", "#202020", "#404040", "#808080", "#c0c0c0", "#ffffff"
     ]
-    def __init__(self, spec, parent=None):
+    def __init__(self, spec, parent=None, initial_color=None):
         super().__init__(parent)
         self.spec = spec
         self.viewer = parent
-        self.setWindowTitle(f"Spectroscopy: {Path(spec['path']).name}")
+        self.setWindowTitle(f"Spectrum - {Path(spec['path']).name}")
         self.resize(860, 640)
         self._toggle_buttons = []
         self._advanced_controls_visible = False
-        self._dark_background = False
+        # Follow the app theme by default; the popup's own Dark toggle can
+        # still override per-window.
+        self._dark_background = bool(getattr(parent, "dark_mode", False))
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(8, 8, 8, 8)
@@ -399,15 +810,37 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self.ax = self.fig.add_subplot(111)
         self.channel_combo = QtWidgets.QComboBox()
         self.axis_combo = QtWidgets.QComboBox()
+        self.unit_combo = QtWidgets.QComboBox()
+        self.unit_combo.setToolTip("Display unit for the X axis")
+        self.unit_combo.setEnabled(False)
+        self.unit_combo.currentTextChanged.connect(self._on_axis_unit_override_changed)
+        self.value_label = QtWidgets.QLabel("Value: —")
+        self.value_label.setObjectName("spectroValueLabel")
         self.fit_btn = QtWidgets.QPushButton("Fit parabola")
         self.copy_btn = QtWidgets.QPushButton("Copy channel")
-        self._active_line_color = self.SCIENCE_PALETTE[0]
+        # Honor the color the caller already committed to (e.g. the Grid Map
+        # Explorer's color-cycle swatch for the point that was clicked) so
+        # this popup's trace doesn't default to a mismatched palette entry.
+        self._active_line_color = str(initial_color) if initial_color else self.SCIENCE_PALETTE[0]
         self._swatch_buttons = []
         self._curve_entries = []
         self._selected_curve_index = 0
         self._drag_start_pos = None
         self._font_scale = 1.0
         self._grid_enabled = True
+        self._grid_minor_enabled = False
+        self._axis_unit_override = None
+        self._hover_points = []
+        # Scroll-to-zoom (cursor-centered) / drag-to-pan (once zoomed) /
+        # Reset View - mirrors the main preview canvas's own zoom mechanism
+        # (detail_preview_canvas.py's _on_scroll_zoom/_is_zoomed/_pan_active)
+        # for a consistent feel across the app.
+        self._home_xlim = None
+        self._home_ylim = None
+        self._pan_active = False
+        self._pan_start = None
+        self._pan_start_lim = None
+        self._pan_fast_mode_state = None
         self._legend_enabled = True
         self._show_markers = False
         self._show_line = True
@@ -426,6 +859,12 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self._inset_dragging = False
         self._inset_drag_offset = (0.0, 0.0)
         self._suppress_drag_until_release = False
+        self._inset_show_other_points = True
+        self._inset_marker_symbol = "circle"
+        self._inset_marker_size = 52.0
+        self._inset_marker_color_override = None
+        self._inset_resizing = None
+        self._inset_resize_start = None
         # Resolve the real viewer so thumbnail/header lookups work even when
         # this popup is spawned from a comparison dialog.
         self.viewer = None
@@ -463,6 +902,12 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             f"Position: {spec.get('x','?')}/{spec.get('y','?')} nm\n"
             f"Time: {spec.get('time')}"
         )
+        assignment_txt = _spectro_assignment_text(spec)
+        site_txt = _spectro_site_text(spec)
+        if site_txt:
+            meta_txt = f"{meta_txt}\n{site_txt}"
+        if assignment_txt:
+            meta_txt = f"{meta_txt}\n{assignment_txt}"
         self.meta_label = QtWidgets.QLabel(meta_txt)
         self.meta_label.setWordWrap(True)
         self.meta_label.setObjectName("spectroMetaLabel")
@@ -474,9 +919,22 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         selector_row.addWidget(self.channel_combo, 1)
         selector_row.addWidget(QtWidgets.QLabel("Axis:"))
         selector_row.addWidget(self.axis_combo, 1)
+        selector_row.addWidget(QtWidgets.QLabel("Unit:"))
+        selector_row.addWidget(self.unit_combo)
         selector_row.addWidget(self.fit_btn)
         selector_row.addWidget(self.copy_btn)
         info_layout.addLayout(selector_row)
+
+        value_row = QtWidgets.QHBoxLayout()
+        value_row.setContentsMargins(0, 0, 0, 0)
+        value_row.setSpacing(6)
+        value_row.addWidget(self.value_label, 1)
+        info_layout.addLayout(value_row)
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_value_hover)
+        self.canvas.mpl_connect("scroll_event", self._on_zoom_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_pan_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_pan_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_pan_release)
 
         controls_panel = QtWidgets.QWidget()
         controls_layout = QtWidgets.QVBoxLayout(controls_panel)
@@ -498,6 +956,10 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self.dark_bg_toggle = self._make_toggle_button("Dark", checked=self._dark_background, tooltip="Toggle dark spectroscopy plot background")
         self.dark_bg_toggle.toggled.connect(lambda checked: self._set_plot_option("dark", checked))
         primary_row.addWidget(self.dark_bg_toggle)
+        self.reset_view_btn = QtWidgets.QPushButton("Reset View")
+        self.reset_view_btn.setToolTip("Undo scroll-zoom/drag-pan and restore the original view (scroll to zoom, drag to pan while zoomed)")
+        self.reset_view_btn.clicked.connect(self._on_reset_zoom)
+        primary_row.addWidget(self.reset_view_btn)
         primary_row.addStretch(1)
         self.advanced_toggle_btn = self._make_toggle_button("Advanced ▼", checked=False, tooltip="Show/hide advanced spectroscopy controls")
         self.advanced_toggle_btn.toggled.connect(self._set_advanced_options_visible)
@@ -555,6 +1017,14 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self.filters_menu.aboutToShow.connect(self._populate_filter_menu)
         self.filters_btn.setMenu(self.filters_menu)
         tools_row.addWidget(self.filters_btn)
+        self.inset_settings_btn = QtWidgets.QToolButton(self)
+        self.inset_settings_btn.setText("Inset")
+        self.inset_settings_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.inset_settings_btn.setToolTip("Show/hide other points and change the position marker's style")
+        self.inset_settings_menu = QtWidgets.QMenu(self.inset_settings_btn)
+        self.inset_settings_menu.aboutToShow.connect(self._populate_inset_settings_menu)
+        self.inset_settings_btn.setMenu(self.inset_settings_menu)
+        tools_row.addWidget(self.inset_settings_btn)
         tools_row.addStretch(1)
         advanced_layout.addLayout(tools_row)
         controls_layout.addWidget(self._advanced_controls_widget)
@@ -585,6 +1055,12 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         button_row = QtWidgets.QHBoxLayout()
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(6)
+        self.show_on_image_btn = QtWidgets.QPushButton("Show on image")
+        self.show_on_image_btn.setToolTip("Focus the main preview on the image this spectrum was acquired on and pulse its marker")
+        self.show_on_image_btn.clicked.connect(self._on_show_on_image)
+        if not hasattr(self.viewer, "reveal_spectroscopy_source"):
+            self.show_on_image_btn.setVisible(False)
+        button_row.addWidget(self.show_on_image_btn)
         self.copy_all_btn = QtWidgets.QPushButton("Copy all")
         self.copy_all_btn.clicked.connect(self._copy_all_traces_to_clipboard)
         button_row.addWidget(self.copy_all_btn)
@@ -612,6 +1088,7 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         for ax in self.axes:
             self.axis_combo.addItem(self._axis_display_name(ax), ax.get("key"))
         self.axis_combo.currentIndexChanged.connect(self._on_axis_changed)
+        self._populate_axis_unit_combo()
         for name in self.channels.keys():
             self.channel_combo.addItem(name)
         if self.channel_combo.count():
@@ -657,45 +1134,25 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             self.advanced_toggle_btn.blockSignals(False)
 
     def _apply_toggle_button_styles(self):
-        dark = bool(self._dark_background)
-        if dark:
-            inactive_bg = "#1e2430"
-            inactive_border = "#46556e"
-            inactive_text = "#d4deee"
-            active_bg = "#2f6fcb"
-            active_border = "#79a9f2"
-            active_text = "#ffffff"
-            panel_text = "#dce5f3"
-            list_bg = "#10151f"
-            list_alt = "#171d29"
-            list_border = "#445167"
-        else:
-            inactive_bg = "#f3f5f9"
-            inactive_border = "#aeb7c5"
-            inactive_text = "#1f2a3d"
-            active_bg = "#1f6fd7"
-            active_border = "#5b97e8"
-            active_text = "#ffffff"
-            panel_text = "#314056"
-            list_bg = "#ffffff"
-            list_alt = "#f7f9fc"
-            list_border = "#c2cad6"
+        # Chrome palette follows the app theme (amber wins), falling back to
+        # the historical blue dark/light sets — see theme.toggle_pill_palette.
+        p = ui_theme.toggle_pill_palette(bool(self._dark_background))
         style = (
             "QToolButton#spectroToggleButton {"
-            f"background-color: {inactive_bg};"
-            f"color: {inactive_text};"
-            f"border: 1px solid {inactive_border};"
-            "border-radius: 12px;"
+            f"background-color: {p['inactive_bg']};"
+            f"color: {p['inactive_text']};"
+            f"border: 1px solid {p['inactive_border']};"
+            f"border-radius: {p['radius']};"
             "padding: 4px 12px;"
             "font-weight: 600;"
             "}"
             "QToolButton#spectroToggleButton:checked {"
-            f"background-color: {active_bg};"
-            f"color: {active_text};"
-            f"border: 1px solid {active_border};"
+            f"background-color: {p['active_bg']};"
+            f"color: {p['active_text']};"
+            f"border: 1px solid {p['active_border']};"
             "}"
             "QToolButton#spectroToggleButton:hover {"
-            f"border: 1px solid {active_border};"
+            f"border: 1px solid {p['active_border']};"
             "}"
         )
         for btn in self._toggle_buttons:
@@ -705,9 +1162,9 @@ class SpectroscopyPopup(QtWidgets.QDialog):
                 pass
         list_style = (
             "QListWidget {"
-            f"background: {list_bg};"
-            f"alternate-background-color: {list_alt};"
-            f"border: 1px solid {list_border};"
+            f"background: {p['list_bg']};"
+            f"alternate-background-color: {p['list_alt']};"
+            f"border: 1px solid {p['list_border']};"
             "border-radius: 6px;"
             "}"
         )
@@ -716,11 +1173,11 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         except Exception:
             pass
         try:
-            self.meta_label.setStyleSheet(f"color: {panel_text};")
+            self.meta_label.setStyleSheet(f"color: {p['panel_text']};")
         except Exception:
             pass
         try:
-            self.fit_result_label.setStyleSheet(f"color: {panel_text};")
+            self.fit_result_label.setStyleSheet(f"color: {p['panel_text']};")
         except Exception:
             pass
 
@@ -919,92 +1376,80 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self._legend_border = bool(enabled)
         self._plot_selected_channel()
 
+    def _populate_inset_settings_menu(self, menu=None):
+        menu = menu or getattr(self, "inset_settings_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        show_others_act = QtWidgets.QAction("Show other points", menu, checkable=True, checked=self._inset_show_other_points)
+        show_others_act.setToolTip("Show markers for the other traces plotted in this popup, not just the currently selected one")
+        show_others_act.toggled.connect(self._set_inset_show_other_points)
+        menu.addAction(show_others_act)
+        menu.addSeparator()
+        symbol_widget = QtWidgets.QWidget()
+        symbol_h = QtWidgets.QHBoxLayout(symbol_widget)
+        symbol_h.setContentsMargins(6, 2, 6, 2)
+        symbol_combo = QtWidgets.QComboBox()
+        for sym in _INSET_MARKER_SYMBOLS:
+            symbol_combo.addItem(sym.capitalize(), sym)
+        idx = symbol_combo.findData(self._inset_marker_symbol)
+        symbol_combo.setCurrentIndex(max(0, idx))
+        symbol_h.addWidget(QtWidgets.QLabel("Marker"))
+        symbol_h.addWidget(symbol_combo, 1)
+        symbol_act = QtWidgets.QWidgetAction(menu)
+        symbol_act.setDefaultWidget(symbol_widget)
+        menu.addAction(symbol_act)
+        symbol_combo.currentIndexChanged.connect(lambda i: self._set_inset_marker_symbol(symbol_combo.itemData(i)))
+        size_widget = QtWidgets.QWidget()
+        size_h = QtWidgets.QHBoxLayout(size_widget)
+        size_h.setContentsMargins(6, 2, 6, 2)
+        size_spin = QtWidgets.QSpinBox()
+        size_spin.setRange(15, 200)
+        size_spin.setValue(int(self._inset_marker_size))
+        size_h.addWidget(QtWidgets.QLabel("Size"))
+        size_h.addWidget(size_spin)
+        size_act = QtWidgets.QWidgetAction(menu)
+        size_act.setDefaultWidget(size_widget)
+        menu.addAction(size_act)
+        size_spin.valueChanged.connect(self._set_inset_marker_size)
+        color_act = QtWidgets.QAction("Marker color...", menu)
+        color_act.triggered.connect(self._pick_inset_marker_color)
+        menu.addAction(color_act)
+        reset_color_act = QtWidgets.QAction("Use trace color", menu, checkable=True, checked=self._inset_marker_color_override is None)
+        reset_color_act.setToolTip("Color each marker with its own trace color instead of a fixed override")
+        reset_color_act.triggered.connect(lambda: self._set_inset_marker_color(None))
+        menu.addAction(reset_color_act)
+
+    def _set_inset_show_other_points(self, enabled):
+        self._inset_show_other_points = bool(enabled)
+        self._update_position_inset()
+        self.canvas.draw_idle()
+
+    def _set_inset_marker_symbol(self, symbol):
+        if not symbol:
+            return
+        self._inset_marker_symbol = str(symbol)
+        self._update_position_inset()
+        self.canvas.draw_idle()
+
+    def _set_inset_marker_size(self, size):
+        self._inset_marker_size = float(size)
+        self._update_position_inset()
+        self.canvas.draw_idle()
+
+    def _set_inset_marker_color(self, color):
+        self._inset_marker_color_override = color
+        self._update_position_inset()
+        self.canvas.draw_idle()
+
+    def _pick_inset_marker_color(self):
+        initial = QtGui.QColor(self._inset_marker_color_override or "#ff3b6a")
+        col = QtWidgets.QColorDialog.getColor(initial, self, "Select Position Marker Color")
+        if col.isValid():
+            self._set_inset_marker_color(col.name())
+
     def _apply_data_filters(self, x_vals, y_vals, y_unit, x_unit):
-        data = np.asarray(y_vals, dtype=float)
-        x_arr = np.asarray(x_vals, dtype=float) if np.size(x_vals) == data.size else np.linspace(0, data.size - 1, data.size)
-        if data.size == 0:
-            return data, y_unit
-        result = data.copy()
-        dx = float(np.nanmean(np.diff(x_arr))) if x_arr.size > 1 else 1.0
-        if not math.isfinite(dx) or dx == 0:
-            dx = 1.0
-
-        def _odd(value, minimum):
-            v = max(minimum, int(value) or minimum)
-            return v + 1 if v % 2 == 0 else v
-
-        gauss = self._filter_cfg.get("gaussian", {})
-        if gauss.get("enabled"):
-            sigma = max(0.1, float(gauss.get("sigma", 1.0)))
-            if _scipy_ndimage is not None:
-                result = _scipy_ndimage.gaussian_filter1d(result, sigma=max(0.05, sigma), mode="nearest")
-            else:
-                radius = max(1, int(3 * sigma))
-                xs = np.arange(-radius, radius + 1)
-                kernel = np.exp(-(xs ** 2) / (2.0 * sigma ** 2))
-                kernel /= kernel.sum() or 1.0
-                result = np.convolve(result, kernel, mode="same")
-
-        median = self._filter_cfg.get("median", {})
-        if median.get("enabled"):
-            size = _odd(median.get("size", 3), 3)
-            if _scipy_ndimage is not None:
-                result = _scipy_ndimage.median_filter(result, size=size, mode="nearest")
-            else:
-                pad = size // 2
-                padded = np.pad(result, pad, mode="edge")
-                out = np.empty_like(result)
-                for i in range(result.size):
-                    out[i] = np.median(padded[i:i + size])
-                result = out
-
-        sav_cfg = self._filter_cfg.get("savgol", {})
-        if sav_cfg.get("enabled"):
-            window = _odd(sav_cfg.get("window", 11), 5)
-            window = min(window, result.size - 1 if result.size % 2 == 0 else result.size)
-            window = max(5, window if window % 2 == 1 else window - 1)
-            poly = max(2, min(int(sav_cfg.get("poly", 3)), window - 1))
-            if window >= 3 and window <= result.size:
-                if _scipy_signal is not None:
-                    result = _scipy_signal.savgol_filter(result, window, poly, mode="interp")
-                else:
-                    result = np.convolve(result, np.ones(window) / float(window), mode="same")
-
-        fft_cfg = self._filter_cfg.get("fft", {})
-        if fft_cfg.get("enabled") and result.size >= 8:
-            cutoff = min(max(float(fft_cfg.get("cutoff", 0.15)), 0.0), 0.5)
-            if cutoff > 0.0:
-                centered = result - np.nanmean(result)
-                freq = np.fft.rfftfreq(result.size, d=dx)
-                spectrum = np.fft.rfft(centered)
-                nyquist = 0.5 / dx
-                spectrum *= (np.abs(freq) <= cutoff * nyquist)
-                result = np.fft.irfft(spectrum, n=result.size) + np.nanmean(result)
-
-        notch = self._filter_cfg.get("notch", {})
-        if notch.get("enabled") and result.size >= 8:
-            freq = abs(float(notch.get("freq", 50.0)))
-            width = max(0.0001, abs(float(notch.get("width", 5.0))))
-            if freq > 0.0:
-                centered = result - np.nanmean(result)
-                spectrum = np.fft.rfft(centered)
-                freqs = np.fft.rfftfreq(result.size, d=dx)
-                spectrum *= ~(np.abs(freqs - freq) < width)
-                result = np.fft.irfft(spectrum, n=result.size) + np.nanmean(result)
-
-        deriv = self._filter_cfg.get("derive", {})
-        unit = y_unit
-        if deriv.get("enabled"):
-            window = _odd(deriv.get("window", 11), 5)
-            window = min(window, result.size - 1 if result.size % 2 == 0 else result.size)
-            window = max(5, window if window % 2 == 1 else window - 1)
-            poly = max(2, min(int(deriv.get("poly", 3)), window - 1))
-            if _scipy_signal is not None and window >= 5 and window <= result.size:
-                result = _scipy_signal.savgol_filter(result, window, poly, deriv=1, delta=dx, mode="interp")
-            else:
-                result = np.gradient(result, x_arr)
-            unit = f"d({unit or 'arb'})/d({x_unit or 'x'})"
-        return result, unit
+        return _apply_signal_filter_chain(x_vals, y_vals, y_unit, x_unit, self._filter_cfg)
 
     def _set_filter_enabled(self, section, enabled):
         self._filter_cfg.setdefault(section, {})["enabled"] = bool(enabled)
@@ -1323,8 +1768,12 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             )
         return axes
 
-    def _axis_values_for_spec(self, spec, axis_key):
-        """Return axis values/label/unit for a given spec and axis key."""
+    def _axis_values_for_spec(self, spec, axis_key, common_origin=None):
+        """Return axis values/label/unit for a given spec and axis key.
+        `common_origin` (see _zrel_group_common_origin) should be passed
+        whenever this spec is being shown alongside others, so a relative-Z
+        axis aligns to the group's deepest sweep-start instead of showing
+        each spectrum's own absolute Z."""
         if spec is None:
             return np.asarray([]), "Axis", ""
         axis_key = axis_key or "primary"
@@ -1333,6 +1782,7 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             key = choice.get("key") or choice.get("label")
             if key == axis_key:
                 vals = np.asarray(choice.get("values", []), dtype=float)
+                vals = _apply_zrel_origin(vals, choice, key, common_origin)
                 return vals, choice.get("label") or "Axis", choice.get("unit") or ""
         if axis_key == "topo":
             extra_topo = _topo_axis_from_spec(spec)
@@ -1380,15 +1830,58 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             except Exception:
                 pass
         self.axis_unit = unit or ""
+        self._populate_axis_unit_combo()
         self._update_primary_axis(axis_vals=self.V, axis_label=self.axis_label, axis_unit=self.axis_unit)
+        self._apply_axis_to_entries(key)
+        # A different axis means the X domain (and its numbers) changed
+        # entirely - forget any scroll-zoom/pan so _plot_selected_channel
+        # autoscales fresh instead of reapplying a now-meaningless window.
+        self._home_xlim = None
+        self._home_ylim = None
         self._plot_selected_channel()
         self._update_fit_button()
+
+    def _populate_axis_unit_combo(self):
+        """(Re)populate the Unit combo for the currently-selected axis's
+        unit family (length: pm/Å/nm/µm, voltage: µV/mV/V), preserving the
+        user's chosen override when it's still valid for the new axis, and
+        clearing it (back to the native unit) when switching to a
+        differently-typed axis (e.g. Z -> Bias) would otherwise leave a
+        stale, meaningless override in effect."""
+        choices = _axis_unit_choices_for(self.axis_unit)
+        self.unit_combo.blockSignals(True)
+        self.unit_combo.clear()
+        if choices:
+            self.unit_combo.addItems(choices)
+            self.unit_combo.setEnabled(True)
+            if self._axis_unit_override not in choices:
+                self._axis_unit_override = None
+            target = self._axis_unit_override or self.axis_unit
+            idx = self.unit_combo.findText(target)
+            self.unit_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        else:
+            self._axis_unit_override = None
+            self.unit_combo.setEnabled(False)
+        self.unit_combo.blockSignals(False)
+
+    def _on_axis_unit_override_changed(self, text):
+        text = (text or "").strip()
+        self._axis_unit_override = text or None
+        # The display-unit scale changed the X numbers too (e.g. nm -> Å is
+        # a 10x rescale) - a prior zoom window would no longer line up.
+        self._home_xlim = None
+        self._home_ylim = None
+        self._plot_selected_channel()
 
     def _on_channel_changed(self, name):
         self._last_fit_result = None
         self.fit_result_label.setText("")
         self.fit_result_label.setVisible(False)
         self._apply_channel_to_entries(name or "")
+        # A different channel means the Y domain changed entirely - see
+        # _on_axis_changed's identical reasoning for the X axis.
+        self._home_xlim = None
+        self._home_ylim = None
         self._plot_selected_channel()
         self._update_fit_button()
 
@@ -1429,6 +1922,42 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             )
         return changed
 
+    def _apply_axis_to_entries(self, axis_key):
+        """Force every curve entry to recompute its own X-axis data for the
+        given axis key, using each entry's OWN spec - mirroring
+        _apply_channel_to_entries for the Y-axis/channel side. Without this,
+        switching the Axis dropdown only updated _curve_entries[0] (via
+        _update_primary_axis), leaving every Ctrl+click-appended curve on
+        whatever axis was selected back when it was appended, visibly
+        misaligning the combined plot. When more than one curve is shown
+        together, a relative-Z axis is aligned to the group's deepest
+        sweep-start (see _zrel_group_common_origin/_apply_zrel_origin)
+        instead of each spectrum's own absolute Z; a lone curve keeps the
+        plain relative-from-zero view."""
+        entries = self._curve_entries or []
+        specs = []
+        for entry in entries:
+            spec = entry.get("spec")
+            if spec is None:
+                spec = self._resolve_spec_from_viewer(entry)
+                if spec:
+                    entry["spec"] = spec
+            specs.append(spec)
+        common_origin = _zrel_group_common_origin(specs)
+        changed = False
+        for entry, spec in zip(entries, specs):
+            if not spec:
+                continue
+            axis_vals, axis_label, axis_unit = self._axis_values_for_spec(spec, axis_key, common_origin=common_origin)
+            axis_vals = np.asarray(axis_vals, dtype=float)
+            if axis_vals.size == 0:
+                continue
+            entry["axis_vals"] = axis_vals
+            entry["axis_label"] = axis_label
+            entry["axis_unit"] = axis_unit
+            changed = True
+        return changed
+
     def _update_primary_axis(self, axis_vals, axis_label, axis_unit):
         if not self._curve_entries:
             return
@@ -1438,6 +1967,15 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         entry["axis_unit"] = axis_unit
 
     def _plot_selected_channel(self):
+        # Preserve the user's current scroll-zoom/pan across redraws that
+        # don't change the data domain (toggling grid/markers/color, adding
+        # a Ctrl+click-combined curve, ...) - _on_axis_changed/
+        # _on_channel_changed clear _home_xlim/_home_ylim first, which makes
+        # _is_zoomed() False here and so intentionally skips restoration,
+        # since switching axis/channel changes what the numbers even mean.
+        was_zoomed = self._is_zoomed()
+        zoom_xlim = self.ax.get_xlim() if was_zoomed else None
+        zoom_ylim = self.ax.get_ylim() if was_zoomed else None
         self.ax.clear()
         if not self._curve_entries:
             self._apply_plot_theme()
@@ -1447,16 +1985,20 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         axis_unit = (self.axis_unit or "").strip()
         axis_plot_scale = 1.0
         axis_plot_unit = axis_unit
-        if axis_unit.lower() == "v" and self.V.size:
+        if self._axis_unit_override:
+            axis_plot_scale = _axis_unit_scale_for(axis_unit, self._axis_unit_override)
+            axis_plot_unit = self._axis_unit_override
+        elif axis_unit.lower() == "v" and self.V.size:
             axis_plot_scale = 1000.0
             axis_plot_unit = "mV"
-        if axis_unit and axis_unit not in axis_label:
-            axis_label = f"{axis_label} ({axis_unit})"
+        if axis_plot_unit and axis_plot_unit not in axis_label:
+            axis_label = f"{axis_label} ({axis_plot_unit})"
         plotted = False
         active_marker = 'o' if self._show_markers else None
         if not self._show_line and active_marker is None:
             active_marker = 'o'
         filtered_units = []
+        self._hover_points = []
         for entry in self._curve_entries:
             self._normalize_curve_style(entry)
             axis_vals = np.asarray(entry.get("axis_vals", []), dtype=float)
@@ -1478,6 +2020,7 @@ class SpectroscopyPopup(QtWidgets.QDialog):
                 markersize=4 if active_marker else None,
                 label=entry.get("label", "Data"),
             )
+            self._hover_points.append((scaled_axis, values_plot, entry.get("label", "")))
             plotted = True
         self._axis_plot_scale = axis_plot_scale
         self._axis_plot_unit = axis_plot_unit
@@ -1490,9 +2033,15 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             ylabel = f"{name or 'Signal'} ({unit})"
         self.ax.set_ylabel(ylabel)
         if self._grid_enabled:
-            self.ax.grid(True, alpha=0.25)
+            self.ax.minorticks_on()
+            self.ax.grid(True, which="major", alpha=0.25)
+            if self._grid_minor_enabled:
+                self.ax.grid(True, which="minor", alpha=0.12, linewidth=0.5)
+            else:
+                self.ax.grid(False, which="minor")
         else:
-            self.ax.grid(False)
+            self.ax.minorticks_off()
+            self.ax.grid(False, which="both")
         if plotted and self._legend_enabled:
             legend = self.ax.legend(loc=self._legend_loc or 'best', fontsize=self._legend_font)
             if legend:
@@ -1502,7 +2051,252 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self._update_position_inset()
         self._apply_plot_theme()
         self._apply_font_scale()
+        self._home_xlim = self.ax.get_xlim()
+        self._home_ylim = self.ax.get_ylim()
+        if was_zoomed and zoom_xlim is not None and zoom_ylim is not None:
+            self.ax.set_xlim(zoom_xlim)
+            self.ax.set_ylim(zoom_ylim)
         self.canvas.draw_idle()
+
+    def _on_plot_value_hover(self, event):
+        """Value-reader: show the plotted (x, y) nearest the cursor,
+        snapping to the closest actual data point (in on-screen pixel
+        distance, matching the marker-hit-testing convention used
+        elsewhere in this app) within a small radius; otherwise fall back
+        to the raw cursor position so the label always reads *something*
+        useful while hovering the plot."""
+        if not hasattr(self, "value_label"):
+            return
+        if event is None or event.inaxes is not self.ax or not self._hover_points:
+            self.value_label.setText("Value: —")
+            return
+        try:
+            ex, ey = float(event.x), float(event.y)
+        except Exception:
+            self.value_label.setText("Value: —")
+            return
+        best_xy = None
+        best_d2 = None
+        best_label = ""
+        multi = len(self._curve_entries) > 1
+        for xs, ys, label in self._hover_points:
+            if xs.size == 0:
+                continue
+            try:
+                disp = self.ax.transData.transform(np.column_stack((xs, ys)))
+            except Exception:
+                continue
+            dx = disp[:, 0] - ex
+            dy = disp[:, 1] - ey
+            d2 = dx * dx + dy * dy
+            idx = int(np.argmin(d2))
+            if best_d2 is None or d2[idx] < best_d2:
+                best_d2 = d2[idx]
+                best_xy = (xs[idx], ys[idx])
+                best_label = label
+        x_unit = self._axis_plot_unit or self.axis_unit or ""
+        if best_xy is not None and best_d2 is not None and best_d2 <= 400.0:  # 20px radius
+            suffix = f"  [{best_label}]" if multi and best_label else ""
+            self.value_label.setText(f"Value: x={best_xy[0]:.4g} {x_unit}   y={best_xy[1]:.4g}{suffix}")
+        elif event.xdata is not None and event.ydata is not None:
+            self.value_label.setText(f"Value: x={event.xdata:.4g} {x_unit}   y={event.ydata:.4g}")
+        else:
+            self.value_label.setText("Value: —")
+
+    def _click_reserved_by_other_tool(self, event):
+        """True when a click/drag should be left to some other interactive
+        element (the position inset's own drag/resize, or a draggable
+        legend) instead of starting a zoom-scroll pan - mirrors the
+        preview canvas's convention of reserving overlay handles/bodies
+        before falling back to background pan."""
+        if self._position_inset_ax is not None and self._show_position_inset:
+            try:
+                bbox = self._position_inset_ax.bbox
+                if bbox is not None and (
+                    _near_resize_handle(bbox, event.x, event.y) or bbox.contains(event.x, event.y)
+                ):
+                    return True
+            except Exception:
+                pass
+        legend = self.ax.get_legend()
+        if legend is not None and legend.get_visible():
+            try:
+                if legend.contains(event)[0]:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _is_zoomed(self):
+        if self._home_xlim is None or self._home_ylim is None:
+            return False
+        try:
+            cur_xlim = self.ax.get_xlim()
+            cur_ylim = self.ax.get_ylim()
+            tol = 1e-9
+            return (
+                abs(cur_xlim[0] - self._home_xlim[0]) > tol
+                or abs(cur_xlim[1] - self._home_xlim[1]) > tol
+                or abs(cur_ylim[0] - self._home_ylim[0]) > tol
+                or abs(cur_ylim[1] - self._home_ylim[1]) > tol
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clamp_zoom_limits(new_lim, base_lim):
+        """Clamp new axis limits to stay within base limits (preserving
+        axis direction), so scroll-zoom-out and pan can't wander past the
+        original, fully-autoscaled view."""
+        try:
+            base_min, base_max = min(base_lim), max(base_lim)
+            new_min, new_max = min(new_lim), max(new_lim)
+            width = new_max - new_min
+            base_width = base_max - base_min
+            if width >= base_width:
+                return base_lim
+            start = max(base_min, min(new_min, base_max - width))
+            end = start + width
+            return (start, end) if base_lim[0] <= base_lim[1] else (end, start)
+        except Exception:
+            return new_lim
+
+    def _on_zoom_scroll(self, event):
+        """Mouse-wheel zoom centered on the cursor, mirroring the main
+        preview canvas's _on_scroll_zoom."""
+        if event is None or event.inaxes is not self.ax:
+            return
+        if self._pan_active or self._click_reserved_by_other_tool(event):
+            return
+        btn = getattr(event, "button", None)
+        if btn == "up":
+            delta = 1
+        elif btn == "down":
+            delta = -1
+        else:
+            step = getattr(event, "step", 0) or 0
+            if not step:
+                return
+            delta = 1 if step > 0 else -1
+        scale = 0.9 if delta > 0 else 1.1
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        if self._home_xlim is None:
+            self._home_xlim = xlim
+        if self._home_ylim is None:
+            self._home_ylim = ylim
+        x0 = event.xdata if event.xdata is not None else (xlim[0] + xlim[1]) * 0.5
+        y0 = event.ydata if event.ydata is not None else (ylim[0] + ylim[1]) * 0.5
+        new_xlim = (x0 - (x0 - xlim[0]) * scale, x0 + (xlim[1] - x0) * scale)
+        new_ylim = (y0 - (y0 - ylim[0]) * scale, y0 + (ylim[1] - y0) * scale)
+        new_xlim = self._clamp_zoom_limits(new_xlim, self._home_xlim)
+        new_ylim = self._clamp_zoom_limits(new_ylim, self._home_ylim)
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
+
+    def _enter_fast_pan_mode(self):
+        """Temporarily simplify the plot for the duration of an active drag
+        (minor grid off, markers hidden) so each *real* redraw during the
+        pan has less to rasterize, restored via _exit_fast_pan_mode on
+        release. Deliberately keeps every frame a genuine, live
+        set_xlim/set_ylim + redraw - i.e. what's on screen during the drag
+        always IS the real, current position - rather than sliding a frozen
+        snapshot and committing a possibly-different final redraw on
+        release, which felt smoother in isolation but left the final
+        "landing" position uncertain until it happened."""
+        if self._pan_fast_mode_state is not None:
+            return
+        marker_sizes = {}
+        for line in self.ax.get_lines():
+            marker = line.get_marker()
+            if marker not in (None, "None", ""):
+                marker_sizes[line] = line.get_markersize()
+                line.set_markersize(0)
+        had_minor_grid = bool(self._grid_minor_enabled)
+        if had_minor_grid:
+            self.ax.grid(False, which="minor")
+        self._pan_fast_mode_state = {"markers": marker_sizes, "minor_grid": had_minor_grid}
+
+    def _exit_fast_pan_mode(self):
+        state = self._pan_fast_mode_state
+        if state is None:
+            return
+        for line, size in state.get("markers", {}).items():
+            try:
+                line.set_markersize(size)
+            except Exception:
+                pass
+        if state.get("minor_grid"):
+            self.ax.grid(True, which="minor", alpha=0.12, linewidth=0.5)
+        self._pan_fast_mode_state = None
+
+    def _pan_limits_for(self, event):
+        x0, y0 = self._pan_start
+        xlim0, ylim0 = self._pan_start_lim
+        dx = event.xdata - x0
+        dy = event.ydata - y0
+        new_xlim = (xlim0[0] - dx, xlim0[1] - dx)
+        new_ylim = (ylim0[0] - dy, ylim0[1] - dy)
+        if self._home_xlim is not None:
+            new_xlim = self._clamp_zoom_limits(new_xlim, self._home_xlim)
+        if self._home_ylim is not None:
+            new_ylim = self._clamp_zoom_limits(new_ylim, self._home_ylim)
+        return new_xlim, new_ylim
+
+    def _on_pan_press(self, event):
+        if event is None or event.button != 1 or event.inaxes is not self.ax:
+            return
+        if self._click_reserved_by_other_tool(event):
+            return
+        if event.xdata is None or event.ydata is None or not self._is_zoomed():
+            return
+        self._pan_active = True
+        self._pan_start = (event.xdata, event.ydata)
+        self._pan_start_lim = (self.ax.get_xlim(), self.ax.get_ylim())
+        self._enter_fast_pan_mode()
+
+    def _on_pan_motion(self, event):
+        if not self._pan_active:
+            return
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        if self._pan_start is None or self._pan_start_lim is None:
+            return
+        new_xlim, new_ylim = self._pan_limits_for(event)
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
+
+    def _on_pan_release(self, event):
+        if event is not None and event.button != 1:
+            return
+        if self._pan_active and self._pan_start is not None and self._pan_start_lim is not None:
+            if event is not None and event.xdata is not None and event.ydata is not None:
+                new_xlim, new_ylim = self._pan_limits_for(event)
+                self.ax.set_xlim(new_xlim)
+                self.ax.set_ylim(new_ylim)
+            self._exit_fast_pan_mode()
+            self.canvas.draw_idle()
+        self._pan_active = False
+        self._pan_start = None
+        self._pan_start_lim = None
+
+    def _on_reset_zoom(self):
+        if self._home_xlim is not None:
+            self.ax.set_xlim(self._home_xlim)
+        if self._home_ylim is not None:
+            self.ax.set_ylim(self._home_ylim)
+        self.canvas.draw_idle()
+
+    def _on_show_on_image(self):
+        viewer = self.viewer
+        if viewer is None or not hasattr(viewer, "reveal_spectroscopy_source"):
+            return
+        try:
+            viewer.reveal_spectroscopy_source(self.spec)
+        except Exception:
+            pass
 
     def _on_canvas_context_menu(self, pos):
         menu = QtWidgets.QMenu(self)
@@ -1524,6 +2318,8 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         save_png_600_act = save_menu.addAction("PNG 600 dpi...")
         save_svg_act = save_menu.addAction("SVG (vector)...")
         save_pdf_act = save_menu.addAction("PDF (vector)...")
+        if hasattr(self.viewer, "reveal_spectroscopy_source"):
+            menu.addAction("Show on image", self._on_show_on_image)
         add_source_file_menu(menu, self.spec.get("path"), self)
         add_font_menu_action(
             menu,
@@ -1543,6 +2339,10 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         grid_act = style_menu.addAction("Show grid")
         grid_act.setCheckable(True)
         grid_act.setChecked(self._grid_enabled)
+        grid_minor_act = style_menu.addAction("Show minor grid (finer)")
+        grid_minor_act.setCheckable(True)
+        grid_minor_act.setChecked(self._grid_minor_enabled)
+        grid_minor_act.setEnabled(self._grid_enabled)
         legend_act = style_menu.addAction("Show legend")
         legend_act.setCheckable(True)
         legend_act.setChecked(self._legend_enabled)
@@ -1582,6 +2382,8 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         position_act = style_menu.addAction("Show position inset")
         position_act.setCheckable(True)
         position_act.setChecked(self._show_position_inset)
+        reset_view_act = style_menu.addAction("Reset View (undo zoom/pan)")
+        reset_view_act.setEnabled(self._is_zoomed())
         reset_act = style_menu.addAction("Reset style")
         action = menu.exec_(self.canvas.mapToGlobal(pos))
         if action in preset_actions:
@@ -1606,6 +2408,9 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             self._save_plot_export("pdf")
         elif action == grid_act:
             self._grid_enabled = grid_act.isChecked()
+            self._plot_selected_channel()
+        elif action == grid_minor_act:
+            self._grid_minor_enabled = grid_minor_act.isChecked()
             self._plot_selected_channel()
         elif action == legend_act:
             self._legend_enabled = legend_act.isChecked()
@@ -1637,6 +2442,8 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         elif action == position_act:
             self._show_position_inset = position_act.isChecked()
             self._plot_selected_channel()
+        elif action == reset_view_act:
+            self._on_reset_zoom()
         elif action == reset_act:
             self._reset_plot_style()
 
@@ -1646,14 +2453,70 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             self.curve_list.setCurrentRow(row)
         menu = QtWidgets.QMenu(self)
         self._populate_trace_style_menu(menu)
+        open_own_act = None
+        split_act = None
         if len(self._curve_entries) > 1:
             menu.addSeparator()
             remove_act = menu.addAction("Remove selected trace")
+            open_own_act = menu.addAction("Open selected trace in its own window")
+            split_act = menu.addAction("Split all traces into separate windows")
+            split_act.setToolTip(
+                "Opens one Spectrum window per trace, each keeping its current "
+                "color, then closes this combined window."
+            )
         else:
             remove_act = None
+        entry = self._current_entry()
+        entry_path = entry.get("spec_path") if entry else None
+        if entry_path:
+            menu.addSeparator()
+            add_source_file_menu(menu, entry_path, self)
         chosen = menu.exec_(self.curve_list.mapToGlobal(pos))
         if remove_act is not None and chosen == remove_act:
             self._remove_selected_curve()
+        elif open_own_act is not None and chosen == open_own_act:
+            entry = self._current_entry()
+            if entry:
+                self._open_curve_in_own_window(entry)
+        elif split_act is not None and chosen == split_act:
+            self._split_into_individual_windows()
+
+    def _open_curve_in_own_window(self, entry):
+        """Pop a single trace out into its own Spectrum window, keeping its
+        current color - the color-cycle link to whatever produced this
+        multi-trace window (e.g. the Grid Map) is one-way and only applies
+        at creation time, so this is just a normal independent popup from
+        here on."""
+        viewer = getattr(self, "viewer", None)
+        if viewer is None or not hasattr(viewer, "_open_spectroscopy_popup"):
+            return
+        spec = entry.get("spec") or self._resolve_spec_from_viewer(entry)
+        if not spec:
+            QtWidgets.QMessageBox.warning(
+                self, "Open trace", "Could not resolve the original spectrum for this trace."
+            )
+            return
+        viewer._open_spectroscopy_popup(spec, initial_color=entry.get("color"))
+
+    def _split_into_individual_windows(self):
+        """Explode every trace currently combined in this window into its
+        own Spectrum popup, each keeping its color, then close this one."""
+        viewer = getattr(self, "viewer", None)
+        if viewer is None or not hasattr(viewer, "_open_spectroscopy_popup"):
+            return
+        resolved = []
+        for entry in self._curve_entries:
+            spec = entry.get("spec") or self._resolve_spec_from_viewer(entry)
+            if not spec:
+                QtWidgets.QMessageBox.warning(
+                    self, "Split traces",
+                    f"Could not resolve the original spectrum for '{entry.get('label', '')}' - nothing was split.",
+                )
+                return
+            resolved.append((spec, entry.get("color")))
+        for spec, color in resolved:
+            viewer._open_spectroscopy_popup(spec, initial_color=color)
+        self.close()
 
     def _font_style_state(self):
         return {
@@ -1847,9 +2710,15 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             entry.setdefault("matrix_index", spec.get("matrix_index"))
             entry.setdefault("image_key", str(spec.get("image_key") or ""))
             entry.setdefault("nm_coords", (spec.get("x"), spec.get("y")))
-            coords = self._spec_thumbnail_coords(spec=spec, file_key=entry.get("image_key"))
-            if coords:
-                entry["coords"] = coords
+            # Deliberately do NOT precompute/cache "coords" here: the
+            # position-inset display size and crop (aborted-scan row
+            # trimming) aren't known yet at entry-creation time, so any
+            # coords computed now would use the wrong scale and get stuck in
+            # the entry (_collect_inset_markers only recomputes when
+            # entry["coords"] is still None). The inset draw path computes
+            # and caches the correct coords itself once it knows the actual
+            # displayed image size/crop.
+            entry["coords"] = None
         return entry
 
     def _resolve_spec_from_viewer(self, entry):
@@ -1994,12 +2863,20 @@ class SpectroscopyPopup(QtWidgets.QDialog):
 
     def _apply_plot_theme(self):
         dark = bool(self._dark_background)
-        fig_face = "#0f1720" if dark else "#ffffff"
-        ax_face = "#111827" if dark else "#ffffff"
-        text = "#e5edf8" if dark else "#1f2937"
-        grid = "#41526a" if dark else "#d7deea"
-        legend_face = "#0f1720" if dark else "#ffffff"
-        legend_edge = "#6f86a5" if dark else "#7d8ea8"
+        # Chrome only (backgrounds/ticks/legend frame); trace colors and any
+        # image colormaps are untouched. Under the amber app theme the dark
+        # plot background uses the warm amber chrome palette.
+        if dark:
+            mode = "amber" if ui_theme.is_amber(getattr(self, "viewer", None)) else "dark"
+        else:
+            mode = "light"
+        colors = ui_theme.mpl_chrome_colors(mode)
+        fig_face = colors["fig_face"]
+        ax_face = colors["ax_face"]
+        text = colors["text"]
+        grid = colors["grid"]
+        legend_face = colors["legend_face"]
+        legend_edge = colors["legend_edge"]
         self.fig.patch.set_facecolor(fig_face)
         self.ax.set_facecolor(ax_face)
         try:
@@ -2018,7 +2895,9 @@ class SpectroscopyPopup(QtWidgets.QDialog):
                 pass
         if self._grid_enabled:
             try:
-                self.ax.grid(True, color=grid, alpha=0.35 if dark else 0.45)
+                self.ax.grid(True, which="major", color=grid, alpha=0.35 if dark else 0.45)
+                if self._grid_minor_enabled:
+                    self.ax.grid(True, which="minor", color=grid, alpha=(0.35 if dark else 0.45) * 0.55)
             except Exception:
                 pass
         legend = self.ax.get_legend()
@@ -2082,6 +2961,7 @@ class SpectroscopyPopup(QtWidgets.QDialog):
 
     def _reset_plot_style(self):
         self._grid_enabled = True
+        self._grid_minor_enabled = False
         self._legend_enabled = True
         self._show_markers = False
         self._show_line = True
@@ -2121,33 +3001,12 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         viewer = getattr(self, "viewer", None)
         file_key = file_key or str(self.spec.get("image_key") or "")
         if not viewer or not file_key:
-            return None
-        thumb = None
-        label = getattr(viewer, "_thumb_labels", {}).get(file_key) if hasattr(viewer, "_thumb_labels") else None
-        if label is not None and label.pixmap():
-            thumb = label.pixmap()
-        if thumb is None:
-            try:
-                width = int(getattr(viewer, "thumb_size_px", 160))
-                height = max(48, int(round(width * 0.75)))
-                cmap = viewer.thumb_cmap_combo.currentText() if hasattr(viewer, "thumb_cmap_combo") else None
-                cmap = cmap or getattr(viewer, "thumb_cmap", "viridis")
-                channel_idx = viewer.channel_dropdown.currentIndex() if hasattr(viewer, "channel_dropdown") else 0
-                thumb = viewer._thumbnail_pixmap_for_file(file_key, channel_idx, width, height, cmap)
-            except Exception:
-                return None
-        if thumb is None:
-            return None
-        qimg = thumb.toImage().convertToFormat(QtGui.QImage.Format_RGBA8888)
-        ptr = qimg.bits()
-        ptr.setsize(qimg.byteCount())
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((qimg.height(), qimg.width(), 4))
-        arr = arr[..., :3] / 255.0
-        gray = np.clip(arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114, 0.0, 1.0)
-        tinted = np.stack([gray, gray, gray], axis=-1)
-        return tinted
+            return None, None
+        width = int(getattr(viewer, "thumb_size_px", 160))
+        height = max(48, int(round(width * 0.75)))
+        return _render_inset_background(viewer, file_key, width, height)
 
-    def _spec_thumbnail_coords(self, spec=None, file_key=None, dims=None):
+    def _spec_thumbnail_coords(self, spec=None, file_key=None, dims=None, crop_info=None):
         viewer = getattr(self, "viewer", None)
         spec = spec or self.spec
         file_key = file_key or str(spec.get("image_key") or "")
@@ -2162,11 +3021,7 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         else:
             width = int(getattr(viewer, "thumb_size_px", 160))
             height = max(48, int(round(width * 0.75)))
-        try:
-            coords = viewer._map_spec_to_pixels(spec, header, width, height, file_key=file_key)
-        except Exception:
-            coords = None
-        return coords
+        return _spec_display_coords(viewer, spec, header, file_key, width, height, crop_info=crop_info)
 
     def _update_position_inset(self):
         if self._position_inset_ax is not None:
@@ -2180,14 +3035,14 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             return
         base_entry = self._curve_entries[0] if self._curve_entries else None
         base_key = base_entry.get("image_key") if base_entry else str(self.spec.get("image_key") or "")
-        image = self._load_thumbnail_array(base_key)
+        image, crop_info = self._load_thumbnail_array(base_key)
         image_dims = None
         if image is not None:
             try:
                 image_dims = (int(image.shape[1]), int(image.shape[0]))
             except Exception:
                 image_dims = None
-        markers = self._collect_inset_markers(base_key, image_dims=image_dims)
+        markers = self._collect_inset_markers(base_key, image_dims=image_dims, crop_info=crop_info)
         if image is None or not markers:
             self._remove_inset_drag_handlers()
             return
@@ -2199,22 +3054,28 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self._position_inset_ax.set_xticks([])
         self._position_inset_ax.set_yticks([])
         self._position_inset_ax.set_title("Position", fontsize=7.5 * self._font_scale)
-        for color, coords in markers:
+        marker_shape = _INSET_MPL_MARKER_BY_SYMBOL.get(self._inset_marker_symbol, "o")
+        for color, coords, is_current in markers:
             try:
                 self._position_inset_ax.scatter(
                     coords[0],
                     coords[1],
-                    s=52,
+                    s=self._inset_marker_size,
+                    marker=marker_shape,
                     facecolors="none",
-                    edgecolors=color,
-                    linewidths=1.7,
+                    edgecolors=self._inset_marker_color_override or color,
+                    linewidths=2.0 if is_current else 1.3,
+                    alpha=1.0 if is_current else 0.55,
+                    zorder=5 if is_current else 3,
                 )
             except Exception:
                 continue
+        _draw_inset_resize_handle(self._position_inset_ax)
         self._install_inset_drag_handlers()
 
     def _install_inset_drag_handlers(self):
-        """Install matplotlib callbacks so the inset can be dragged."""
+        """Install matplotlib callbacks so the inset can be dragged and,
+        via the bottom-right corner handle, resized."""
         self._remove_inset_drag_handlers()
         if not self.canvas:
             return
@@ -2227,14 +3088,40 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             bbox = self._position_inset_ax.bbox
             if bbox is None:
                 return
+            if _near_resize_handle(bbox, event.x, event.y):
+                self._inset_resizing = True
+                self._inset_resize_start = (
+                    event.x - bbox.x1,
+                    event.y - bbox.y0,
+                    list(self._inset_bbox or [0.04, 0.04, 0.28, 0.28]),
+                )
+                return
             if bbox.contains(event.x, event.y):
                 self._inset_dragging = True
                 self._inset_drag_offset = (event.x - bbox.x0, event.y - bbox.y0)
 
         def on_motion(event):
-            if not self._inset_dragging or self._position_inset_ax is None:
+            if self._position_inset_ax is None:
                 return
             if event.x is None or event.y is None:
+                return
+            if self._inset_resizing:
+                new_bbox = _resize_inset_bbox(self.ax, self._inset_resize_start, event.x, event.y)
+                if new_bbox is None:
+                    return
+                self._inset_bbox = new_bbox
+                self._position_inset_ax.set_axes_locator(InsetPosition(self.ax, self._inset_bbox))
+                self.canvas.draw_idle()
+                return
+            if not self._inset_dragging:
+                bbox = self._position_inset_ax.bbox
+                if bbox is not None:
+                    if _near_resize_handle(bbox, event.x, event.y):
+                        self.canvas.setCursor(QtCore.Qt.SizeFDiagCursor)
+                    elif bbox.contains(event.x, event.y):
+                        self.canvas.setCursor(QtCore.Qt.SizeAllCursor)
+                    else:
+                        self.canvas.setCursor(QtCore.Qt.ArrowCursor)
                 return
             bbox = self._position_inset_ax.bbox
             if bbox is None:
@@ -2262,6 +3149,8 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             if event.button != MouseButton.LEFT:
                 return
             self._inset_dragging = False
+            self._inset_resizing = False
+            self._inset_resize_start = None
 
         self._inset_drag_cids = [
             self.canvas.mpl_connect("button_press_event", on_press),
@@ -2280,16 +3169,22 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self._inset_drag_cids = []
         self._inset_dragging = False
         self._inset_drag_offset = (0.0, 0.0)
+        self._inset_resizing = False
+        self._inset_resize_start = None
         self._suppress_drag_until_release = False
 
-    def _collect_inset_markers(self, image_key, image_dims=None):
+    def _collect_inset_markers(self, image_key, image_dims=None, crop_info=None):
+        """Return a list of (color, coords, is_current) tuples. `is_current`
+        marks the trace currently selected in the curve list, so callers can
+        optionally hide every other marker when `_inset_show_other_points`
+        is off."""
         markers = []
         if not self._curve_entries:
-            coords = self._spec_thumbnail_coords(dims=image_dims)
+            coords = self._spec_thumbnail_coords(dims=image_dims, crop_info=crop_info)
             if coords is not None:
-                markers.append(("#ff3b6a", coords))
+                markers.append(("#ff3b6a", coords, True))
             return markers
-        for entry in self._curve_entries:
+        for idx, entry in enumerate(self._curve_entries):
             if image_key and entry.get("image_key") and entry.get("image_key") != image_key:
                 continue
             color = entry.get("color", "#ff3b6a")
@@ -2301,15 +3196,17 @@ class SpectroscopyPopup(QtWidgets.QDialog):
                     if spec:
                         entry["spec"] = spec
                 if spec:
-                    coords = self._spec_thumbnail_coords(spec=spec, file_key=entry.get("image_key"), dims=image_dims)
+                    coords = self._spec_thumbnail_coords(spec=spec, file_key=entry.get("image_key"), dims=image_dims, crop_info=crop_info)
                     if coords:
                         entry["coords"] = coords
             if coords is not None:
-                markers.append((color, coords))
+                markers.append((color, coords, idx == self._selected_curve_index))
         if not markers:
-            coords = self._spec_thumbnail_coords(dims=image_dims)
+            coords = self._spec_thumbnail_coords(dims=image_dims, crop_info=crop_info)
             if coords is not None:
-                markers.append(("#ff3b6a", coords))
+                markers.append(("#ff3b6a", coords, True))
+        if not self._inset_show_other_points and any(m[2] for m in markers):
+            markers = [m for m in markers if m[2]]
         return markers
 
     def _qt_pos_hits_inset(self, pos):
@@ -2339,7 +3236,14 @@ class SpectroscopyPopup(QtWidgets.QDialog):
     def eventFilter(self, source, event):
         if source == self.canvas:
             if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
-                if self._qt_pos_hits_inset(event.pos()):
+                if self._qt_pos_hits_inset(event.pos()) or self._is_zoomed():
+                    # Once zoomed, click+drag is reserved for panning (see
+                    # _on_pan_press/_on_pan_motion) - without this, dragging
+                    # to pan and dragging to export the curve (this event
+                    # filter's own QDrag-on-drag-threshold feature below)
+                    # fired at the same time from the same gesture, and the
+                    # QDrag's blocking exec_() mid-pan is what made panning
+                    # feel snappy/clunky instead of smooth.
                     self._drag_start_pos = None
                     self._suppress_drag_until_release = True
                 else:
@@ -2386,15 +3290,27 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         event.acceptProposedAction()
 
     def _add_entry_from_drop(self, payload):
-        axis_vals = np.asarray(payload.get("axis_vals") or [], dtype=float)
-        values = np.asarray(payload.get("values") or [], dtype=float)
+        raw_axis_vals = payload.get("axis_vals")
+        raw_values = payload.get("values")
+        axis_vals = np.asarray(raw_axis_vals, dtype=float) if raw_axis_vals is not None else np.asarray([], dtype=float)
+        values = np.asarray(raw_values, dtype=float) if raw_values is not None else np.asarray([], dtype=float)
         color = payload.get("color") or self.SCIENCE_PALETTE[len(self._curve_entries) % len(self.SCIENCE_PALETTE)]
         label = payload.get("label") or Path(payload.get("spec_path", "")).name
         spec_path = payload.get("spec_path", "")
         channel = payload.get("channel")
-        # Avoid duplicating the curve when a drag/drop occurs onto the same popup.
+        matrix_index = payload.get("matrix_index")
+        # Avoid duplicating the curve when a drag/drop (or a repeat grid-map
+        # click) targets the same trace already in this popup. Matrix/grid
+        # specs all share one spec_path (the .3ds file) with per-pixel
+        # matrix_index, so spec_path+channel alone would treat every point
+        # in the same grid as "already present" after the first one.
         for entry in self._curve_entries:
-            if spec_path and spec_path == entry.get("spec_path") and (channel or "") == (entry.get("channel") or ""):
+            if (
+                spec_path
+                and spec_path == entry.get("spec_path")
+                and (channel or "") == (entry.get("channel") or "")
+                and matrix_index == entry.get("matrix_index")
+            ):
                 QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Curve already present", self)
                 return
         entry = {
@@ -2420,13 +3336,26 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         self._update_curve_list()
         self._plot_selected_channel()
 
-    def add_external_spectrum(self, spec, channel=None, axis_key=None):
+    def add_external_spectrum(self, spec, channel=None, axis_key=None, color=None):
         """Append another spectroscopy entry into this popup."""
         if spec is None:
             return False
+        # Unlike _open_spectroscopy_popup/_open_spectroscopy_compare_popup,
+        # a spec arriving here (e.g. from Ctrl+click multi-select) may still
+        # be an unhydrated, lazily-loaded placeholder with no "channels"/"V"
+        # payload yet - hydrate it in place first, or every append below
+        # silently no-ops on empty channel data.
+        if hasattr(self.viewer, "hydrate_spectro_entry"):
+            try:
+                hydrated = self.viewer.hydrate_spectro_entry(spec)
+                if hydrated:
+                    spec = hydrated
+            except Exception:
+                pass
         channels = spec.get("channels") or {}
         channel_name = channel or self.channel_combo.currentText()
-        data = np.asarray(channels.get(channel_name) or [], dtype=float)
+        raw_values = channels.get(channel_name)
+        data = np.asarray(raw_values, dtype=float) if raw_values is not None else np.asarray([], dtype=float)
         if data.size == 0:
             for name, values in channels.items():
                 arr = np.asarray(values, dtype=float)
@@ -2451,7 +3380,7 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             "label": f"{Path(spec.get('path', '')).name} ({channel_name})",
             "axis_vals": axis_vals,
             "values": data,
-            "color": self.SCIENCE_PALETTE[len(self._curve_entries) % len(self.SCIENCE_PALETTE)],
+            "color": str(color) if color else self.SCIENCE_PALETTE[len(self._curve_entries) % len(self.SCIENCE_PALETTE)],
             "spec_path": str(Path(spec.get("path", ""))),
             "channel": channel_name,
             "axis_label": axis_label,
@@ -2463,6 +3392,12 @@ class SpectroscopyPopup(QtWidgets.QDialog):
             "spec": spec,
         }
         self._add_entry_from_drop(payload)
+        # Adding this spec can change the group's Z_rel common origin (e.g.
+        # if its own sweep started deeper than every curve already shown) -
+        # recompute every entry's axis data against the now-updated group
+        # instead of leaving pre-existing curves aligned to a stale one.
+        if self._apply_axis_to_entries(axis_key):
+            self._plot_selected_channel()
         return True
 
     def _start_drag(self):
@@ -2607,7 +3542,14 @@ class SpectroscopyPopup(QtWidgets.QDialog):
         if not name or name not in self.channels:
             return
         try:
-            res = fit_parabola_bias(self.V, self.channels[name])
+            # Fit whatever is actually plotted, not the raw unfiltered
+            # channel - _plot_selected_channel already runs the enabled
+            # filter chain via _apply_data_filters before drawing, so a fit
+            # against self.channels[name] directly would silently disagree
+            # with the curve on screen whenever a filter is active.
+            axis_unit = self.axis_unit if getattr(self, "axis_unit", None) else ""
+            fit_data, _ = self._apply_data_filters(self.V, self.channels[name], "", axis_unit)
+            res = fit_parabola_bias(self.V, fit_data)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Fit failed", str(e))
             return
@@ -2664,8 +3606,9 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
                 pass
         self._resolve_anchor_path()
         base_name = self._matrix_file_name()
-        self.setWindowTitle(f"Matrix Explorer - {base_name}")
-        self.resize(1100, 720)
+        self.setWindowTitle(f"Grid map - {base_name}")
+        init_w, init_h = self._initial_window_size()
+        self.resize(init_w, init_h)
         root = QtWidgets.QVBoxLayout(self)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -2681,14 +3624,133 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self.image_value_label = QtWidgets.QLabel("Value: --")
         left_layout.addWidget(self.image_value_label)
 
+        # View-mode row: "Slice at value" and "Reference image" are the two
+        # views people actually reach for; the three aggregate statistics
+        # are occasionally useful but shouldn't visually compete with them.
+        # A row of toggle buttons (vs. a plain dropdown) makes picking a
+        # view a one-click, visually obvious action; the two primary modes
+        # get an accent color, the three secondary ones stay neutral.
+        mode_row = QtWidgets.QHBoxLayout()
+        # map_mode_combo stays a real (but hidden) QComboBox rather than a
+        # custom stand-in - _draw_image_layer, _reset_matrix_view, the
+        # legend dialog etc. all already read its currentText()/count(),
+        # and keeping it real means none of that has to change; the button
+        # row below just drives it instead of the user seeing it directly.
+        self.map_mode_combo = QtWidgets.QComboBox()
+        self.map_mode_combo.addItems(["Slice at value", "Reference image", "Max amplitude", "Peak position", "Integral"])
+        self.map_mode_combo.setVisible(False)
+        self._mode_buttons = {}
+        self._mode_group = QtWidgets.QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        primary_modes = {"Slice at value", "Reference image"}
+        mode_tooltips = {
+            "Max amplitude": "Peak-to-peak amplitude of each pixel's whole curve "
+                "(max value minus min value) - useful for spotting which pixels "
+                "have the most signal variation, but doesn't say where in the "
+                "sweep that happened.",
+            "Peak position": "The sweep-axis value (e.g. Bias) where each pixel's "
+                "curve reaches its maximum - useful for mapping where a resonance "
+                "or peak shifts across the grid.",
+            "Integral": "Area under each pixel's curve (sum over the sweep axis) - "
+                "useful as a rough total-signal map when the peak shape itself "
+                "isn't what matters.",
+            "Slice at value": "Shows the channel's value at one chosen point along "
+                "the sweep axis (e.g. Frequency Shift at Bias = -0.5 V) for every "
+                "pixel - a CITS-style slice through the grid. Usually the most "
+                "direct way to see spatial structure in the data.",
+            "Reference image": "Shows the topography/reference scan this grid was "
+                "acquired on, with spectroscopy positions overlaid - no per-pixel "
+                "grid data, just the underlying image for context.",
+        }
+        for i in range(self.map_mode_combo.count()):
+            mode_name = self.map_mode_combo.itemText(i)
+            btn = QtWidgets.QPushButton(mode_name)
+            btn.setCheckable(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            tooltip = mode_tooltips.get(mode_name)
+            if tooltip:
+                btn.setToolTip(tooltip)
+            if mode_name in primary_modes:
+                btn.setStyleSheet(
+                    "QPushButton { font-weight: 600; padding: 6px 10px; border-radius: 5px; }"
+                    "QPushButton:checked { background: #3f8fd1; color: white; }"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { padding: 4px 8px; color: palette(mid); }"
+                    "QPushButton:checked { background: palette(midlight); color: palette(text); font-weight: 600; }"
+                )
+            btn.clicked.connect(lambda _checked, name=mode_name: self._set_map_mode(name))
+            self._mode_group.addButton(btn)
+            self._mode_buttons[mode_name] = btn
+            mode_row.addWidget(btn)
+        # "Slice at value" is the default: it's the one view that shows real
+        # per-pixel spectroscopy data at a glance (a CITS-style slice), unlike
+        # the three aggregate statistics (which need context to interpret) or
+        # "Reference image" (which shows no grid data at all).
+        _default_mode = "Slice at value"
+        self._mode_buttons[_default_mode].setChecked(True)
+        self.map_mode_combo.setCurrentIndex(self.map_mode_combo.findText(_default_mode))
+        left_layout.addLayout(mode_row)
+
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(QtWidgets.QLabel("Channel map:"))
         self.channel_combo = QtWidgets.QComboBox()
         controls.addWidget(self.channel_combo, 1)
-        self.map_mode_combo = QtWidgets.QComboBox()
-        self.map_mode_combo.addItems(["Max amplitude", "Peak position", "Integral"])
-        controls.addWidget(self.map_mode_combo)
+        controls.addWidget(QtWidgets.QLabel("Colormap:"))
+        self.cmap_combo = QtWidgets.QComboBox()
+        # Same full colormap set + gradient-swatch icons as the Thumb/Preview
+        # cmap pickers in main_window.py, instead of a hand-picked shortlist
+        # with no visual cue of what each name actually looks like.
+        _cmap_names = cmap_registry.all_cmap_names()
+        for _cmap_name in _cmap_names:
+            try:
+                _icon = _colormap_icon(_cmap_name, width=96, height=14)
+            except Exception:
+                _icon = QIcon()
+            self.cmap_combo.addItem(_icon, _cmap_name)
+        controls.addWidget(self.cmap_combo)
+        self.cmap_star_btn = QtWidgets.QToolButton()
+        self.cmap_star_btn.setText("★")
+        self.cmap_star_btn.setAutoRaise(True)
+        self.cmap_star_btn.setFixedWidth(22)
+        self.cmap_star_btn.setToolTip(
+            "Save the current colormap as your default for grid maps (metric or "
+            "reference-image view, whichever is active; used at startup and in "
+            "reports). Clear via Display → Reset colormap defaults.")
+        self.cmap_star_btn.clicked.connect(self._on_save_cmap_favorite)
+        controls.addWidget(self.cmap_star_btn)
         left_layout.addLayout(controls)
+        # Start from the user's saved favourites (star button), falling back
+        # to the historical defaults.
+        _fav = getattr(self.viewer, "get_favorite_cmap", None)
+        self._metric_cmap = (_fav('grid_metric', 'inferno') if callable(_fav) else 'inferno')
+        self._reference_cmap = (_fav('grid_reference', 'gray') if callable(_fav) else 'gray')
+        if self._metric_cmap not in _cmap_names:
+            self._metric_cmap = "inferno"
+        if self._reference_cmap not in _cmap_names:
+            self._reference_cmap = "gray"
+
+        # "Slice at value" mode: instead of an aggregate statistic over each
+        # pixel's whole curve, show the channel's value at one specific
+        # sweep-axis point (e.g. Frequency Shift at Bias = -0.5 V) - a CITS-
+        # style slice through the grid. Hidden unless that mode is active.
+        self.slice_controls = QtWidgets.QWidget()
+        slice_row = QtWidgets.QHBoxLayout(self.slice_controls)
+        slice_row.setContentsMargins(0, 0, 0, 0)
+        slice_row.addWidget(QtWidgets.QLabel("Slice:"))
+        self.slice_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slice_slider.setRange(0, 199)
+        self.slice_slider.setValue(0)
+        slice_row.addWidget(self.slice_slider, 1)
+        self.slice_value_label = QtWidgets.QLabel("--")
+        self.slice_value_label.setMinimumWidth(90)
+        slice_row.addWidget(self.slice_value_label)
+        left_layout.addWidget(self.slice_controls)
+        self.slice_controls.setVisible(False)
+        self._slice_axis_min = 0.0
+        self._slice_axis_max = 1.0
+        self._slice_axis_unit = ""
 
         ref_controls = QtWidgets.QHBoxLayout()
         ref_controls.addWidget(QtWidgets.QLabel("Reference image:"))
@@ -2702,17 +3764,89 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         for name in list_color_cycles():
             self.palette_combo.addItem(name)
         palette_controls.addWidget(self.palette_combo, 1)
+        self.palette_swatch = QtWidgets.QLabel()
+        self.palette_swatch.setFixedSize(96, 16)
+        self.palette_swatch.setToolTip("Preview of this color cycle's colors")
+        palette_controls.addWidget(self.palette_swatch)
+        self.palette_star_btn = QtWidgets.QToolButton()
+        self.palette_star_btn.setText("★")
+        self.palette_star_btn.setAutoRaise(True)
+        self.palette_star_btn.setFixedWidth(22)
+        self.palette_star_btn.setToolTip(
+            "Save this color cycle as your default for plots (used at startup "
+            "and in reports). Clear via Display → Reset colormap defaults.")
+        self.palette_star_btn.clicked.connect(
+            lambda: getattr(self.viewer, "set_favorite_color_cycle",
+                            lambda *_: None)(self.palette_combo.currentText()))
+        palette_controls.addWidget(self.palette_star_btn)
         left_layout.addLayout(palette_controls)
 
+        positions_row = QtWidgets.QHBoxLayout()
         self.show_positions_cb = QtWidgets.QCheckBox("Show all spectroscopy positions")
         self.show_positions_cb.setChecked(True)
         self.show_positions_cb.toggled.connect(self._draw_image_layer)
-        left_layout.addWidget(self.show_positions_cb)
+        positions_row.addWidget(self.show_positions_cb)
+        self.show_position_markers_cb = QtWidgets.QCheckBox("Show markers")
+        self.show_position_markers_cb.setChecked(True)
+        self.show_position_markers_cb.setToolTip(
+            "Hide every position marker/badge so the channel/slice map is "
+            "visible on its own - useful before copying or exporting it as "
+            "a plain image."
+        )
+        self.show_position_markers_cb.toggled.connect(self._on_show_position_markers_toggled)
+        positions_row.addWidget(self.show_position_markers_cb)
+        self.relative_axes_cb = QtWidgets.QCheckBox("Relative axes")
+        self.relative_axes_cb.setChecked(True)
+        self.relative_axes_cb.setToolTip(
+            "Draw the channel/slice map on the grid's own local, unrotated "
+            "pitch-based axes instead of true absolute nm position - a "
+            "flat, axis-aligned view that's easier to compare across grids "
+            "and always matches what 'Virtual copy'/'Export WSxM XYZ' "
+            "produce. On by default. Uncheck for the true absolute-position "
+            "view, which lines up exactly with the reference image and "
+            "shows the grid's real acquisition angle, but renders as a "
+            "tilted parallelogram for any rotated grid - that tilt is "
+            "correct geometry, not a rendering bug."
+        )
+        self.relative_axes_cb.toggled.connect(self._draw_image_layer)
+        positions_row.addWidget(self.relative_axes_cb)
+        positions_row.addStretch(1)
+        left_layout.addLayout(positions_row)
 
-        self.fit_matrix_btn = QtWidgets.QPushButton("Fit matrix parabolas...")
-        left_layout.addWidget(self.fit_matrix_btn)
+        # A compact, single row of small flat buttons - these are useful
+        # secondary actions, not the dialog's main controls, and previously
+        # took up three full-width rows that gave them outsized visual
+        # weight relative to how often they're actually used.
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setSpacing(6)
+        button_style = "QPushButton { padding: 3px 8px; }"
+        self.fit_matrix_btn = QtWidgets.QPushButton("Fit parabolas...")
+        self.fit_matrix_btn.setStyleSheet(button_style)
+        self.fit_matrix_btn.setToolTip("Fit KPFM df(V) parabolas for every point in the matrix")
+        action_row.addWidget(self.fit_matrix_btn)
         self.reset_view_btn = QtWidgets.QPushButton("Reset view")
-        left_layout.addWidget(self.reset_view_btn)
+        self.reset_view_btn.setStyleSheet(button_style)
+        action_row.addWidget(self.reset_view_btn)
+        self.show_on_image_btn = QtWidgets.QPushButton("Show on image")
+        self.show_on_image_btn.setStyleSheet(button_style)
+        self.show_on_image_btn.setToolTip("Focus the main preview on the image this grid map was acquired on")
+        self.show_on_image_btn.clicked.connect(self._on_show_on_image)
+        if not hasattr(self.viewer, "reveal_spectroscopy_source"):
+            self.show_on_image_btn.setVisible(False)
+        action_row.addWidget(self.show_on_image_btn)
+        self.virtual_copy_btn = QtWidgets.QPushButton("Virtual copy")
+        self.virtual_copy_btn.setStyleSheet(button_style)
+        self.virtual_copy_btn.setToolTip(
+            "Turn the current channel/slice map into its own virtual-copy "
+            "thumbnail - a real image the rest of the app can treat like "
+            "any other: crop, measure, add molecule overlays, etc."
+        )
+        self.virtual_copy_btn.clicked.connect(self._create_virtual_copy_of_map)
+        if not hasattr(self.viewer, "_create_virtual_view_copy"):
+            self.virtual_copy_btn.setVisible(False)
+        action_row.addWidget(self.virtual_copy_btn)
+        action_row.addStretch(1)
+        left_layout.addLayout(action_row)
         self.matrix_info_label = QtWidgets.QLabel("")
         self.matrix_info_label.setWordWrap(True)
         left_layout.addWidget(self.matrix_info_label)
@@ -2766,6 +3900,7 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self._fit_dialogs = []
         self._current_image_arr = None
         self._current_image_extent = None
+        self._current_image_coords = None
         self._current_image_unit = ''
         self._selection = []
         self._selection_keys = set()
@@ -2780,6 +3915,17 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         }
         self._aggregate_mode = False
         self._focused_key = None
+        # Hover-preview: scrub the curve plot to whatever pixel is under the
+        # cursor without clicking, so exploring the grid doesn't spam popups
+        # or clutter the real selection. Debounced via a timer so fast mouse
+        # movement doesn't force a full curve redraw on every motion event.
+        self._hover_spec_key = None
+        self._hover_marker_artist = None
+        self._pending_hover_spec = None
+        self._hover_timer = QtCore.QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(35)
+        self._hover_timer.timeout.connect(self._apply_pending_hover_preview)
         # Guard against palette_name not being provided by callers
         palette_choice = palette_name or getattr(self.viewer, "spectro_color_cycle", DEFAULT_COLOR_CYCLE)
         self.palette_name = palette_choice
@@ -2791,8 +3937,11 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self._populate_channels()
         self._populate_image_channels()
         self.channel_combo.currentIndexChanged.connect(self._on_channel_combo_changed)
-        self.map_mode_combo.currentIndexChanged.connect(self._draw_image_layer)
+        self.map_mode_combo.currentIndexChanged.connect(self._on_map_mode_changed)
         self.image_channel_combo.currentIndexChanged.connect(self._draw_image_layer)
+        self.cmap_combo.setCurrentText(self._metric_cmap)
+        self.cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
+        self.slice_slider.valueChanged.connect(self._on_slice_slider_changed)
         self.fit_matrix_btn.clicked.connect(self._on_fit_matrix)
         self.reset_view_btn.clicked.connect(self._reset_matrix_view)
         self.export_csv_btn.clicked.connect(self._on_export_selection)
@@ -2808,7 +3957,14 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self.palette_combo.blockSignals(False)
         self.selection_table.itemSelectionChanged.connect(self._update_curve_from_selection)
         self.palette_combo.currentTextChanged.connect(self._on_palette_changed)
-        self._draw_image_layer()
+        self._update_palette_swatch()
+        self._update_slice_axis_range()
+        # Route the initial draw through _on_map_mode_changed (rather than
+        # calling _draw_image_layer directly) so whatever mode ended up
+        # checked above - default "Slice at value" - also gets its
+        # mode-specific setup applied (slice_controls visibility, cmap sync),
+        # not just the metric computation.
+        self._on_map_mode_changed()
         self._update_matrix_info_label()
 
     def resizeEvent(self, event):
@@ -2853,21 +4009,58 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
             pass
 
     def _group_specs_by_channel(self):
-        mapping = defaultdict(list)
-        self._channel_labels_map = {}
+        raw_mapping = defaultdict(list)
         for spec in self.specs:
             path = spec.get('path')
             if not path:
                 continue
             key = self._normalize_path(path)
-            mapping[key].append(spec)
-            if key not in self._channel_labels_map:
-                label = spec.get('channel_name') or spec.get('channel_code')
+            raw_mapping[key].append(spec)
+
+        # A Nanonis .3ds grid is one file holding every channel for every
+        # pixel (spec['channels'] = {name: array, ...}), unlike the older
+        # Omicron/Anfatec layout this dialog was originally built for (one
+        # file - and one spec object - per channel per pixel, so grouping
+        # by path already separates channels). Expand that case into one
+        # pseudo-group per real channel name - otherwise there is nothing
+        # for the "Channel map" dropdown to select besides the file itself.
+        #
+        # Expansion is restricted to matrix-derived groups (matrix_index is
+        # not None) specifically. A co-located Z-stack/single .dat file is
+        # *also* often multi-channel bundled, but its channel names (Bias_V,
+        # Current_A, ...) routinely collide with the grid's own - the same
+        # instrument, same naming convention - so expanding it the same way
+        # would silently overwrite the grid's 700+-point channel groups with
+        # a single stray point sharing that name. Any non-matrix group (or
+        # a matrix group with only one channel) instead collapses to one
+        # plain, file-keyed entry, exactly like the pre-existing behavior
+        # for any non-bundled file.
+        mapping = {}
+        self._channel_labels_map = {}
+        self._bundled_channel_keys = set()
+        for path_key, group_specs in raw_mapping.items():
+            is_matrix_group = any(spec.get('matrix_index') is not None for spec in group_specs)
+            channel_names = []
+            if is_matrix_group:
+                for spec in group_specs:
+                    for name in (spec.get('channels') or {}).keys():
+                        if name not in channel_names:
+                            channel_names.append(name)
+                    if channel_names:
+                        break
+            if len(channel_names) > 1:
+                for name in channel_names:
+                    mapping[name] = group_specs
+                    self._channel_labels_map[name] = name
+                    self._bundled_channel_keys.add(name)
+            else:
+                label = group_specs[0].get('channel_name') or group_specs[0].get('channel_code')
                 if not label:
-                    chs = spec.get('channels') or {}
+                    chs = group_specs[0].get('channels') or {}
                     if len(chs) == 1:
                         label = next(iter(chs.keys()))
-                self._channel_labels_map[key] = label or Path(key).name
+                mapping[path_key] = group_specs
+                self._channel_labels_map[path_key] = label or Path(path_key).name
         return mapping
 
     def _reset_color_cycle(self):
@@ -3007,7 +4200,18 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
             self._channel_labels_map[path] = label
             added.add(path)
         if self.channel_combo.count():
-            self.channel_combo.setCurrentIndex(0)
+            self.channel_combo.setCurrentIndex(self._default_channel_index())
+
+    def _default_channel_index(self):
+        """Prefer a Current channel as the default map - the alphabetically-
+        first channel (often the sweep axis itself, e.g. "Bias_V") is
+        essentially never what a user wants a Max amplitude/Integral/Slice
+        map of. Falls back to the first entry when no Current channel
+        exists."""
+        for i in range(self.channel_combo.count()):
+            if "current" in self.channel_combo.itemText(i).lower():
+                return i
+        return 0
 
     def _populate_image_channels(self):
         anchor = self.anchor_path or self.image_entry.get('path')
@@ -3023,16 +4227,70 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
             for idx, fd in enumerate(fds):
                 label = fd.get('Caption', fd.get('FileName', f"Channel {idx}"))
                 self.image_channel_combo.addItem(label, idx)
+
+            def _looks_backward(i):
+                label = str(fds[i].get('Caption', fds[i].get('FileName', ''))).lower()
+                return "backward" in label or "bwd" in label
+
+            # Backward-direction channels are stored in raw acquisition
+            # column order (mirrored left-right relative to the real, physical
+            # orientation - confirmed empirically: a real Z forward/backward
+            # pair correlates at only 0.39 as-is vs 0.97 once backward is
+            # flipped) and nothing in this app ever corrects that anywhere.
+            # "Slice at value"/metric modes are built from each grid point's
+            # true absolute (x, y), so they're immune to this - but
+            # "Reference image" mode just displays the selected raw channel
+            # array as-is, so picking a Backward channel here makes it look
+            # mirrored relative to the (correctly oriented) metric map. Default
+            # to a Forward-looking channel to sidestep that mismatch, rather
+            # than inheriting whatever direction the main preview last showed.
             default_idx = 0
+            for i in range(len(fds)):
+                if not _looks_backward(i):
+                    default_idx = i
+                    break
             if self.viewer.last_preview and self.viewer.last_preview[0] == str(path):
                 try:
                     prev_idx = int(self.viewer.last_preview[1])
                 except Exception:
-                    prev_idx = 0
-                if 0 <= prev_idx < len(fds):
+                    prev_idx = -1
+                if 0 <= prev_idx < len(fds) and not _looks_backward(prev_idx):
                     default_idx = prev_idx
             self.image_channel_combo.setCurrentIndex(default_idx)
         self.image_channel_combo.blockSignals(False)
+
+    def _initial_window_size(self):
+        """Pick a starting window size whose width/height ratio follows the
+        grid's own row/col aspect ratio, instead of always opening the same
+        fixed rectangle - a wide grid (e.g. 32x8) previously opened into the
+        same shape as a tall one (8x32), wasting space on one axis."""
+        rows = max((spec.get('grid_rows') or 0) for spec in self.specs) if self.specs else 0
+        cols = max((spec.get('grid_cols') or 0) for spec in self.specs) if self.specs else 0
+        default_w, default_h = 1100, 720
+        if not rows or not cols:
+            return default_w, default_h
+
+        aspect = cols / rows  # grid width / height
+        right_panel_w = 380  # curve plot + selection table; roughly fixed regardless of grid shape
+        chrome_w = 60  # splitter handle + outer margins
+        controls_h = 300  # mode buttons/combos/checkboxes/action row/info label above the plot
+        chrome_h = 40  # outer margins
+
+        # Keep the plot panel's own area close to what the old fixed default
+        # implied, but let width vs. height follow the grid's real aspect
+        # ratio rather than always being locked to a generic rectangle.
+        plot_area = (default_w - right_panel_w - chrome_w) * (default_h - controls_h - chrome_h)
+        plot_h = (plot_area / aspect) ** 0.5
+        plot_w = plot_h * aspect
+
+        total_w = int(plot_w) + right_panel_w + chrome_w
+        total_h = int(plot_h) + controls_h + chrome_h
+
+        # Clamp so extreme grid shapes (e.g. 4x64) still produce a usable,
+        # on-screen window rather than one absurdly wide/tall or tiny.
+        total_w = max(760, min(1700, total_w))
+        total_h = max(560, min(1000, total_h))
+        return total_w, total_h
 
     def _matrix_file_name(self):
         if self.dataset and getattr(self.dataset, "channels", None):
@@ -3100,6 +4358,7 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self.palette_name = self.palette_combo.currentText() or DEFAULT_COLOR_CYCLE
         self._color_palette = get_color_cycle(self.palette_name)
         self._reset_color_cycle()
+        self._update_palette_swatch()
         if hasattr(self.viewer, "set_spectro_color_cycle"):
             self.viewer.set_spectro_color_cycle(self.palette_name)
         if self._selection:
@@ -3108,16 +4367,108 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         else:
             self._update_selection_markers()
 
+    def _update_palette_swatch(self):
+        """Paint a strip of swatches for the current color cycle next to
+        its dropdown - picking "Warm" or "Cool" by name alone means
+        guessing what it actually looks like until you've committed to it."""
+        colors = self._color_palette or get_color_cycle(self.palette_name)
+        w, h = self.palette_swatch.width(), self.palette_swatch.height()
+        pix = QtGui.QPixmap(max(w, 1), max(h, 1))
+        pix.fill(QtCore.Qt.transparent)
+        if colors:
+            painter = QtGui.QPainter(pix)
+            n = len(colors)
+            seg_w = w / float(n)
+            for i, color in enumerate(colors):
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(QtGui.QColor(color))
+                painter.drawRect(QtCore.QRectF(i * seg_w, 0, seg_w + 0.5, h))
+            painter.end()
+        self.palette_swatch.setPixmap(pix)
+
     def _apply_palette_to_selection(self):
         self._reset_color_cycle()
         for entry in self._selection:
             entry["color"] = self._next_color()
 
+    def _create_virtual_copy_of_map(self):
+        """Turn the current channel/slice map into a real virtual-copy
+        thumbnail via the same mechanism popups/preview use for their own
+        "virtual copy" action - once it exists as a thumbnail, it's a real
+        image as far as the rest of the app is concerned, so it picks up
+        the main preview's full feature set (context menu, crop, molecule
+        overlays, distance measurement, export, ...) for free instead of
+        this dialog needing its own parallel implementation of any of it."""
+        viewer = getattr(self, "viewer", None)
+        if viewer is None or not hasattr(viewer, "_create_virtual_view_copy"):
+            return
+        anchor = self.anchor_path or self.image_entry.get('path')
+        if not anchor:
+            QtWidgets.QMessageBox.information(self, "Virtual copy", "No map data to copy yet.")
+            return
+        agg_mode = self.map_mode_combo.currentText()
+        arr = self._current_image_arr
+        if agg_mode == "Reference image":
+            extent = self._current_image_extent
+        else:
+            # Always export from the grid's own local/relative axes,
+            # regardless of which view is currently on screen - a virtual
+            # copy becomes a normal, always axis-aligned image elsewhere in
+            # the app (_create_virtual_view_copy), which the true, rotated
+            # absolute-position view (pcolormesh) can never faithfully
+            # become without resampling onto a new raster; the local frame
+            # already is axis-aligned, so it's the only representation that
+            # round-trips correctly - confirmed the old row_axis/col_axis
+            # extent (grid_extent) produced a virtual copy that visibly
+            # disagreed in orientation with the grid map's own (correctly
+            # rotated) on-screen slice. Recomputed fresh here rather than
+            # reused from self._current_image_extent, so the copy's
+            # geometry doesn't depend on which mode/toggle was last drawn.
+            channel_specs = self._current_channel_specs()
+            rows, cols, zero_based = self._grid_dims(channel_specs)
+            _dx, _dy, extent, row_flip, col_flip = self._grid_local_extent(channel_specs, rows, cols, zero_based)
+            if arr is not None and (row_flip or col_flip):
+                # Match _draw_image_layer's relative-axes rendering (see
+                # _grid_local_orientation) - without this, a virtual copy
+                # of a grid whose acquisition angle flips north/south or
+                # east/west would still visibly disagree with the grid
+                # map's own on-screen local/relative view, even though
+                # both are now built from the same extent.
+                arr = np.flipud(arr) if row_flip else arr
+                arr = np.fliplr(arr) if col_flip else arr
+        if arr is None or extent is None:
+            QtWidgets.QMessageBox.information(self, "Virtual copy", "No map data to copy yet.")
+            return
+        channel_label = self._channel_label_for_path(self.channel_combo.currentData()) or "channel"
+        view = {
+            "path": str(anchor),
+            "arr": np.asarray(arr, dtype=float),
+            "channel_idx": 0,
+            "extent_raw": tuple(float(v) for v in extent),
+            "title": f"{channel_label} [{agg_mode}]",
+        }
+        key = viewer._create_virtual_view_copy(view, tag=f"[{agg_mode}]", op="grid_slice")
+        if not key:
+            QtWidgets.QMessageBox.warning(self, "Virtual copy", "Could not create a virtual copy of this map.")
+            return
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Virtual copy created", self)
+        try:
+            viewer.show_file_channel(key, 0)
+        except Exception:
+            pass
+
+    def _on_show_position_markers_toggled(self, checked):
+        # "Show all spectroscopy positions" only matters once markers are
+        # actually being drawn - keep it visibly disabled rather than just
+        # inert, so it doesn't look like a second, redundant "on" toggle.
+        self.show_positions_cb.setEnabled(bool(checked))
+        self._draw_image_layer()
+
     def _reset_matrix_view(self):
         self._clear_selection()
         if self.channel_combo.count():
             self.channel_combo.blockSignals(True)
-            self.channel_combo.setCurrentIndex(0)
+            self.channel_combo.setCurrentIndex(self._default_channel_index())
             self.channel_combo.blockSignals(False)
         if self.map_mode_combo.count():
             self.map_mode_combo.setCurrentIndex(0)
@@ -3134,12 +4485,162 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self._draw_image_layer()
 
     def _on_channel_combo_changed(self):
-        self._clear_selection()
+        self._update_slice_axis_range()
+        self._resync_selection_to_current_channel()
         self._draw_image_layer()
+
+    def _resync_selection_to_current_channel(self):
+        """Re-resolve every currently-selected point's plotted channel to
+        the Channel map dropdown's new selection, instead of leaving
+        already-selected spectra frozen on whatever channel was active
+        when they were clicked - previously this cleared the whole
+        selection outright, so switching channels looked like it "did
+        nothing" to the plot on the right (it just silently emptied it)."""
+        if not self._selection:
+            return
+        primary_label = self._channel_label_for_path(self.channel_combo.currentData())
+        for entry in self._selection:
+            spec = entry.get("spec")
+            if spec is None:
+                continue
+            multi = self._gather_multi_channel_specs(spec.get('matrix_index')) or [(primary_label, spec)]
+            if primary_label:
+                multi.sort(key=lambda item: 0 if item[0] == primary_label else 1)
+            entry["multi"] = multi
+            entry["label"] = primary_label
+            entry["unit"] = self._channel_unit_for_spec(spec, primary_label)
+        self._refresh_selection_table()
+
+    def _on_cmap_changed(self, name):
+        # Reference image and the channel/slice map keep independent
+        # colormap preferences (a grayscale reference image and an inferno
+        # heatmap are both reasonable defaults, and switching modes
+        # shouldn't clobber whichever one you picked for the other).
+        if self.map_mode_combo.currentText() == "Reference image":
+            self._reference_cmap = name
+        else:
+            self._metric_cmap = name
+        self._draw_image_layer()
+
+    def _on_save_cmap_favorite(self):
+        """Star button: persist the active view's colormap as the user's
+        default for that grid-map context (metric map vs reference image)."""
+        setter = getattr(self.viewer, "set_favorite_cmap", None)
+        if not callable(setter):
+            return
+        if self.map_mode_combo.currentText() == "Reference image":
+            setter('grid_reference', self._reference_cmap)
+        else:
+            setter('grid_metric', self._metric_cmap)
+
+    def _set_map_mode(self, mode_name):
+        """Driven by the view-mode button row - keeps the (hidden)
+        map_mode_combo as the single source of truth so every other method
+        that reads it keeps working unchanged."""
+        idx = self.map_mode_combo.findText(mode_name)
+        if idx >= 0:
+            self.map_mode_combo.setCurrentIndex(idx)
+        btn = self._mode_buttons.get(mode_name)
+        if btn is not None:
+            btn.setChecked(True)
+
+    def _on_map_mode_changed(self):
+        current = self.map_mode_combo.currentText()
+        btn = self._mode_buttons.get(current)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        is_slice = current == "Slice at value"
+        self.slice_controls.setVisible(is_slice)
+        if is_slice:
+            self._update_slice_axis_range()
+        is_reference = current == "Reference image"
+        self.cmap_combo.blockSignals(True)
+        self.cmap_combo.setCurrentText(self._reference_cmap if is_reference else self._metric_cmap)
+        self.cmap_combo.blockSignals(False)
+        self._draw_image_layer()
+
+    def _on_slice_slider_changed(self, _value=None):
+        self._update_slice_value_label()
+        if self.map_mode_combo.currentText() == "Slice at value":
+            self._draw_image_layer()
+
+    def _current_slice_value(self):
+        span = self._slice_axis_max - self._slice_axis_min
+        frac = self.slice_slider.value() / max(1, self.slice_slider.maximum())
+        return self._slice_axis_min + frac * span
+
+    def _update_slice_value_label(self):
+        value = self._current_slice_value()
+        unit = f" {self._slice_axis_unit}" if self._slice_axis_unit else ""
+        self.slice_value_label.setText(f"{value:.4g}{unit}")
+
+    def _update_slice_axis_range(self):
+        """Recompute the slider's value range from the current channel's
+        real sweep axis (e.g. Bias), so it scrubs across the actual
+        measured range instead of an arbitrary placeholder."""
+        channel_specs = self._current_channel_specs()
+        label = self._channel_label_for_path(self.channel_combo.currentData())
+        axis = None
+        axis_unit = ""
+        for spec in channel_specs[:5]:  # a handful of samples is enough; the axis is shared across the grid
+            xs, ys = self._extract_pixel_series(spec, label)
+            if xs is not None and xs.size >= 2:
+                axis = xs
+                axis_unit = spec.get("AxisUnit") or ""
+                break
+        if axis is None:
+            self._slice_axis_min, self._slice_axis_max = 0.0, 1.0
+        else:
+            lo, hi = float(np.nanmin(axis)), float(np.nanmax(axis))
+            if lo == hi:
+                hi = lo + 1.0
+            self._slice_axis_min, self._slice_axis_max = lo, hi
+        self._slice_axis_unit = axis_unit
+        self._update_slice_value_label()
+
+    def _on_show_on_image(self):
+        viewer = self.viewer
+        if viewer is None or not hasattr(viewer, "reveal_spectroscopy_source"):
+            return
+        try:
+            spec = self.specs[0] if self.specs else None
+            viewer.reveal_spectroscopy_source(spec, image_key=self.anchor_path)
+        except Exception:
+            pass
 
     def _on_canvas_context_menu(self, pos):
         menu = QtWidgets.QMenu(self)
 
+        # The channel/slice map is real experimental data - it's a per-
+        # pixel measurement, just laid out over the grid's positions
+        # instead of the image's - so it gets the same copy/export options
+        # as any other plot in this app (SpectroscopyPopup's canvas menu),
+        # not just the position-marker/typography controls this menu
+        # already had.
+        copy_data_act = menu.addAction("Copy channel map data")
+        copy_png_act = menu.addAction("Copy plot as PNG (300 dpi)")
+        copy_png_600_act = menu.addAction("Copy plot as PNG (600 dpi)")
+        copy_svg_act = menu.addAction("Copy plot as SVG")
+        save_menu = menu.addMenu("Save plot")
+        save_png_300_act = save_menu.addAction("PNG 300 dpi...")
+        save_png_600_act = save_menu.addAction("PNG 600 dpi...")
+        save_svg_act = save_menu.addAction("SVG (vector)...")
+        save_pdf_act = save_menu.addAction("PDF (vector)...")
+        save_wsxm_act = save_menu.addAction("WSxM XYZ...")
+        save_wsxm_act.setToolTip(
+            "Export this channel/slice map's real per-pixel values as a "
+            "WSxM ASCII XYZ file - any map here (Slice at value, Max "
+            "amplitude, ...) is real measured data, not just a preview."
+        )
+        virtual_copy_act = None
+        if hasattr(self.viewer, "_create_virtual_view_copy"):
+            virtual_copy_act = menu.addAction("Create virtual copy...")
+            virtual_copy_act.setToolTip(
+                "Turn this map into its own virtual-copy thumbnail - a real "
+                "image you can crop, measure, add molecule overlays to, "
+                "etc. in the main preview."
+            )
+        menu.addSeparator()
         add_font_menu_action(
             menu,
             self,
@@ -3176,13 +4677,108 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         edge_act.triggered.connect(functools.partial(self._choose_position_marker_color, "edgecolor"))
 
         menu.addSeparator()
+        show_image_act = None
+        if hasattr(self.viewer, "reveal_spectroscopy_source"):
+            show_image_act = menu.addAction("Show on image")
         clear_act = menu.addAction("Clear selections")
         reset_act = menu.addAction("Reset view")
+        grid_path = self.specs[0].get("path") if self.specs else None
+        if grid_path:
+            menu.addSeparator()
+            add_source_file_menu(menu, grid_path, self, title="Grid file")
         action = menu.exec_(self.canvas.mapToGlobal(pos))
-        if action == clear_act:
+        if action == copy_data_act:
+            self._copy_map_data_to_clipboard()
+        elif action == copy_png_act:
+            self._copy_map_plot_as_png(dpi=300)
+        elif action == copy_png_600_act:
+            self._copy_map_plot_as_png(dpi=600)
+        elif action == copy_svg_act:
+            self._copy_map_plot_as_svg()
+        elif action == save_png_300_act:
+            self._save_map_plot_export("png", dpi=300)
+        elif action == save_png_600_act:
+            self._save_map_plot_export("png", dpi=600)
+        elif action == save_svg_act:
+            self._save_map_plot_export("svg")
+        elif action == save_pdf_act:
+            self._save_map_plot_export("pdf")
+        elif action == save_wsxm_act:
+            self._export_map_wsxm_xyz()
+        elif show_image_act is not None and action == show_image_act:
+            self._on_show_on_image()
+        elif action == clear_act:
             self._clear_selection()
         elif action == reset_act:
             self._reset_matrix_view()
+        elif virtual_copy_act is not None and action == virtual_copy_act:
+            self._create_virtual_copy_of_map()
+
+    def _copy_map_data_to_clipboard(self):
+        arr = self._current_image_arr
+        if arr is None:
+            QtWidgets.QMessageBox.information(self, "Copy channel map", "No map data to copy.")
+            return
+        agg_mode = self.map_mode_combo.currentText()
+        channel_label = self._channel_label_for_path(self.channel_combo.currentData())
+        lines = [f"Mode\t{agg_mode}", f"Channel\t{channel_label or ''}", ""]
+        for row in np.asarray(arr, dtype=float):
+            lines.append("\t".join("" if not np.isfinite(v) else f"{float(v):.6g}" for v in row))
+        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Channel map copied", self)
+
+    def _copy_map_plot_as_png(self, *, dpi=300):
+        try:
+            copy_figure_to_clipboard(self, self.canvas.figure, "png", dpi=dpi)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Copy plot", f"Unable to copy PNG: {exc}")
+
+    def _copy_map_plot_as_svg(self):
+        try:
+            copy_figure_to_clipboard(self, self.canvas.figure, "svg")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Copy plot", f"Unable to copy SVG: {exc}")
+
+    def _save_map_plot_export(self, fmt, *, dpi=300):
+        save_figure_with_dialog(self, self.canvas.figure, default_stem="grid_map", fmt=fmt, dpi=dpi)
+
+    def _export_map_wsxm_xyz(self):
+        arr = self._current_image_arr
+        agg_mode = self.map_mode_combo.currentText()
+        if agg_mode == "Reference image":
+            extent = self._current_image_extent
+        else:
+            # See _create_virtual_copy_of_map: always export the grid's own
+            # local/relative axes, not whatever's currently on screen, so
+            # this file's coordinates are always a plain axis-aligned grid
+            # (matching WSxM's own expectations) rather than depending on
+            # the true-position view's rotation.
+            channel_specs = self._current_channel_specs()
+            rows, cols, zero_based = self._grid_dims(channel_specs)
+            _dx, _dy, extent, row_flip, col_flip = self._grid_local_extent(channel_specs, rows, cols, zero_based)
+            if arr is not None and (row_flip or col_flip):
+                # See _create_virtual_copy_of_map / _grid_local_orientation.
+                arr = np.flipud(arr) if row_flip else arr
+                arr = np.fliplr(arr) if col_flip else arr
+        if arr is None or extent is None:
+            QtWidgets.QMessageBox.information(self, "Export WSxM XYZ", "No map data to export.")
+            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder for WSxM XYZ export")
+        if not folder:
+            return
+        arr = np.asarray(arr, dtype=float)
+        ny, nx = arr.shape
+        x0, x1, y_bottom, y_top = [float(v) for v in extent]
+        # extent's 4th value is where row 0 sits (origin='upper' throughout
+        # this dialog - see _draw_image_layer), so the y axis must run
+        # top-to-bottom to stay aligned with arr's own row order.
+        x_vals = np.linspace(x0, x1, nx) if nx > 1 else np.array([x0])
+        y_vals = np.linspace(y_top, y_bottom, ny) if ny > 1 else np.array([y_top])
+        channel_label = self._channel_label_for_path(self.channel_combo.currentData()) or "channel"
+        unit = self._current_image_unit or "a.u."
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{channel_label}_{agg_mode}").strip("_") or "grid_map"
+        save_wsxm_xyz(folder, arr, x_vals, y_vals, safe_name, z_unit=unit)
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"Saved WSxM XYZ to {folder}", self)
 
     def _font_style_state(self):
         return {
@@ -3266,24 +4862,130 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
             return
         path = Path(anchor)
         header, fds = self.viewer.headers.get(str(path), (None, None))
-        header_map = header or {}
         channel_specs = self._current_channel_specs()
         self.ax.clear()
         self._selection_artists = []
+        # ax.clear() just wiped any hover-preview ring along with everything
+        # else; drop the tracked key too so hovering back onto the same
+        # pixel after a channel/mode switch re-draws it instead of being
+        # skipped as "already showing this one."
+        self._hover_marker_artist = None
+        self._hover_spec_key = None
         agg_mode = self.map_mode_combo.currentText()
+        channel_label = self._channel_label_for_path(self.channel_combo.currentData())
+
+        # The channel/slice map is built at the grid's OWN native resolution
+        # (e.g. 30x30) using its real measured extent - not painted onto the
+        # reference image's (usually much higher-resolution) pixel grid,
+        # which used to leave nearly the entire array empty/invisible (a
+        # 900-point grid onto a 96x96-pixel reference image only fills
+        # ~10% of the cells) and silently masked as "no data" by the
+        # fallback below. See _grid_axes for the extent convention.
+        rows, cols, zero_based = self._grid_dims(channel_specs)
+        row_axis, col_axis = self._grid_axes(channel_specs, rows, cols, zero_based)
+        grid_extent = None
+        if row_axis is not None and col_axis is not None and rows > 1 and cols > 1:
+            # matplotlib's extent is always (left, right, bottom, top); with
+            # origin='upper', row 0 of the array is placed at the "top"
+            # value - so row 0's own real y (row_axis[0]) must be the 4th
+            # element here, not the 3rd, or row 0 renders at the wrong edge.
+            grid_extent = (float(col_axis[0]), float(col_axis[-1]), float(row_axis[-1]), float(row_axis[0]))
+
         metric = None
-        file_key = str(path)
-        if agg_mode == "Max amplitude":
-            metric = self._build_stat_metric(np.nanmax, channel_specs, header_map, file_key)
-        elif agg_mode == "Integral":
-            metric = self._build_integral_metric(channel_specs, header_map, file_key)
-        elif agg_mode == "Peak position":
-            metric = self._build_peak_metric(channel_specs, header_map, file_key)
+        if grid_extent is not None:
+            if agg_mode == "Max amplitude":
+                metric = self._build_stat_metric(np.nanmax, channel_specs, channel_label, rows, cols, zero_based)
+            elif agg_mode == "Integral":
+                metric = self._build_integral_metric(channel_specs, channel_label, rows, cols, zero_based)
+            elif agg_mode == "Peak position":
+                metric = self._build_peak_metric(channel_specs, channel_label, rows, cols, zero_based)
+            elif agg_mode == "Slice at value":
+                metric = self._build_slice_metric(channel_specs, channel_label, rows, cols, zero_based, self._current_slice_value())
         metric_valid = metric is not None and np.isfinite(metric).any()
-        if metric_valid:
-            self.ax.imshow(metric, cmap='inferno', origin='upper')
+
+        view_extent = grid_extent
+        self._current_image_coords = None
+        # Local-mode display flips (see _grid_local_orientation): the value
+        # readout must undo them, since _current_image_arr stays unflipped.
+        self._current_local_flips = (False, False)
+        # Active local/relative display frame, or None when the current view
+        # is in absolute nm (or Reference image) coordinates. Consumed by
+        # _spec_display_xy so hover/click picking and ring placement agree
+        # with where the markers below actually got drawn.
+        self._current_local_frame = None
+        relative_mode = bool(
+            agg_mode != "Reference image"
+            and getattr(self, "relative_axes_cb", None) is not None
+            and self.relative_axes_cb.isChecked()
+        )
+        local_dx = local_dy = None
+        local_row_flip = local_col_flip = False
+        if agg_mode != "Reference image" and metric_valid:
+            if relative_mode:
+                # Local/relative frame: a plain axis-aligned grid using the
+                # grid's own real pixel pitch, ignoring its acquisition
+                # angle entirely - the familiar "fill the box" look, and
+                # (unlike the true-position view below) always exportable
+                # as a normal image, since it's already axis-aligned. See
+                # _grid_local_extent. row_flip/col_flip keep this view in
+                # visual agreement with the absolute view about which end
+                # is up/right - without them, any grid whose acquisition
+                # angle flips north/south or east/west would render here
+                # mirrored relative to every other (correctly, absolutely
+                # positioned) view of the same data.
+                local_dx, local_dy, local_extent, local_row_flip, local_col_flip = self._grid_local_extent(
+                    channel_specs, rows, cols, zero_based
+                )
+                if local_extent is not None:
+                    display_metric = metric
+                    if local_row_flip:
+                        display_metric = np.flipud(display_metric)
+                    if local_col_flip:
+                        display_metric = np.fliplr(display_metric)
+                    self.ax.imshow(display_metric, cmap=cmap_registry.effective_cmap_name(self._metric_cmap), origin='upper', extent=local_extent, aspect='equal')
+                    view_extent = local_extent
+                    self._current_image_extent = local_extent
+                    self._current_local_flips = (local_row_flip, local_col_flip)
+                    self._current_local_frame = (rows, cols, zero_based, local_dx, local_dy, local_row_flip, local_col_flip)
+                else:
+                    relative_mode = False
+            if not relative_mode:
+                X, Y = self._grid_xy_coords(channel_specs, rows, cols, zero_based)
+                has_coords = (
+                    X is not None and Y is not None
+                    and not np.isnan(X).any() and not np.isnan(Y).any()
+                )
+                if has_coords:
+                    # Render at each pixel's true measured position instead of
+                    # the grid's axis-aligned row/col-index extent (_grid_axes) -
+                    # a rotated grid's real footprint is a rotated parallelogram,
+                    # not the axis-aligned box imshow(extent=...) can draw, so
+                    # imshow there silently disagreed with the position markers
+                    # below (which already plot specs' real, correctly-rotated
+                    # x/y) on any grid with a non-zero acquisition angle. This
+                    # keeps both in the same absolute frame regardless of angle.
+                    self.ax.pcolormesh(X, Y, metric, cmap=cmap_registry.effective_cmap_name(self._metric_cmap), shading='nearest')
+                    self.ax.set_aspect('equal', adjustable='box')
+                    self._current_image_coords = (X, Y)
+                    # Standard upward ylim (min, max): physically north-up,
+                    # which matches "Reference image" mode's CONTENT (row 0 =
+                    # north drawn at the top). Do not "fix" an apparent
+                    # mirror here by inverting this — the one time that
+                    # looked necessary, the real culprit was a stale
+                    # pre-row-flip Nanonis conversion cache serving a
+                    # mirrored anchor thumbnail (see NANONIS_CACHE_VERSION
+                    # v5 note in providers/nanonis/adapter.py).
+                    view_extent = (
+                        float(np.nanmin(X)), float(np.nanmax(X)),
+                        float(np.nanmin(Y)), float(np.nanmax(Y)),
+                    )
+                else:
+                    self.ax.imshow(metric, cmap=cmap_registry.effective_cmap_name(self._metric_cmap), origin='upper', extent=grid_extent, aspect='equal')
+                    view_extent = grid_extent
+                self._current_image_extent = grid_extent
             self._current_image_arr = metric
-            self._current_image_unit = ''
+            sample_spec = channel_specs[0] if channel_specs else None
+            self._current_image_unit = self._channel_unit_for_spec(sample_spec, channel_label) if sample_spec else ''
         elif header and fds:
             try:
                 idx = self.image_channel_combo.currentData()
@@ -3291,46 +4993,87 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
                     idx = 0
                 fd = fds[idx]
                 arr = self.viewer._get_channel_array(str(path), idx, header, fd)
-                self.ax.imshow(arr, cmap='gray', origin='upper')
+                ref_extent = self.viewer._header_extent(header)
+                self.ax.imshow(arr, cmap=cmap_registry.effective_cmap_name(self._reference_cmap), origin='upper', extent=ref_extent, aspect='equal')
                 self._current_image_arr = np.asarray(arr, dtype=float)
+                self._current_image_extent = ref_extent
                 self._current_image_unit = fd.get('PhysUnit', '')
+                view_extent = ref_extent
             except Exception:
                 self.ax.text(0.5, 0.5, Path(path).name, ha='center', va='center', transform=self.ax.transAxes)
                 self._current_image_arr = None
+                self._current_image_extent = None
         else:
             self.ax.text(0.5, 0.5, Path(path).name, ha='center', va='center', transform=self.ax.transAxes)
             self._current_image_arr = None
-        xpix = int(header_map.get('xPixel', 128))
-        ypix = int(header_map.get('yPixel', 128))
+            self._current_image_extent = None
+
+        # Position markers - see _spec_display_xy: grid-native metric maps
+        # use a spec's raw (x, y) directly (correct, since the map's own
+        # axes are built from that same real coordinate system), but
+        # "Reference image" mode needs each spec rotated into the topo
+        # image's local display frame first, exactly like the main preview
+        # and the Position insets already do, or markers land wherever the
+        # scan's Angle happens to put them relative to true north instead of
+        # relative to the image on screen.
+        # "Show markers" is a separate, all-or-nothing toggle from "Show all
+        # spectroscopy positions" (which only decides *which* specs count
+        # once markers are on) - unchecking it lets the channel/slice map be
+        # viewed/copied on its own, with no marker points at all.
+        show_markers = getattr(self.show_position_markers_cb, "isChecked", lambda: True)()
         xs = []
         ys = []
-        if getattr(self.show_positions_cb, "isChecked", lambda: True)():
-            overlay_specs = self.specs
+        if relative_mode and local_dx is not None:
+            # A synthetic local position only means something for this
+            # grid's own points (row/col only exists inside this dataset) -
+            # "Show all spectroscopy positions" doesn't apply here, unlike
+            # the absolute/true-position view above.
+            if show_markers:
+                for s in channel_specs:
+                    rc = self._spec_grid_row_col(s, rows, cols, zero_based)
+                    if rc is None:
+                        continue
+                    disp_row = (rows - 1 - rc[0]) if local_row_flip else rc[0]
+                    disp_col = (cols - 1 - rc[1]) if local_col_flip else rc[1]
+                    xs.append((disp_col + 0.5) * local_dx)
+                    ys.append((disp_row + 0.5) * local_dy)
         else:
-            overlay_specs = channel_specs
-        if overlay_specs:
-            for spec in overlay_specs:
-                coords = self.viewer._map_spec_to_pixels(spec, header_map, xpix, ypix, file_key=file_key)
-                if coords:
-                    xs.append(coords[0])
-                    ys.append(coords[1])
-            if xs and ys:
-                cfg = self._position_marker_config
-                self.ax.scatter(
-                    xs,
-                    ys,
-                    s=cfg.get("size", 28),
-                    marker=cfg.get("marker", "o"),
-                    facecolors=cfg.get("facecolor", "#ffffff"),
-                    edgecolors=cfg.get("edgecolor", "#101010"),
-                    linewidths=cfg.get("linewidth", 0.4),
-                    alpha=cfg.get("alpha", 0.85),
-                    zorder=2,
-                )
+            if show_markers and getattr(self.show_positions_cb, "isChecked", lambda: True)():
+                overlay_specs = self.specs
+            elif show_markers:
+                overlay_specs = channel_specs
+            else:
+                overlay_specs = []
+            for s in (overlay_specs or []):
+                sx, sy = self._spec_display_xy(s)
+                if sx is None or sy is None:
+                    continue
+                xs.append(sx)
+                ys.append(sy)
+        if xs and ys:
+            cfg = self._position_marker_config
+            self.ax.scatter(
+                xs,
+                ys,
+                s=cfg.get("size", 28),
+                marker=cfg.get("marker", "o"),
+                facecolors=cfg.get("facecolor", "#ffffff"),
+                edgecolors=cfg.get("edgecolor", "#101010"),
+                linewidths=cfg.get("linewidth", 0.4),
+                alpha=cfg.get("alpha", 0.85),
+                zorder=2,
+            )
+        if view_extent is not None:
+            self.ax.set_xlim(view_extent[0], view_extent[1])
+            self.ax.set_ylim(view_extent[2], view_extent[3])
+        self.ax.set_xlabel("x (nm)")
+        self.ax.set_ylabel("y (nm)")
         style = _style_kwargs(self._font_style_state())
         for text in list(self.ax.get_xticklabels()) + list(self.ax.get_yticklabels()):
             apply_text_style(text, family=self._plot_font_family, **style)
-        self._update_selection_markers(redraw=False)
+        if show_markers:
+            self._update_selection_markers(redraw=False)
+        _style_plot_chrome(self, self.canvas.figure)
         self.canvas.draw_idle()
         if self._current_image_arr is None:
             self.image_value_label.setText("Value: --")
@@ -3339,7 +5082,7 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         path = self.channel_combo.currentData()
         if not path:
             return []
-        return self._channel_specs.get(self._normalize_path(path), [])
+        return self._channel_specs.get(self._channel_key(path), [])
 
     def _normalize_path(self, path):
         try:
@@ -3347,8 +5090,20 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         except Exception:
             return str(path)
 
+    def _channel_key(self, path_or_name):
+        # For a "bundled" entry (a Nanonis .3ds file's own channel, or any
+        # other multi-channel source), channel_combo's data is already the
+        # real channel name, not a filesystem path - normalizing it through
+        # Path() is unnecessary and, for the general case, incorrect. Which
+        # combo entries are bundled is tracked per-key (not one global
+        # mode) since a single dialog can now hold both a grid's per-
+        # channel entries and separate single-channel Z-stack/single files.
+        if path_or_name in getattr(self, "_bundled_channel_keys", ()):
+            return str(path_or_name)
+        return self._normalize_path(path_or_name)
+
     def _channel_label_for_path(self, path):
-        key = self._normalize_path(path)
+        key = self._channel_key(path)
         label = self._channel_labels_map.get(key)
         if label:
             return label
@@ -3362,75 +5117,438 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
                     label = next(iter(channels.keys()))
         return label or Path(key).name
 
-    def _build_stat_metric(self, fn, channel_specs, header, file_key):
-        if not channel_specs:
+    def _grid_dims(self, specs):
+        """(rows, cols, zero_based) for a set of grid-point specs. zero_based
+        mirrors MatrixFitWorker's own matrix_index convention detection
+        (matrix_fit.py) so the two stay consistent."""
+        if not specs:
+            return 0, 0, True
+        rows = max((s.get('grid_rows') or 0) for s in specs)
+        cols = max((s.get('grid_cols') or 0) for s in specs)
+        zero_based = True
+        if rows and cols:
+            matrix_indices = [s.get('matrix_index') for s in specs if s.get('matrix_index') is not None]
+            if matrix_indices:
+                min_idx, max_idx = min(matrix_indices), max(matrix_indices)
+                if min_idx >= 1 and max_idx == rows * cols:
+                    zero_based = False
+        return rows, cols, zero_based
+
+    def _spec_grid_row_col(self, spec, rows, cols, zero_based):
+        """This spec's (row, col) in the grid's own native rows x cols
+        layout - from explicit grid_row/grid_col fields when present, else
+        derived from matrix_index (matching MatrixFitWorker's derivation)."""
+        row = spec.get('grid_row')
+        col = spec.get('grid_col')
+        if row is not None and col is not None:
+            try:
+                return int(row), int(col)
+            except Exception:
+                pass
+        if not cols:
             return None
-        xpix = int(header.get('xPixel', 128) if header else 128)
-        ypix = int(header.get('yPixel', 128) if header else 128)
-        grid = np.full((ypix, xpix), np.nan, dtype=float)
+        idx = spec.get('matrix_index')
+        if idx is None:
+            return None
+        try:
+            idx_val = int(idx)
+        except Exception:
+            return None
+        if not zero_based:
+            idx_val -= 1
+        return idx_val // cols, idx_val % cols
+
+    def _grid_axes(self, specs, rows, cols, zero_based):
+        """1D arrays holding each row/column index's real measured (y, x)
+        nm position - row_axis[0]/col_axis[0] is whatever position grid
+        index 0 was actually measured at (not assumed to be the minimum),
+        so orientation is always correct regardless of scan direction.
+        Mirrors MatrixFitDialog's _axis_from_specs (matrix_fit.py) except
+        kept in absolute nm (not shifted to start at 0), so it lines up
+        with the reference image and the position markers.
+
+        This assumes the grid is axis-aligned in absolute (x, y) - i.e.
+        every point in a given row shares one y, every point in a given
+        column shares one x - which only holds when the grid's own
+        acquisition angle is 0. For a rotated grid (Nanonis .3ds grids can
+        carry an arbitrary angle - see providers/nanonis/adapter.py) real
+        x/y varies with *both* row and col together, so a single scalar
+        per row/column silently throws away the rotation. _draw_image_layer
+        therefore only falls back to this axis-aligned extent when the true
+        per-point coordinates from _grid_xy_coords aren't usable; prefer
+        that for anything that needs to actually match the point markers'
+        positions."""
+        if not rows or not cols:
+            return None, None
+        row_axis = [None] * rows
+        col_axis = [None] * cols
+        for spec in specs:
+            rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+            if rc is None:
+                continue
+            row, col = rc
+            y = spec.get('y')
+            x = spec.get('x')
+            if 0 <= row < rows and y is not None and row_axis[row] is None:
+                row_axis[row] = float(y)
+            if 0 <= col < cols and x is not None and col_axis[col] is None:
+                col_axis[col] = float(x)
+            if all(v is not None for v in row_axis) and all(v is not None for v in col_axis):
+                break
+        if any(v is None for v in row_axis) or any(v is None for v in col_axis):
+            return None, None
+        return np.asarray(row_axis, dtype=float), np.asarray(col_axis, dtype=float)
+
+    def _grid_xy_coords(self, specs, rows, cols, zero_based):
+        """2D (rows, cols) arrays of every grid pixel's true measured
+        absolute (x, y) nm position, placed the same way _build_stat_metric
+        et al. place values (via _spec_grid_row_col) so the result lines up
+        cell-for-cell with those metric grids.
+
+        Unlike _grid_axes, this keeps each point's real position instead of
+        collapsing a row/column to one shared scalar, so it stays correct
+        for a rotated grid - _draw_image_layer uses this to render the
+        slice/metric map with pcolormesh at each pixel's true position,
+        which is what makes it land exactly under the position markers
+        (which already plot specs' real x/y) regardless of acquisition
+        angle."""
+        if not specs or not rows or not cols:
+            return None, None
+        X = np.full((rows, cols), np.nan, dtype=float)
+        Y = np.full((rows, cols), np.nan, dtype=float)
+        for spec in specs:
+            rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+            if rc is None or not (0 <= rc[0] < rows and 0 <= rc[1] < cols):
+                continue
+            x = spec.get('x')
+            y = spec.get('y')
+            if x is None or y is None:
+                continue
+            X[rc[0], rc[1]] = float(x)
+            Y[rc[0], rc[1]] = float(y)
+        return X, Y
+
+    def _grid_local_pitch(self, X, Y, rows, cols):
+        """Typical real-world spacing (nm) per grid step along columns and
+        rows, from true per-point positions (_grid_xy_coords) - used to
+        build a synthetic, always axis-aligned "local" frame that doesn't
+        depend on the grid's acquisition angle (see "Relative axes" mode in
+        _draw_image_layer, and _grid_local_extent for virtual-copy/export).
+        Reduces to the physical pixel pitch for an unrotated grid too."""
+        dx = dy = 1.0
+        if cols > 1:
+            step = np.hypot(np.diff(X, axis=1), np.diff(Y, axis=1))
+            finite = step[np.isfinite(step)]
+            if finite.size:
+                dx = float(np.nanmedian(finite)) or 1.0
+        if rows > 1:
+            step = np.hypot(np.diff(X, axis=0), np.diff(Y, axis=0))
+            finite = step[np.isfinite(step)]
+            if finite.size:
+                dy = float(np.nanmedian(finite)) or 1.0
+        return dx, dy
+
+    def _anchor_scan_angle(self):
+        """Scan angle (degrees) of the grid's anchor image, 0.0 when there
+        is no resolvable anchor. Used to flatten the local/relative view
+        into the anchor image's raster frame (see _grid_local_orientation)."""
+        try:
+            header, _fds = self.viewer.headers.get(str(self.anchor_path), (None, None))
+            if header:
+                return float(self.viewer._header_scan_angle(header) or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _grid_local_orientation(self, X, Y, rows, cols, angle_deg=0.0):
+        """(row_flip, col_flip): whether the metric array needs flipping
+        along that axis so the local/relative view agrees with the
+        **anchor image's raster** (= the thumbnail, the main preview, and
+        "Reference image" mode - also the frame Nanonis's own grid viewer
+        uses) about which end is up/right.
+
+        The local/relative view deliberately discards the grid's rotation
+        (that's the whole point of it), but the flattening needs a target
+        frame to orient into, and there are two candidates that only agree
+        for small scan angles: absolute north-up (the pcolormesh view) and
+        the anchor image's raster. This used to orient into north-up, which
+        is self-consistent but reads as "mirrored/inverted" next to the
+        thumbnail for large angles - a real 157-degree scan put the two a
+        clean 180 degrees apart (the flattening silently swallowed the
+        remaining 23), and the user's natural comparison targets (the
+        thumbnail and Nanonis's grid viewer) are both raster-frame. So the
+        direction tests now run on the grid coordinates *rotated into the
+        anchor's scan frame* (same +theta convention as
+        _map_spec_to_pixels); with angle 0 this reduces exactly to the old
+        north-up behaviour, so unrotated data is unaffected.
+
+        Convention details: _draw_image_layer's local-mode extent is
+        (0, cols*dx, rows*dy, 0) - bottom > top - so with origin='upper' an
+        *unflipped* array renders row 0 at the top. In the raster frame,
+        "toward row 0 of the displayed image" is increasing v (frac_y =
+        0.5 - v in _map_spec_to_pixels), so flip rows when v *increases*
+        with grid row; u increases rightward in every view, so flip
+        columns when u decreases with grid col. (History: an earlier
+        version of this condition was once inverted to chase an apparent
+        mirror vs the anchor thumbnail; the thumbnail itself turned out to
+        be mirrored by a stale pre-row-flip conversion cache - see
+        NANONIS_CACHE_VERSION v5 in providers/nanonis/adapter.py. The
+        raster-frame choice here was instead validated quantitatively:
+        image pixels sampled at _map_spec_to_pixels positions correlate
+        |r|~0.98 with the grid's own slice values, pinning the correct
+        display orientation independent of any cache.)"""
+        row_flip = False
+        col_flip = False
+        try:
+            theta = math.radians(float(angle_deg or 0.0))
+        except Exception:
+            theta = 0.0
+        if theta:
+            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            U = X * cos_t - Y * sin_t
+            V = X * sin_t + Y * cos_t
+        else:
+            U, V = X, Y
+        if rows > 1:
+            v_first = np.nanmean(V[0, :])
+            v_last = np.nanmean(V[-1, :])
+            if np.isfinite(v_first) and np.isfinite(v_last):
+                row_flip = bool(v_last > v_first)
+        if cols > 1:
+            u_first = np.nanmean(U[:, 0])
+            u_last = np.nanmean(U[:, -1])
+            if np.isfinite(u_first) and np.isfinite(u_last):
+                col_flip = bool(u_last < u_first)
+        return row_flip, col_flip
+
+    def _grid_local_extent(self, channel_specs, rows, cols, zero_based):
+        """(dx, dy, extent, row_flip, col_flip) for the grid's local/
+        relative frame - a plain axis-aligned box of size (cols*dx,
+        rows*dy) starting at (0, 0). row_flip/col_flip (see
+        _grid_local_orientation) say whether the metric array and marker
+        placement need flipping along that axis before display, so this
+        flattened view agrees with the anchor image's raster (thumbnail/
+        preview/"Reference image" mode) about which end is up/right.
+        Returns (None, None, None, False, False) if true per-point
+        coordinates aren't available (e.g. some pixels missing channel
+        data).
+        """
+        X, Y = self._grid_xy_coords(channel_specs, rows, cols, zero_based)
+        if X is None or Y is None or np.isnan(X).any() or np.isnan(Y).any():
+            return None, None, None, False, False
+        dx, dy = self._grid_local_pitch(X, Y, rows, cols)
+        row_flip, col_flip = self._grid_local_orientation(
+            X, Y, rows, cols, angle_deg=self._anchor_scan_angle())
+        extent = (0.0, cols * dx, rows * dy, 0.0)
+        return dx, dy, extent, row_flip, col_flip
+
+    def _extract_pixel_series(self, spec, channel_label):
+        """Return (xs, ys) for one grid pixel, for the metric-builder
+        helpers below. Handles both the older Omicron/Anfatec layout (one
+        spec object per channel per pixel, data in spec['data'] as an
+        (xs, ys) tuple) and the Nanonis .3ds "bundled" layout (one spec per
+        pixel holding every channel in spec['channels'], sharing the axis
+        in spec['V'])."""
+        data = spec.get('data')
+        if data is not None:
+            try:
+                return np.asarray(data[0], dtype=float), np.asarray(data[1], dtype=float)
+            except Exception:
+                return None, None
+        channels = spec.get('channels') or {}
+        if channel_label and channel_label in channels:
+            try:
+                xs = np.asarray(spec.get('V', []), dtype=float)
+                ys = np.asarray(channels[channel_label], dtype=float)
+                if xs.size and xs.size == ys.size:
+                    return xs, ys
+            except Exception:
+                pass
+        return None, None
+
+    def _build_stat_metric(self, fn, channel_specs, channel_label, rows, cols, zero_based):
+        if not channel_specs or not rows or not cols:
+            return None
+        grid = np.full((rows, cols), np.nan, dtype=float)
         for spec in channel_specs:
-            data = spec.get('data')
-            coords = self.viewer._map_spec_to_pixels(spec, header or {}, xpix, ypix, file_key=file_key)
-            if data is None or coords is None:
+            rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+            if rc is None or not (0 <= rc[0] < rows and 0 <= rc[1] < cols):
+                continue
+            _xs, ys = self._extract_pixel_series(spec, channel_label)
+            if ys is None:
                 continue
             try:
-                values = np.asarray(data[1], dtype=float)
-                grid[coords[1], coords[0]] = fn(values)
+                grid[rc[0], rc[1]] = fn(ys)
             except Exception:
                 continue
         return grid
 
-    def _build_integral_metric(self, channel_specs, header, file_key):
-        if not channel_specs:
+    def _build_integral_metric(self, channel_specs, channel_label, rows, cols, zero_based):
+        if not channel_specs or not rows or not cols:
             return None
-        xpix = int(header.get('xPixel', 128) if header else 128)
-        ypix = int(header.get('yPixel', 128) if header else 128)
-        grid = np.full((ypix, xpix), np.nan, dtype=float)
+        grid = np.full((rows, cols), np.nan, dtype=float)
         for spec in channel_specs:
-            data = spec.get('data')
-            coords = self.viewer._map_spec_to_pixels(spec, header or {}, xpix, ypix, file_key=file_key)
-            if data is None or coords is None:
+            rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+            if rc is None or not (0 <= rc[0] < rows and 0 <= rc[1] < cols):
+                continue
+            xs, ys = self._extract_pixel_series(spec, channel_label)
+            if xs is None or ys is None:
                 continue
             try:
-                xs = np.asarray(data[0], dtype=float)
-                ys = np.asarray(data[1], dtype=float)
-                grid[coords[1], coords[0]] = np.trapz(ys, xs)
+                # np.trapz removed in NumPy 2.0 -> np.trapezoid
+                _trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+                grid[rc[0], rc[1]] = _trapz(ys, xs)
             except Exception:
                 continue
         return grid
 
-    def _build_peak_metric(self, channel_specs, header, file_key):
-        if not channel_specs:
+    def _build_peak_metric(self, channel_specs, channel_label, rows, cols, zero_based):
+        if not channel_specs or not rows or not cols:
             return None
-        xpix = int(header.get('xPixel', 128) if header else 128)
-        ypix = int(header.get('yPixel', 128) if header else 128)
-        grid = np.full((ypix, xpix), np.nan, dtype=float)
+        grid = np.full((rows, cols), np.nan, dtype=float)
         for spec in channel_specs:
-            data = spec.get('data')
-            coords = self.viewer._map_spec_to_pixels(spec, header or {}, xpix, ypix, file_key=file_key)
-            if data is None or coords is None:
+            rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+            if rc is None or not (0 <= rc[0] < rows and 0 <= rc[1] < cols):
+                continue
+            xs, ys = self._extract_pixel_series(spec, channel_label)
+            if xs is None or ys is None:
                 continue
             try:
-                ys = np.asarray(data[1], dtype=float)
                 idx = int(np.nanargmax(ys))
-                xs = np.asarray(data[0], dtype=float)
-                grid[coords[1], coords[0]] = xs[idx]
+                grid[rc[0], rc[1]] = xs[idx]
             except Exception:
                 continue
         return grid
 
-    def _pick_spec_from_point(self, x, y, channel_specs, file_key):
+    def _build_slice_metric(self, channel_specs, channel_label, rows, cols, zero_based, slice_value):
+        """A CITS-style slice: the selected channel's value at one specific
+        sweep-axis point (e.g. Frequency Shift at Bias = -0.5 V) for every
+        pixel, linearly interpolated between the nearest measured points -
+        as opposed to the other modes, which each collapse a pixel's whole
+        curve into a single aggregate statistic."""
+        if not channel_specs or not rows or not cols:
+            return None
+        grid = np.full((rows, cols), np.nan, dtype=float)
+        for spec in channel_specs:
+            rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+            if rc is None or not (0 <= rc[0] < rows and 0 <= rc[1] < cols):
+                continue
+            xs, ys = self._extract_pixel_series(spec, channel_label)
+            if xs is None or ys is None or xs.size < 2:
+                continue
+            try:
+                if xs[0] > xs[-1]:
+                    xs = xs[::-1]
+                    ys = ys[::-1]
+                grid[rc[0], rc[1]] = np.interp(slice_value, xs, ys)
+            except Exception:
+                continue
+        return grid
+
+    def _spec_display_xy(self, spec):
+        """Real (x, y) nm position to actually draw/pick this spec at.
+
+        Grid-native metric maps (Slice at value, Max amplitude, ...) build
+        their own axes directly from specs' real x/y (see _grid_axes), so
+        plotting a spec's raw x/y against them is already correct - both
+        stay in the same absolute frame.
+
+        "Reference image" mode is different: the background there is a
+        real topo image, displayed at its own *local* extent (_header_extent
+        is a simple, non-rotated bounding box) exactly like the main preview
+        and the Position insets do - and both of those already convert a
+        spec's absolute (x, y) into that image's local frame via
+        _map_spec_to_pixels before placing it. Plotting raw (x, y) directly
+        here instead, as this method used to, skips that conversion - fine
+        when the scan's Angle header is 0, but a real, measurable error
+        otherwise (confirmed ~0.3/7.4 nm x/y offset on this app's own real
+        42.4-degree-rotated test data, not a hypothetical corner case).
+        Route through the same _map_spec_to_pixels used elsewhere so the
+        grid map's own markers land exactly where the inset/preview would
+        put them, instead of a third, disagreeing convention.
+        """
+        x = spec.get('x')
+        y = spec.get('y')
+        if x is None or y is None:
+            return None, None
+        x = float(x)
+        y = float(y)
+        if self.map_mode_combo.currentText() != "Reference image":
+            # "Relative axes" draws the metric map (and its markers) in the
+            # grid's own local frame, not absolute nm - a spec's raw x/y is
+            # in a completely different coordinate range there, which made
+            # hover/click picking silently latch onto one fixed nearest-by-
+            # wrong-frame point. Reproduce the exact marker placement from
+            # _draw_image_layer's relative branch instead; specs without a
+            # grid row/col (co-located singles) aren't drawn in this frame,
+            # so they're not pickable either.
+            frame = getattr(self, "_current_local_frame", None)
+            if frame is not None:
+                rows, cols, zero_based, local_dx, local_dy, row_flip, col_flip = frame
+                rc = self._spec_grid_row_col(spec, rows, cols, zero_based)
+                if rc is None:
+                    return None, None
+                disp_row = (rows - 1 - rc[0]) if row_flip else rc[0]
+                disp_col = (cols - 1 - rc[1]) if col_flip else rc[1]
+                return (disp_col + 0.5) * local_dx, (disp_row + 0.5) * local_dy
+            return x, y
+        arr = self._current_image_arr
+        extent = self._current_image_extent
+        if arr is None or extent is None:
+            return x, y
+        try:
+            ypix, xpix = arr.shape[:2]
+        except Exception:
+            return x, y
+        anchor = self.anchor_path or self.image_entry.get('path')
+        if not anchor:
+            return x, y
+        header, _fds = self.viewer.headers.get(str(anchor), (None, None))
+        if header is None:
+            return x, y
+        try:
+            coords = self.viewer._map_spec_to_pixels(spec, header, xpix, ypix, file_key=str(anchor))
+        except Exception:
+            coords = None
+        if coords is None:
+            return x, y
+        # A single occasional off-frame spectrum is deliberately clamped to
+        # the reference image's nearest edge elsewhere in the app (see
+        # CLAUDE.md's off-frame handling) - a fine treatment for one point.
+        # A grid can have an entire boundary row/column genuinely outside a
+        # smaller anchored image (confirmed on real data: a grid whose own
+        # footprint was larger than its anchored scan in both axes), and
+        # clamping *all* of those independently per-axis produces a
+        # crisscrossing zigzag of points that reads as scrambled/broken data
+        # rather than "this grid extends past this image" - which points
+        # are affected also changes every time anchoring picks a different
+        # (correctly, more specific) image, since that's a property of the
+        # image, not the grid. Matrix/grid points with a real (not just
+        # floating-point-noise) off-frame distance are omitted here instead
+        # of clamped - they still render correctly in "Slice at value" and
+        # "Relative axes" modes, which aren't tied to any one image's bounds.
+        if spec.get('matrix_index') is not None:
+            off_dist = spec.get('off_frame_distance_nm')
+            if off_dist and off_dist > 1e-6:
+                return None, None
+        col, row = coords
+        x0, x1, y1, y0 = extent
+        disp_x = x0 + (col / max(1, xpix - 1)) * (x1 - x0)
+        disp_y = y1 - (row / max(1, ypix - 1)) * (y1 - y0)
+        return disp_x, disp_y
+
+    def _pick_spec_from_point(self, x, y, channel_specs, file_key=None):
+        """Nearest spec to a click, by displayed (x, y) nm distance - see
+        _spec_display_xy for why this isn't always a spec's raw x/y."""
+        if x is None or y is None:
+            return None
         best = None
         best_dist = None
-        header, _ = self.viewer.headers.get(str(self.image_entry['path']), (None, None))
-        xpix = int(header.get('xPixel', 128) if header else 128)
-        ypix = int(header.get('yPixel', 128) if header else 128)
         for spec in channel_specs:
-            coords = self.viewer._map_spec_to_pixels(spec, header or {}, xpix, ypix, file_key=file_key)
-            if coords is None:
+            sx, sy = self._spec_display_xy(spec)
+            if sx is None or sy is None:
                 continue
-            col, row = coords
-            dist = (col - x)**2 + (row - y)**2
+            dist = (sx - x) ** 2 + (sy - y) ** 2
             if best is None or dist < best_dist:
                 best = spec
                 best_dist = dist
@@ -3439,14 +5557,29 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
     def _on_click(self, event):
         if event.inaxes != self.ax or event.button != MouseButton.LEFT:
             return
-        channel_specs = self._current_channel_specs()
-        spec = self._pick_spec_from_point(event.xdata, event.ydata, channel_specs, str(self.image_entry['path']))
+        # A real click always supersedes whatever the hover-preview was
+        # showing - drop the pending/applied hover state so a later hover
+        # back over this same pixel doesn't skip re-drawing (its key would
+        # otherwise still match) and the hover ring doesn't linger under
+        # the real selection marker this click is about to add.
+        self._hover_timer.stop()
+        self._pending_hover_spec = None
+        self._hover_spec_key = None
+        self._remove_hover_marker(redraw=False)
+        # Pick from whatever set of positions is actually drawn (see
+        # show_positions_cb handling in _draw_image_layer) - the full
+        # dataset when "Show all spectroscopy positions" is checked, or
+        # just the current channel/file's points when it's not.
+        pickable_specs = self.specs if getattr(self.show_positions_cb, "isChecked", lambda: True)() else self._current_channel_specs()
+        spec = self._pick_spec_from_point(event.xdata, event.ydata, pickable_specs)
         if not spec:
             return
-        header, _ = self.viewer.headers.get(str(self.image_entry['path']), (None, None))
-        xpix = int(header.get('xPixel', 128) if header else 128)
-        ypix = int(header.get('yPixel', 128) if header else 128)
-        coords = self.viewer._map_spec_to_pixels(spec, header or {}, xpix, ypix, file_key=str(self.image_entry['path']))
+        # coords is the *displayed* position (drives the selection ring
+        # drawn on the map, so it must match _spec_display_xy's rotation
+        # handling in Reference image mode); nm_coords below stays the
+        # spec's real, unrotated position since that's used for text/labels
+        # (selection table, popup titles), not drawing.
+        coords = self._spec_display_xy(spec)
         key = self._selection_key(spec)
         mods = self._event_modifiers(event)
         shift = bool(mods & QtCore.Qt.ShiftModifier)
@@ -3487,8 +5620,48 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
             self._aggregate_mode = True
             if hasattr(self.viewer, '_toggle_multi_spec_selection'):
                 self.viewer._toggle_multi_spec_selection(spec)
+            # Shift+click on a second (third, ...) point used to only
+            # update this dialog's own embedded comparison plot below -
+            # nothing opened or changed anywhere else, which read as
+            # "shift-clicking more spectra does nothing." Also open/append
+            # to a spectrum popup, matching how shift+click behaves on
+            # thumbnail markers elsewhere in the app.
+            controller = getattr(self.viewer, "spectro_compare_controller", None)
+            if controller is not None and hasattr(controller, "append_spec_to_single_popup"):
+                try:
+                    # Each shift+click already claimed the next color-cycle
+                    # color for this dialog's own selection table above; hand
+                    # it to the popup too so the accumulating multi-trace
+                    # window's colors track the grid map's cycle instead of
+                    # the popup's own independent SCIENCE_PALETTE ordering.
+                    controller.append_spec_to_single_popup(spec, initial_color=color)
+                except Exception:
+                    pass
         else:
-            self.viewer._open_spectroscopy_popup(spec)
+            controller = getattr(self.viewer, "spectro_compare_controller", None)
+            stack_count = int(spec.get("xy_stack_count") or 0)
+            is_stack_member = bool(spec.get('xy_stack_key')) and stack_count > 1 and spec.get('matrix_index') is None
+            opened_stack = False
+            if is_stack_member and controller is not None and hasattr(controller, "open_stack_popup"):
+                # A non-shift click on a Z-stack/repeated-measurement point
+                # (e.g. one co-located with this grid on the same image)
+                # should open its full Z-series - all traces at that site -
+                # matching how Z-stack markers are activated everywhere
+                # else in the app. Without this, clicking such a point here
+                # could only ever open one isolated trace with no way to
+                # reach the rest of the stack from this dialog.
+                try:
+                    controller.open_stack_popup(spec, file_key=str(spec.get('image_key') or ''))
+                    opened_stack = True
+                except Exception:
+                    opened_stack = False
+            if not opened_stack:
+                # Pass the color this click just claimed from the grid
+                # map's own color cycle so the popup that opens doesn't
+                # independently default to its own SCIENCE_PALETTE[0] - the
+                # two would almost never coincide, so the marker and its
+                # trace looked unrelated.
+                self.viewer._open_spectroscopy_popup(spec, initial_color=color)
         max_sel = 24
         if len(self._selection) > max_sel:
             overflow = len(self._selection) - max_sel
@@ -3596,13 +5769,14 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self.curve_ax.grid(True, alpha=0.3)
         if legend_handles:
             self.curve_ax.legend(loc='upper right', fontsize=8)
+        _style_plot_chrome(self, self.curve_canvas.figure)
         self.curve_canvas.draw_idle()
 
     def _gather_multi_channel_specs(self, matrix_index):
         if matrix_index is None:
             return []
         entries = []
-        selected = self._normalize_path(self.channel_combo.currentData())
+        selected = self._channel_key(self.channel_combo.currentData())
         for path, specs in self._channel_specs.items():
             if selected and path != selected:
                 continue
@@ -3624,14 +5798,21 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
         self.selection_table.setRowCount(0)
         self.curve_ax.clear()
         self._update_selection_markers()
+        _style_plot_chrome(self, self.curve_canvas.figure)
         self.curve_canvas.draw_idle()
 
     def _on_fit_matrix(self):
         dlg = MatrixFitDialog(self.viewer, self.specs, parent=self)
         dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
         self._fit_dialogs.append(dlg)
         dlg.finished.connect(lambda _: self._cleanup_fit_dialog(dlg))
+        # Start the fit immediately instead of leaving the user to notice
+        # and click this dialog's own separate "Run fits" button - clicking
+        # "Fit matrix parabolas..." here should mean "fit now."
+        dlg._start_fit()
 
     def _cleanup_fit_dialog(self, dlg):
         try:
@@ -3669,32 +5850,266 @@ class MatrixSpectroViewer(QtWidgets.QDialog):
     def _on_canvas_hover(self, event):
         if event.inaxes != self.ax or self._current_image_arr is None:
             self.image_value_label.setText("Value: --")
+            self._clear_hover_preview()
             return
-        val = sample_array_value(self._current_image_arr, event.xdata, event.ydata, self._current_image_extent)
+        val = self._sample_current_image(event.xdata, event.ydata)
         if val is None:
             self.image_value_label.setText("Value: --")
+        else:
+            unit = self._current_image_unit or ''
+            txt = f"Value: {val:.4g}"
+            if unit:
+                txt += f" {unit}"
+            self.image_value_label.setText(txt)
+
+        # Scrub the embedded curve plot to whichever pixel is under the
+        # cursor, mirroring _on_click's own picking logic, so hovering finds
+        # the same point a click there would. This never touches
+        # self._selection/_curve_entries - it's a disposable preview only.
+        pickable_specs = self.specs if getattr(self.show_positions_cb, "isChecked", lambda: True)() else self._current_channel_specs()
+        spec = self._pick_spec_from_point(event.xdata, event.ydata, pickable_specs)
+        if not spec:
+            self._clear_hover_preview()
             return
-        unit = self._current_image_unit or ''
-        txt = f"Value: {val:.4g}"
+        key = self._selection_key(spec)
+        if key == self._hover_spec_key:
+            return
+        self._pending_hover_spec = spec
+        self._hover_timer.start()
+
+    def _apply_pending_hover_preview(self):
+        spec = self._pending_hover_spec
+        if not spec:
+            return
+        self._hover_spec_key = self._selection_key(spec)
+        self._draw_hover_preview(spec)
+
+    def _draw_hover_preview(self, spec):
+        self.curve_ax.clear()
+        channel_label = self._channel_label_for_path(self.channel_combo.currentData())
+        xs, ys, unit, resolved_label, x_unit = self._extract_channel_data(spec, channel_label)
+        if xs is None or ys is None:
+            self.curve_canvas.draw_idle()
+            return
+        preview_color = "#9aa0a6"
+        self.curve_ax.plot(xs, ys, '-', color=preview_color, lw=1.6, alpha=0.9)
+        xlabel = f"Bias ({x_unit})" if x_unit else "Bias"
+        axis_label = resolved_label or "Signal"
         if unit:
-            txt += f" {unit}"
-        self.image_value_label.setText(txt)
+            axis_label = f"{axis_label} ({unit})"
+        self.curve_ax.set_xlabel(xlabel)
+        self.curve_ax.set_ylabel(axis_label)
+        self.curve_ax.grid(True, alpha=0.25, linestyle=':')
+        title = "Hover preview - click to keep"
+        nm = (spec.get('x'), spec.get('y'))
+        if nm[0] is not None and nm[1] is not None:
+            title += f" @ ({nm[0]:.1f}, {nm[1]:.1f} nm)"
+        self.curve_ax.set_title(title, fontsize=9, color=preview_color, style='italic')
+        _style_plot_chrome(self, self.curve_canvas.figure)
+        # the hover title keeps its dedicated grey so it reads as transient
+        self.curve_ax.title.set_color(preview_color)
+        self.curve_canvas.draw_idle()
+        self._draw_hover_marker(spec)
+
+    def _clear_hover_preview(self):
+        had_state = self._hover_spec_key is not None or self._pending_hover_spec is not None
+        self._hover_timer.stop()
+        self._pending_hover_spec = None
+        self._hover_spec_key = None
+        self._remove_hover_marker()
+        if not had_state:
+            return
+        # Restore whatever the real click-based selection was showing before
+        # the hover preview took over the curve plot.
+        if self._aggregate_mode:
+            self._update_curve_plot()
+        else:
+            self._update_curve_plot(self._selection[-1] if self._selection else None)
+
+    def _draw_hover_marker(self, spec):
+        self._remove_hover_marker(redraw=False)
+        x, y = self._spec_display_xy(spec)
+        if x is None or y is None:
+            return
+        self._hover_marker_artist = self.ax.scatter(
+            [x], [y], s=90, facecolors='none', edgecolors='#ffffff',
+            linewidths=1.6, zorder=40,
+        )
+        self.canvas.draw_idle()
+
+    def _remove_hover_marker(self, redraw=True):
+        if self._hover_marker_artist is None:
+            return
+        try:
+            self._hover_marker_artist.remove()
+        except Exception:
+            pass
+        self._hover_marker_artist = None
+        if redraw:
+            self.canvas.draw_idle()
+
+    def _sample_current_image(self, x, y):
+        """Value of self._current_image_arr at real (x, y) nm.
+
+        When self._current_image_coords is set (grid-native metric modes
+        rendered via pcolormesh at each pixel's true, possibly-rotated
+        position - see _draw_image_layer), row/col can't be recovered by
+        linear extent math since the map isn't an axis-aligned raster, so
+        this finds the nearest true pixel position instead and rejects
+        anything too far outside the grid's actual footprint to be a real
+        hover-over-a-cell.
+
+        Otherwise, given self._current_image_extent in the (left, right,
+        bottom, top) convention used with origin='upper' throughout
+        _draw_image_layer - i.e. array row 0 sits at the extent's 4th
+        ("top") value. Not sample_array_value (thumbnail_render.py), which
+        assumes the opposite (origin='lower': row 0 at the extent's 3rd/
+        "bottom" value) and would silently read the wrong row here."""
+        arr = self._current_image_arr
+        if arr is None or x is None or y is None:
+            return None
+        coords = self._current_image_coords
+        if coords is not None:
+            X, Y = coords
+            x_lo, x_hi = float(np.nanmin(X)), float(np.nanmax(X))
+            y_lo, y_hi = float(np.nanmin(Y)), float(np.nanmax(Y))
+            pad_x = 0.05 * (x_hi - x_lo)
+            pad_y = 0.05 * (y_hi - y_lo)
+            if not (x_lo - pad_x <= x <= x_hi + pad_x and y_lo - pad_y <= y <= y_hi + pad_y):
+                return None
+            d2 = (X - float(x)) ** 2 + (Y - float(y)) ** 2
+            row, col = np.unravel_index(int(np.nanargmin(d2)), d2.shape)
+            val = arr[row, col]
+            return float(val) if np.isfinite(val) else None
+        extent = self._current_image_extent
+        if extent is None:
+            return None
+        h, w = arr.shape
+        if h < 1 or w < 1:
+            return None
+        x0, x1, y_bottom, y_top = extent
+        x_lo, x_hi = min(x0, x1), max(x0, x1)
+        y_lo, y_hi = min(y_bottom, y_top), max(y_bottom, y_top)
+        if not (x_lo <= x <= x_hi and y_lo <= y <= y_hi):
+            return None
+        col = 0.0 if w <= 1 or x1 == x0 else (x - x0) / (x1 - x0) * (w - 1)
+        row = 0.0 if h <= 1 or y_top == y_bottom else (y - y_top) / (y_bottom - y_top) * (h - 1)
+        col = int(round(min(max(col, 0), w - 1)))
+        row = int(round(min(max(row, 0), h - 1)))
+        # The local/relative view displays a flipped copy of the metric
+        # (see _grid_local_orientation) while arr here stays unflipped —
+        # undo the display flips so the readout matches the pixel under
+        # the cursor.
+        row_flip, col_flip = getattr(self, "_current_local_flips", (False, False))
+        if row_flip:
+            row = (h - 1) - row
+        if col_flip:
+            col = (w - 1) - col
+        val = arr[row, col]
+        return float(val) if np.isfinite(val) else None
+
+def _lj_force_model(z, eps, sigma, off):
+    """Lennard-Jones force shape F(z) = 24*eps*(2*sigma^12/z^13 - sigma^6/z^7)
+    + off. z<=0 -> nan (the potential diverges at contact)."""
+    zz = np.where(np.asarray(z, dtype=float) > 0, z, np.nan)
+    r6 = (sigma / zz) ** 6
+    return 24.0 * eps * (2.0 * r6 * r6 - r6) / zz + off
+
+
+def _morse_force_model(z, De, a, ze, off):
+    """Morse force shape F(z) = 2*De*a*(e^{-2a(z-ze)} - e^{-a(z-ze)}) + off."""
+    e = np.exp(-a * (np.asarray(z, dtype=float) - ze))
+    return 2.0 * De * a * (e * e - e) + off
+
+
+def _fit_guess(z, y):
+    z = np.asarray(z, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(z) & np.isfinite(y)
+    z, y = z[m], y[m]
+    order = np.argsort(z)
+    z, y = z[order], y[order]
+    if z.size < 4:
+        return z, y, 1e-3, 0.0, 1.0, 1e-3
+    imin = int(np.argmin(y))
+    zmin = max(float(z[imin]), 1e-3)
+    tail = max(3, len(y) // 10)
+    off = float(np.median(y[-tail:]))
+    amp = abs(float(y[imin]) - off) + 1e-30
+    span = max(float(z.max() - z.min()), 1e-3)
+    return z, y, zmin, off, amp, span
+
+
+def _fit_shape(z, y, model_fn, p0, bounds, model_name, param_names):
+    """Bounded least-squares fit of model_fn to (z, y); returns a result dict
+    matching the parabola fit's shape (func/rmse/params). Never evaluates the
+    model at z<=0 (LJ/Morse explode there); the data z-range is used as-is."""
+    from scipy.optimize import curve_fit
+    z = np.asarray(z, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(z) & np.isfinite(y)
+    zz, yy = z[mask], y[mask]
+    if zz.size < len(p0) + 1:
+        raise ValueError("not enough finite points to fit")
+    popt, pcov = curve_fit(model_fn, zz, yy, p0=p0, bounds=bounds, maxfev=30000)
+    resid = yy - model_fn(zz, *popt)
+    rmse = float(np.sqrt(np.mean(resid ** 2)))
+    try:
+        perr = np.sqrt(np.diag(pcov))
+    except Exception:
+        perr = np.full(len(popt), np.nan)
+    popt_arr = np.asarray(popt, dtype=float)
+
+    def func(zv, _p=popt_arr):
+        return model_fn(np.asarray(zv, dtype=float), *_p)
+
+    return {
+        "func": func, "rmse": rmse, "model": model_name,
+        "params": dict(zip(param_names, [float(v) for v in popt_arr])),
+        "param_errors": dict(zip(param_names, [float(v) for v in perr])),
+    }
+
+
+def fit_lj_force(z, y):
+    """Fit the Lennard-Jones force shape to a curve (empirical fit to df)."""
+    z, y, zmin, off, amp, _span = _fit_guess(z, y)
+    sigma0 = max(zmin / 1.2447, 1e-3)  # LJ force minimum sits at ~1.2447*sigma
+    return _fit_shape(z, y, _lj_force_model, [amp, sigma0, off],
+                      ([0.0, 1e-4, -np.inf], [np.inf, 1e4, np.inf]),
+                      "Lennard-Jones", ("epsilon", "sigma", "offset"))
+
+
+def fit_morse_force(z, y):
+    """Fit the Morse force shape to a curve (empirical fit to df)."""
+    z, y, zmin, off, amp, span = _fit_guess(z, y)
+    a0 = 5.0 / span
+    ze0 = zmin - np.log(2.0) / a0
+    return _fit_shape(z, y, _morse_force_model, [amp, a0, ze0, off],
+                      ([0.0, 1e-3, -np.inf, -np.inf], [np.inf, np.inf, np.inf, np.inf]),
+                      "Morse", ("De", "a", "ze", "offset"))
+
 
 class _SpectroFitWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list, list)
     progress = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, specs, channel, axis_key):
+    def __init__(self, specs, channel, axis_key, filter_cfg=None, model="parabola"):
         super().__init__()
         self.specs = list(specs)
         self.channel = channel
         self.axis_key = axis_key or "primary"
+        self.model = model or "parabola"  # "parabola" | "lj" | "morse"
+        # Plain dict copy, not a reference to the dialog's live _filter_cfg -
+        # this worker runs on its own QThread, so it must not touch a Qt
+        # widget's state directly.
+        self.filter_cfg = dict(filter_cfg or {})
 
     @staticmethod
-    def _axis_for_spec_with_key(spec, key):
+    def _axis_for_spec_with_key(spec, key, common_origin=None):
         for ax in spec.get("AxisChoices") or []:
             if ax.get("key") == key:
                 vals = np.asarray(ax.get("values", []), dtype=float)
+                vals = _apply_zrel_origin(vals, ax, key, common_origin)
                 return vals, ax.get("label") or "Axis", ax.get("unit") or ""
         if key == "alt":
             alt_vals = spec.get("AltAxis")
@@ -3708,36 +6123,54 @@ class _SpectroFitWorker(QtCore.QObject):
         results = []
         logs = []
         total_specs = len(self.specs)
+        common_origin = _zrel_group_common_origin(self.specs)
         for i, spec in enumerate(self.specs):
             name = Path(spec['path']).name
             progress_msg = f"Fitting {name} ({i+1}/{total_specs})"
             self.progress.emit(int((i / total_specs) * 100), progress_msg)
 
-            V, axis_label, axis_unit = self._axis_for_spec_with_key(spec, self.axis_key)
+            V, axis_label, axis_unit = self._axis_for_spec_with_key(spec, self.axis_key, common_origin)
             channels = spec.get('channels') or {}
             data = channels.get(self.channel)
             if data is None or not V.size:
                 logs.append(f"{name}: channel '{self.channel}' unavailable for axis '{axis_label}'")
                 continue
+            # Fit whatever the dialog is actually plotting - if a filter
+            # (smoothing, denoising, derivative, ...) is enabled, fitting
+            # the raw unfiltered curve instead would silently disagree with
+            # what's on screen, which is the whole point of having filters
+            # in a fit workflow. A no-op (data unchanged) when every
+            # section is disabled, which is the default filter_cfg state.
+            data, _ = _apply_signal_filter_chain(V, data, "", axis_unit, self.filter_cfg)
             try:
-                res = fit_parabola_bias(V, data)
+                if self.model == "lj":
+                    res = fit_lj_force(V, data)
+                elif self.model == "morse":
+                    res = fit_morse_force(V, data)
+                else:
+                    res = fit_parabola_bias(V, data)
                 res['spec'] = spec
                 res['axis_key'] = self.axis_key
                 res['axis_label'] = axis_label
                 res['axis_unit'] = axis_unit
-                a = res.get('a'); b = res.get('b')
-                v0 = None; v0_err = None
-                if a is not None and b is not None and np.isfinite(a) and np.isfinite(b) and a != 0:
-                    v0 = -b / (2.0 * a)
-                    da = res.get('a_err', 0.0)
-                    db = res.get('b_err', 0.0)
-                    term1 = (db / (2.0 * a)) ** 2 if a != 0 else 0.0
-                    term2 = ((b * da) / (2.0 * (a ** 2))) ** 2 if a != 0 else 0.0
-                    v0_err = math.sqrt(max(term1 + term2, 0.0))
-                res['v0'] = v0
-                res['v0_err'] = v0_err
+                if self.model in ("lj", "morse"):
+                    # LJ/Morse have no CPD-style vertex; skip the v0 marker.
+                    res['v0'] = None
+                    res['v0_err'] = None
+                else:
+                    a = res.get('a'); b = res.get('b')
+                    v0 = None; v0_err = None
+                    if a is not None and b is not None and np.isfinite(a) and np.isfinite(b) and a != 0:
+                        v0 = -b / (2.0 * a)
+                        da = res.get('a_err', 0.0)
+                        db = res.get('b_err', 0.0)
+                        term1 = (db / (2.0 * a)) ** 2 if a != 0 else 0.0
+                        term2 = ((b * da) / (2.0 * (a ** 2))) ** 2 if a != 0 else 0.0
+                        v0_err = math.sqrt(max(term1 + term2, 0.0))
+                    res['v0'] = v0
+                    res['v0_err'] = v0_err
                 results.append(res)
-                logs.append(f"{name}: fit ok (RMSE {res['rmse']:.3g})")
+                logs.append(f"{name}: {res.get('model', 'parabola')} fit ok (RMSE {res['rmse']:.3g})")
             except Exception as e:
                 logs.append(f"{name}: {e}")
         self.progress.emit(100, "Fit complete")
@@ -3893,6 +6326,7 @@ class KPFMFitTrendDialog(QtWidgets.QDialog):
             self.fig.tight_layout()
         except Exception:
             pass
+        _style_plot_chrome(self.parent() or self, self.fig)
         self.canvas.draw_idle()
 
 
@@ -3910,10 +6344,22 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
             self._color_cycle = get_color_cycle(DEFAULT_COLOR_CYCLE)
         self._line_map = {}
         self._legend_map = {}
+        self._auto_color_by_id = {}  # spec_id -> auto-assigned palette color, stable across reorders/filtering
+        self._auto_color_next_idx = 0  # persistent cycle position so newly-added curves get a fresh, non-colliding color
         self._fit_results = {}
         self._fit_thread = None
         self._fit_worker = None
         self._fit_trend_dialog = None
+        # Analytic potential-fit (Lennard-Jones / Morse) overlay state.
+        self._potential_fit_cache = {}   # signature -> fit result (or None if it failed)
+        self._potential_fit_overlay = False
+        self._potential_model = potential_fits.MODELS[0]
+        # Optional [zmin, zmax] window (display units) the fit is restricted to;
+        # None means "use the whole displayed curve".
+        self._potential_fit_range = None
+        # Set to force the next _update_plot through the full (clearing) redraw
+        # path instead of the incremental one - needed when removing overlays.
+        self._force_full_replot = False
         self._popup_refs = []
         self._compare_inset_image_cache = OrderedDict()
         self._curve_data_cache = OrderedDict()
@@ -3932,7 +6378,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._lcpd_line_info = {}
         self._delta_selection = []
         self._delta_annotation_artists = []
-        self.setWindowTitle("Spectroscopy comparison")
+        self.setWindowTitle("Compare spectra")
         self.resize(1400, 700)  # Increased size for better layout
         try:
             self.setWindowFlag(QtCore.Qt.MSWindowsFixedSizeDialogHint, False)
@@ -3955,6 +6401,12 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._show_position_inset = True
         self._position_inset_ax = None
         self._inset_bbox = None
+        self._inset_show_other_points = True
+        self._inset_marker_symbol = "circle"
+        self._inset_marker_size = 50.0
+        self._inset_marker_color_override = None
+        self._inset_resizing = None
+        self._inset_resize_start = None
         self._minima_artists = []
         self._inset_dragging = False
         self._inset_drag_offset = (0.0, 0.0)
@@ -4076,11 +6528,6 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._plot_update_pending = False
         self._update_plot()
 
-    def _get_icon(self, name):
-        """Get a themed icon, falling back to empty icon if not available."""
-        icon = QIcon.fromTheme(name)
-        return icon if icon and not icon.isNull() else QIcon()
-
     def _display_name(self, spec):
         name = Path(spec.get('path', '')).name
         idx = spec.get('matrix_index')
@@ -4104,6 +6551,8 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
 
     def _clear_curve_data_cache(self):
         self._curve_data_cache.clear()
+        if hasattr(self, "_potential_fit_cache"):
+            self._potential_fit_cache.clear()
 
     def _decimate_curve_for_display(self, x_vals, y_vals, plotted_count=1):
         try:
@@ -4236,10 +6685,43 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
                 pass
             self._legend_map[leg_line] = spec_id
 
+    def _relative_zero_shift(self):
+        """The x-offset applied to nm axes when 'Relative Z' is on: the smallest
+        min-Z across the selected/checked spectra (0.0 when the mode is off or no
+        nm axis is present). Display x = axis_vals - this shift."""
+        if not self._relative_zero_enabled:
+            return 0.0
+        mins = []
+        for item in self._selected_items() or self._checked_items():
+            spec = item.data(0, QtCore.Qt.UserRole)
+            if not spec:
+                continue
+            axis_vals, _, unit = self._axis_for_spec(spec)
+            if axis_vals.size and unit == "nm":
+                mins.append(np.nanmin(axis_vals))
+        return float(min(mins)) if mins else 0.0
+
+    def _display_x_for_spec(self, spec, axis_vals=None, axis_unit=None, rel_zero=None):
+        """axis_vals shifted into the same display coordinates the plot uses, so
+        the fit-range window (read off the visible x-axis) means the same thing
+        here as on screen - the key to making the window relative-Z-aware."""
+        if axis_vals is None or axis_unit is None:
+            axis_vals, _lbl, axis_unit = self._axis_for_spec(spec)
+        axis_vals = np.asarray(axis_vals, dtype=float)
+        if rel_zero is None:
+            rel_zero = self._relative_zero_shift()
+        if self._relative_zero_enabled and (axis_unit or "").lower() == "nm":
+            return axis_vals - rel_zero
+        return axis_vals
+
     def _can_incremental_plot_update(self):
+        if getattr(self, "_force_full_replot", False):
+            return False
         if not self._line_map:
             return False
         if getattr(self, "_fit_results", None):
+            return False
+        if getattr(self, "_potential_fit_overlay", False):
             return False
         if getattr(self, "_minima_meta", None):
             return False
@@ -4264,20 +6746,8 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         bg_id = self._background_spec_id or ""
         filter_sig = self._filter_signature()
         selected_ids = {item.data(0, QtCore.Qt.UserRole + 1) for item in self._selected_items()}
-        colors = self._iter_color_cycle()
         visible_count = max(1, len(plot_items))
-        rel_zero = 0.0
-        if relative_nm:
-            mins = []
-            for item in self._selected_items() or self._checked_items():
-                spec = item.data(0, QtCore.Qt.UserRole)
-                if not spec:
-                    continue
-                axis_vals, _, unit = self._axis_for_spec(spec)
-                if axis_vals.size and unit == "nm":
-                    mins.append(np.nanmin(axis_vals))
-            if mins:
-                rel_zero = min(mins)
+        rel_zero = self._relative_zero_shift()
         y_units_after_filters = []
         plotted = 0
         plotted_spec_ids = []
@@ -4307,7 +6777,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
             if not x_plot.size:
                 continue
             y_units_after_filters.append(y_unit_final or y_unit_raw)
-            color = next(colors)
+            color = self._auto_color_for_spec(spec_id)
             highlight = spec_id in selected_ids or not selected_ids
             label_txt = self._display_name(spec)
             if self._legend_filename_only:
@@ -4437,12 +6907,18 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
                 color = style.get("color")
             else:
                 color = cycle[idx % len(cycle)]
+                self._auto_color_by_id[spec_id] = color
             try:
                 line.set_color(color)
                 line.set_markerfacecolor(color)
                 line.set_markeredgecolor(color)
             except Exception:
                 pass
+        # Keep the persistent cycle position in sync with what this fast
+        # path just assigned, so a curve added afterward continues the
+        # sequence instead of restarting at palette[0] and colliding with
+        # one of these.
+        self._auto_color_next_idx = len(self._plotted_spec_ids)
         legend = self.ax.get_legend()
         if legend:
             for idx, leg_line in enumerate(legend.get_lines()):
@@ -4677,6 +7153,27 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self.filter_edit.textChanged.connect(self._apply_filter)
         self.filter_edit.setAccessibleName("Spectrum filter")
         self.filter_edit.setAccessibleDescription("Enter text to filter the list of spectra")
+
+        # Bulk check controls - tick/untick many spectra at once instead of one
+        # box at a time. They act on the currently *visible* (filtered) rows, so
+        # they compose with the filter box above.
+        select_row = QtWidgets.QHBoxLayout()
+        select_row.setContentsMargins(0, 0, 0, 0)
+        select_row.setSpacing(4)
+        self.select_all_btn = QtWidgets.QPushButton("All")
+        self.select_all_btn.setToolTip("Tick every spectrum shown (respects the filter)")
+        self.select_all_btn.clicked.connect(lambda: self._set_all_checks("all"))
+        self.select_none_btn = QtWidgets.QPushButton("None")
+        self.select_none_btn.setToolTip("Untick every spectrum shown (respects the filter)")
+        self.select_none_btn.clicked.connect(lambda: self._set_all_checks("none"))
+        self.select_invert_btn = QtWidgets.QPushButton("Invert")
+        self.select_invert_btn.setToolTip("Toggle every spectrum shown (respects the filter)")
+        self.select_invert_btn.clicked.connect(lambda: self._set_all_checks("invert"))
+        for _b in (self.select_all_btn, self.select_none_btn, self.select_invert_btn):
+            _b.setFocusPolicy(QtCore.Qt.NoFocus)
+            select_row.addWidget(_b)
+        select_row.addStretch(1)
+
         self.spec_list = QtWidgets.QTreeWidget()
         self.spec_list.setHeaderLabels(["File", "Type", "Pos (nm)", "Time", "Chans"])
         self.spec_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -4691,6 +7188,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self.spec_list.setAccessibleName("Spectra list")
         self.spec_list.setAccessibleDescription("List of available spectra. Check boxes to include in plot, select for additional operations")
         left_layout.addWidget(self.filter_edit)
+        left_layout.addLayout(select_row)
         left_layout.addWidget(self.spec_list, 1)
         left.setMinimumWidth(180)
         splitter.addWidget(left)
@@ -4775,6 +7273,15 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self.position_inset_cb.setChecked(True)
         self.position_inset_cb.toggled.connect(self._on_visual_toggle)
         vis_row.addWidget(self.position_inset_cb)
+
+        self.inset_settings_btn = QtWidgets.QToolButton(self)
+        self.inset_settings_btn.setText("Inset settings")
+        self.inset_settings_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.inset_settings_btn.setToolTip("Show/hide other points and change the position marker's style")
+        self.inset_settings_menu = QtWidgets.QMenu(self.inset_settings_btn)
+        self.inset_settings_menu.aboutToShow.connect(self._populate_inset_settings_menu)
+        self.inset_settings_btn.setMenu(self.inset_settings_menu)
+        vis_row.addWidget(self.inset_settings_btn)
 
         self.offset_spin = QtWidgets.QDoubleSpinBox()
         self.offset_spin.setRange(-1e9, 1e9)
@@ -4919,27 +7426,137 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
 
         analysis_layout.addWidget(kpfm_group)
 
-        # Forces/Background subsection
-        forces_group = QtWidgets.QGroupBox("Forces/Background")
-        forces_layout = QtWidgets.QVBoxLayout(forces_group)
+        scipy_ok = potential_fits.scipy_available()
 
+        def _hint(text):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: gray; font-size: 11px;")
+            return lbl
+
+        # --- Force workflow, ordered: Background -> Fit -> Force --------------
+        # Step 1: Background
+        background_group = QtWidgets.QGroupBox("1 · Background")
+        background_layout = QtWidgets.QVBoxLayout(background_group)
+        background_layout.addWidget(_hint(
+            "Optional. Subtract a reference curve (e.g. a far/off-site spectrum). "
+            "Right-click any spectrum in the list to set it here."))
         bg_row = QtWidgets.QHBoxLayout()
         self.bg_set_btn = QtWidgets.QPushButton(self._get_icon("list-add"), "Set background")
-        self.bg_set_btn.setToolTip("Set selected spectrum as background for subtraction")
+        self.bg_set_btn.setToolTip("Set the selected spectrum as background for subtraction "
+                                   "(or right-click a spectrum in the list).")
         self.bg_clear_btn = QtWidgets.QPushButton(self._get_icon("list-remove"), "Clear background")
         self.bg_clear_btn.setToolTip("Remove background subtraction")
         bg_row.addWidget(self.bg_set_btn)
         bg_row.addWidget(self.bg_clear_btn)
-        forces_layout.addLayout(bg_row)
+        background_layout.addLayout(bg_row)
+        analysis_layout.addWidget(background_group)
+
+        # Step 2: Fit a smooth Δf model (Lennard-Jones / Morse)
+        potential_group = QtWidgets.QGroupBox("2 · Fit Δf (potential model)")
+        potential_layout = QtWidgets.QVBoxLayout(potential_group)
+        potential_layout.addWidget(_hint(
+            "Fit a smooth Lennard-Jones / Morse model to Δf. Drives the dashed "
+            "overlay and, if chosen below, gives a clean input to the force."))
+
+        pot_model_row = QtWidgets.QHBoxLayout()
+        pot_model_row.addWidget(QtWidgets.QLabel("Model:"))
+        self.potential_model_combo = QtWidgets.QComboBox()
+        for name in potential_fits.MODELS:
+            self.potential_model_combo.addItem(name)
+        self.potential_model_combo.setToolTip(
+            "Analytic model fitted to each displayed Δf curve."
+        )
+        self.potential_model_combo.currentTextChanged.connect(self._on_potential_model_changed)
+        pot_model_row.addWidget(self.potential_model_combo, 1)
+        potential_layout.addLayout(pot_model_row)
+
+        self.potential_overlay_cb = QtWidgets.QCheckBox("Show potential fit")
+        self.potential_overlay_cb.setToolTip(
+            "Overlay the fit (dashed) on each displayed curve. Only the currently "
+            "plotted/selected spectra are fitted. Not required for the fitted-Δf "
+            "force below - that fits on demand."
+        )
+        self.potential_overlay_cb.toggled.connect(self._on_potential_overlay_toggled)
+        potential_layout.addWidget(self.potential_overlay_cb)
+
+        # Fit range: restrict which x (Z) samples feed the fit. Curves that run
+        # too far into the repulsive wall - or where the CO tip bends and adds a
+        # spurious minimum - break the fit; clipping the window fixes that
+        # without touching the raw data. Independent of the overlay so it also
+        # governs the fitted-Δf force.
+        self.potential_range_cb = QtWidgets.QCheckBox("Limit fit range (x)")
+        self.potential_range_cb.setToolTip(
+            "Fit only the samples whose x (Z) falls inside [min, max]. Use it to "
+            "exclude the far repulsive wall or a CO-bending artefact that would "
+            "otherwise distort the fit. Applies to every fitted curve; the raw "
+            "data is unchanged."
+        )
+        self.potential_range_cb.setEnabled(scipy_ok)
+        self.potential_range_cb.toggled.connect(self._on_potential_range_toggled)
+        potential_layout.addWidget(self.potential_range_cb)
+
+        pot_range_row = QtWidgets.QHBoxLayout()
+        pot_range_row.addWidget(QtWidgets.QLabel("min"))
+        self.potential_zmin_spin = QtWidgets.QDoubleSpinBox()
+        self.potential_zmin_spin.setRange(-1e6, 1e6)
+        self.potential_zmin_spin.setDecimals(4)
+        self.potential_zmin_spin.setEnabled(False)
+        self.potential_zmin_spin.valueChanged.connect(self._on_potential_range_edited)
+        pot_range_row.addWidget(self.potential_zmin_spin, 1)
+        pot_range_row.addWidget(QtWidgets.QLabel("max"))
+        self.potential_zmax_spin = QtWidgets.QDoubleSpinBox()
+        self.potential_zmax_spin.setRange(-1e6, 1e6)
+        self.potential_zmax_spin.setDecimals(4)
+        self.potential_zmax_spin.setEnabled(False)
+        self.potential_zmax_spin.valueChanged.connect(self._on_potential_range_edited)
+        pot_range_row.addWidget(self.potential_zmax_spin, 1)
+        self.potential_range_view_btn = QtWidgets.QPushButton("From view")
+        self.potential_range_view_btn.setToolTip("Set min/max to the current x-axis view limits.")
+        self.potential_range_view_btn.setEnabled(False)
+        self.potential_range_view_btn.clicked.connect(self._on_potential_range_from_view)
+        pot_range_row.addWidget(self.potential_range_view_btn)
+        potential_layout.addLayout(pot_range_row)
+        analysis_layout.addWidget(potential_group)
+
+        # Step 3: Force conversion (Sader-Jarvis / Matrix inversion)
+        force_group = QtWidgets.QGroupBox("3 · Force conversion")
+        force_layout = QtWidgets.QVBoxLayout(force_group)
+        force_layout.addWidget(_hint(
+            "Invert Δf to a reversible 'Force' channel (in pN). Needs a Z/distance "
+            "axis and a frequency-shift channel."))
+
+        src_row = QtWidgets.QHBoxLayout()
+        src_row.addWidget(QtWidgets.QLabel("Force from:"))
+        self.force_source_combo = QtWidgets.QComboBox()
+        # userData is the internal mode key read by _force_source_mode().
+        self.force_source_combo.addItem("Raw Δf (filtered)", "raw")
+        if scipy_ok:
+            self.force_source_combo.addItem("Fitted Δf (step 2)", "fit")
+        self.force_source_combo.setToolTip(
+            "Input the Sader-Jarvis / Matrix inversion works on:\n"
+            "• Raw Δf (filtered): the displayed, background-subtracted, filtered "
+            "curve. Honest measurement, but noise and the steep repulsive edge can "
+            "make the inversion spike.\n"
+            "• Fitted Δf (step 2): the smooth Lennard-Jones/Morse fit of Δf. No "
+            "noise, no edge spike; respects the fit range. Needs a usable fit."
+        )
+        self.force_source_combo.currentIndexChanged.connect(self._on_force_source_changed)
+        src_row.addWidget(self.force_source_combo, 1)
+        force_layout.addLayout(src_row)
 
         force_row = QtWidgets.QHBoxLayout()
         self.force_btn = QtWidgets.QPushButton(self._get_icon("transform-scale"), "Convert to force")
         self.force_btn.setToolTip("Convert spectra to force curves (experimental)")
         force_row.addWidget(self.force_btn)
         force_row.addStretch(1)
-        forces_layout.addLayout(force_row)
+        force_layout.addLayout(force_row)
+        analysis_layout.addWidget(force_group)
 
-        analysis_layout.addWidget(forces_group)
+        if not scipy_ok:
+            self.potential_overlay_cb.setEnabled(False)
+            self.potential_model_combo.setEnabled(False)
+            potential_group.setToolTip("SciPy is required for potential fitting and is not available.")
 
         right_layout.addWidget(analysis_group)
 
@@ -4955,6 +7572,13 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         copy_row.addWidget(self.copy_btn)
         copy_row.addWidget(self.copy_table_btn)
         actions_layout.addLayout(copy_row)
+
+        self.show_on_image_btn = QtWidgets.QPushButton("Show on image")
+        self.show_on_image_btn.setToolTip("Focus the main preview on the image the selected spectrum was acquired on")
+        self.show_on_image_btn.clicked.connect(self._on_show_on_image)
+        if not hasattr(self.viewer, "reveal_spectroscopy_source"):
+            self.show_on_image_btn.setVisible(False)
+        actions_layout.addWidget(self.show_on_image_btn)
 
         clear_row = QtWidgets.QHBoxLayout()
         self.clear_sel_btn = QtWidgets.QPushButton(self._get_icon("edit-clear"), "Clear selected")
@@ -4984,7 +7608,11 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self.fit_vs_z_btn.clicked.connect(self._show_fit_vs_z_dialog)
         self.bg_set_btn.clicked.connect(self._on_set_background)
         self.bg_clear_btn.clicked.connect(self._on_clear_background)
-        self.force_btn.clicked.connect(self._on_convert_force)
+        self.force_btn.setCheckable(True)
+        self.force_btn.toggled.connect(self._on_toggle_force)
+        # Force conversion adds a channel to the (shared) spec dicts while
+        # active; make sure it's removed if the window is closed while on.
+        self.finished.connect(lambda *_: self._cleanup_force_on_close())
         self.copy_btn.clicked.connect(self._copy_selected_to_clipboard)
         self.copy_table_btn.clicked.connect(self._copy_table_to_clipboard)
         self.clear_sel_btn.clicked.connect(self._clear_selected)
@@ -5203,6 +7831,8 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._color_cycle = get_color_cycle(self._palette_name)
         if not self._color_cycle:
             self._color_cycle = get_color_cycle(DEFAULT_COLOR_CYCLE)
+        self._auto_color_by_id.clear()
+        self._auto_color_next_idx = 0
         idx = self.palette_combo.findText(self._palette_name)
         self.palette_combo.blockSignals(True)
         if idx >= 0:
@@ -5278,6 +7908,32 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._update_status()
         self._request_plot_update(delay_ms=90)
 
+    def _set_all_checks(self, mode):
+        """Bulk tick/untick the visible (filtered) spectra. mode is one of
+        'all', 'none', 'invert'. Signals are blocked during the loop so the plot
+        is redrawn once at the end rather than per row."""
+        root = self.spec_list.invisibleRootItem()
+        self.spec_list.blockSignals(True)
+        try:
+            for i in range(root.childCount()):
+                item = root.child(i)
+                if item.isHidden():
+                    continue
+                if mode == "all":
+                    new_state = QtCore.Qt.Checked
+                elif mode == "none":
+                    new_state = QtCore.Qt.Unchecked
+                else:  # invert
+                    new_state = (QtCore.Qt.Unchecked
+                                 if item.checkState(0) == QtCore.Qt.Checked
+                                 else QtCore.Qt.Checked)
+                item.setCheckState(0, new_state)
+        finally:
+            self.spec_list.blockSignals(False)
+        self._record_user_action(f"Bulk check: {mode}")
+        self._update_status()
+        self._request_plot_update(delay_ms=20)
+
     def _checked_items(self):
         items = []
         root = self.spec_list.invisibleRootItem()
@@ -5297,9 +7953,11 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         return self._axis_for_spec_with_key(spec, choice_key)
 
     def _axis_for_spec_with_key(self, spec, choice_key):
+        common_origin = _zrel_group_common_origin(self.specs)
         for ax in spec.get("AxisChoices") or []:
             if ax.get("key") == choice_key:
                 vals = np.asarray(ax.get("values", []), dtype=float)
+                vals = _apply_zrel_origin(vals, ax, choice_key, common_origin)
                 return vals, ax.get("label") or "Axis", ax.get("unit") or ""
         if choice_key == "topo":
             extra_topo = _topo_axis_from_spec(spec)
@@ -5315,19 +7973,29 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         return vals, spec.get("AxisLabel") or "Axis", spec.get("AxisUnit") or ""
 
     def _on_set_background(self):
-        self._record_user_action("Set background")
         items = self._selected_items() or self._checked_items()
         if not items:
             QtWidgets.QMessageBox.information(self, "Background", "Select a spectrum to set as background.")
             return
-        spec = items[0].data(0, QtCore.Qt.UserRole)
-        self._background_spec_id = self._spec_id(spec) if spec else None
-        self._log(f"Background set: {Path(spec.get('path','')).name if spec else ''}")
+        self._set_background_spec(items[0].data(0, QtCore.Qt.UserRole))
+
+    def _set_background_spec(self, spec):
+        """Set *spec* as the subtraction background (shared by the button and the
+        list right-click menu)."""
+        if not spec:
+            return
+        self._record_user_action("Set background")
+        self._background_spec_id = self._spec_id(spec)
+        self._log(f"Background set: {Path(spec.get('path','')).name}")
+        # If a force channel is live it was computed against the old background;
+        # rebuild it so the subtraction stays consistent.
+        self._refresh_force_if_active()
         self._request_plot_update()
 
     def _on_clear_background(self):
         self._record_user_action("Clear background")
         self._background_spec_id = None
+        self._refresh_force_if_active()
         self._request_plot_update()
 
     def _background_for(self, spec):
@@ -5366,8 +8034,10 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
             scale = 1e-9
         elif unit in ("pm",):
             scale = 1e-12
-        elif unit in ("um",):
+        elif unit in ("um", "µm", "μm"):
             scale = 1e-6
+        elif unit in ("å", "ang", "angstrom", "angstroms"):
+            scale = 1e-10
         if scale is None:
             return None, None
         axis_m = np.asarray(axis_vals, dtype=float) * scale
@@ -5375,65 +8045,111 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         return axis_m, axis_nm
 
     @staticmethod
-    def _force_from_freq_shift(z_m: np.ndarray, df_hz: np.ndarray, f0: float, k: float, amp_m: float) -> Optional[np.ndarray]:
-        """Sader-Jarvis style force reconstruction (numeric trapz)."""
-        if f0 <= 0 or k <= 0 or amp_m <= 0:
-            return None
+    def _force_sader_jarvis(z_m, df_hz, f0, k, amp_m):
+        """Sader-Jarvis force inversion (Sader & Jarvis, APL 84, 1801 (2004)).
+
+        z in metres, df in Hz, amp_m in metres, k in N/m, f0 in Hz -> force in
+        newtons. Stable analytic form (recommended); a few-percent to ~10%
+        approximation vs the exact matrix inverse at finite amplitude."""
+        trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
         z = np.asarray(z_m, dtype=float)
         df = np.asarray(df_hz, dtype=float)
-        if z.size < 2 or df.size != z.size:
+        if z.size < 3 or df.size != z.size:
             return None
         order = np.argsort(z)
-        z_sorted = z[order]
-        df_sorted = df[order]
-        F_sorted = np.zeros_like(df_sorted)
-        n = len(z_sorted)
-        for i in range(n - 1):
-            u = z_sorted[i + 1 :] - z_sorted[i]
-            if u.size == 0:
-                continue
-            integrand = (df_sorted[i + 1 :] / f0) * np.sin(u / amp_m)
-            F_sorted[i] = 2.0 * k * amp_m * np.trapz(integrand, u)
+        t = z[order]
+        Omega = df[order] / f0
+        dOmega = np.gradient(Omega, t)
+        A = float(amp_m)
+        n = len(t)
+        F = np.zeros(n)
+        for j in range(n - 1):
+            tt = t[j + 1:]
+            dt = tt - t[j]
+            integrand = (1.0 + np.sqrt(A) / (8.0 * np.sqrt(np.pi * dt))) * Omega[j + 1:] \
+                - (A ** 1.5) / np.sqrt(2.0 * dt) * dOmega[j + 1:]
+            F[j] = 2.0 * k * trapz(integrand, tt)
         if n > 1:
-            F_sorted[-1] = F_sorted[-2]
-        F = np.empty_like(F_sorted)
-        F[order] = F_sorted
-        return F
+            F[-1] = F[-2]
+        out = np.empty_like(F)
+        out[order] = F
+        return out
 
-    def _on_convert_force(self):
-        # Prompt for parameters
+    @staticmethod
+    def _force_matrix(z_m, df_hz, f0, k, amp_m):
+        """Giessibl matrix-method force inversion.
+
+        Deconvolves the semicircle amplitude-weighted force gradient
+        (df = (f0/2k)<k_ts>). Exact on clean data, but being a deconvolution it
+        amplifies noise, so Sader-Jarvis is preferred for noisy curves."""
+        trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+        z = np.asarray(z_m, dtype=float)
+        df = np.asarray(df_hz, dtype=float)
+        if z.size < 3 or df.size != z.size:
+            return None
+        order = np.argsort(z)
+        zt = z[order]
+        dft = df[order]
+        A = float(amp_m)
+        n = len(zt)
+        # Normalised semicircle averaging matrix over [z_i, z_i + 2A].
+        M = np.zeros((n, n))
+        for i in range(n):
+            u = zt - (zt[i] + A)
+            w = np.where(np.abs(u) <= A, np.sqrt(np.maximum(A * A - u * u, 0.0)), 0.0)
+            s = w.sum()
+            if s > 0:
+                M[i] = w / s
+        try:
+            kts = (2.0 * k / f0) * np.linalg.lstsq(M, dft, rcond=None)[0]
+        except Exception:
+            return None
+        F = np.array([trapz(kts[i:], zt[i:]) for i in range(n)])
+        out = np.empty_like(F)
+        out[order] = F
+        return out
+
+    @staticmethod
+    def _force_from_freq_shift(z_m, df_hz, f0, k, amp_m, method="Sader-Jarvis"):
+        """Dispatch to the selected force-inversion method; never raises."""
+        if f0 <= 0 or k <= 0 or amp_m <= 0:
+            return None
+        try:
+            if str(method).lower().startswith("matrix"):
+                return SpectroscopyCompareDialog._force_matrix(z_m, df_hz, f0, k, amp_m)
+            return SpectroscopyCompareDialog._force_sader_jarvis(z_m, df_hz, f0, k, amp_m)
+        except Exception:
+            return None
+
+    _FORCE_LABEL = "Force"
+    # Force is stored/plotted in piconewtons; the inversion works in SI (N), so
+    # the raw result is scaled by this factor before it becomes the channel.
+    _FORCE_UNIT = "pN"
+    _FORCE_SCALE = 1e12  # N -> pN
+
+    def _prompt_force_params(self):
+        """Modal entry for the Sader-Jarvis parameters; returns a params dict
+        (f0/k/A/Q/method) or None if cancelled/invalid."""
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Convert to force")
         form = QtWidgets.QFormLayout(dlg)
         f0_edit = QtWidgets.QDoubleSpinBox(); f0_edit.setRange(0, 1e9); f0_edit.setDecimals(3); f0_edit.setValue(0.0)
         k_edit = QtWidgets.QDoubleSpinBox(); k_edit.setRange(0, 1e6); k_edit.setDecimals(3); k_edit.setValue(0.0)
-        a_edit = QtWidgets.QDoubleSpinBox(); a_edit.setRange(0, 1e-3); a_edit.setDecimals(11); a_edit.setSingleStep(1e-11); a_edit.setValue(50e-12)
+        a_edit = QtWidgets.QDoubleSpinBox(); a_edit.setRange(0.0, 100000.0); a_edit.setDecimals(2); a_edit.setSingleStep(1.0); a_edit.setSuffix(" pm"); a_edit.setValue(50.0)
         q_edit = QtWidgets.QDoubleSpinBox(); q_edit.setRange(0, 1e6); q_edit.setDecimals(2); q_edit.setValue(0.0)
-        method_combo = QtWidgets.QComboBox(); method_combo.addItems(["saderF", "matrixF"])
+        method_combo = QtWidgets.QComboBox(); method_combo.addItems(["Sader-Jarvis", "Matrix (Giessibl)"])
         form.addRow("f0 (Hz)", f0_edit)
         form.addRow("Spring constant k (N/m)", k_edit)
-        form.addRow("Amplitude A (m)", a_edit)
+        form.addRow("Amplitude A (pm)", a_edit)
         form.addRow("Q", q_edit)
         form.addRow("Method", method_combo)
-        # load persisted params if available
         cfg = load_config()
         last_force = cfg.get("force_params", {})
-        try:
-            f0_edit.setValue(float(last_force.get("f0", f0_edit.value())))
-        except Exception:
-            pass
-        try:
-            k_edit.setValue(float(last_force.get("k", k_edit.value())))
-        except Exception:
-            pass
-        try:
-            a_edit.setValue(float(last_force.get("A", a_edit.value())))
-        except Exception:
-            pass
-        try:
-            q_edit.setValue(float(last_force.get("Q", q_edit.value())))
-        except Exception:
-            pass
+        for edit, pkey in ((f0_edit, "f0"), (k_edit, "k"), (a_edit, "A_pm"), (q_edit, "Q")):
+            try:
+                edit.setValue(float(last_force.get(pkey, edit.value())))
+            except Exception:
+                pass
         mth = str(last_force.get("method") or "")
         if mth in [method_combo.itemText(i) for i in range(method_combo.count())]:
             method_combo.setCurrentText(mth)
@@ -5447,76 +8163,257 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         form.addRow(btns)
         btns.accepted.connect(dlg.accept); btns.rejected.connect(dlg.reject)
+        def _params():
+            a_pm = a_edit.value()
+            return {"f0": f0_edit.value(), "k": k_edit.value(),
+                    "A_pm": a_pm, "A": a_pm * 1e-12,  # A in metres for the SI calc
+                    "Q": q_edit.value(), "method": method_combo.currentText()}
         def _remember():
-            params = {
-                "f0": f0_edit.value(),
-                "k": k_edit.value(),
-                "A": a_edit.value(),
-                "Q": q_edit.value(),
-                "method": method_combo.currentText(),
-            }
-            cfg = load_config()
-            cfg["force_params"] = params
-            save_config(cfg)
+            c = load_config(); c["force_params"] = _params(); save_config(c)
         def _clear():
-            cfg = load_config()
-            if "force_params" in cfg:
-                cfg.pop("force_params", None)
-                save_config(cfg)
+            c = load_config()
+            if "force_params" in c:
+                c.pop("force_params", None); save_config(c)
         remember_btn.clicked.connect(_remember)
         clear_btn.clicked.connect(_clear)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return
-        f0 = f0_edit.value(); k = k_edit.value(); A = a_edit.value(); Q = q_edit.value(); method = method_combo.currentText()
-        if f0 <= 0 or k <= 0 or A <= 0:
+            return None
+        params = _params()
+        if params["f0"] <= 0 or params["k"] <= 0 or params["A"] <= 0:
             QtWidgets.QMessageBox.information(self, "Force conversion", "Enter positive values for f0, k, and A.")
+            return None
+        return params
+
+    def _force_source_mode(self):
+        """'raw' (filtered Δf) or 'fit' (smooth fitted Δf) - the input the force
+        inversion runs on."""
+        combo = getattr(self, "force_source_combo", None)
+        if combo is None:
+            return "raw"
+        data = combo.currentData()
+        return data if data in ("raw", "fit") else "raw"
+
+    def _on_force_source_changed(self, _idx=None):
+        self._record_user_action(f"Force source → {self._force_source_mode()}")
+        self._refresh_force_if_active()
+
+    def _refresh_force_if_active(self):
+        """Rebuild the live force channel in place (reusing the last parameters,
+        no re-prompt) after a change - source, background - that invalidates it.
+        No-op when the force channel is off."""
+        if not getattr(self, "force_btn", None) or not self.force_btn.isChecked():
             return
-        items = self._selected_items() or self._checked_items()
-        if not items:
-            QtWidgets.QMessageBox.information(self, "Force conversion", "Select spectra to convert.")
+        params = getattr(self, "_last_force_params", None)
+        self._deactivate_force()
+        self._force_toggle_guard = True
+        self.force_btn.setChecked(False)
+        self._force_toggle_guard = False
+        if self._activate_force(params=params):
+            self._force_toggle_guard = True
+            self.force_btn.setChecked(True)
+            self._force_toggle_guard = False
+        self._update_force_button_label()
+
+    def _force_source_channel(self):
+        """A non-force channel to reconstruct force from (the current one, or
+        the first available)."""
+        cur = self.channel_combo.currentText()
+        if cur and cur != self._FORCE_LABEL:
+            return cur
+        for i in range(self.channel_combo.count()):
+            name = self.channel_combo.itemText(i)
+            if name and name != self._FORCE_LABEL:
+                return name
+        return ""
+
+    def _on_toggle_force(self, checked):
+        # Reversible parallel channel: on -> add the "Force" (pN) channel alongside the raw
+        # channels; off -> remove it. Raw data is never overwritten.
+        if getattr(self, "_force_toggle_guard", False):
             return
-        new_specs = []
-        failed = 0
-        channel = self.channel_combo.currentText()
-        for item in items:
+        if checked:
+            if not self._activate_force():
+                self._force_toggle_guard = True
+                self.force_btn.setChecked(False)
+                self._force_toggle_guard = False
+        else:
+            self._deactivate_force()
+        self._update_force_button_label()
+
+    def _update_force_button_label(self):
+        on = self.force_btn.isChecked()
+        self.force_btn.setText("Force channel: on" if on else "Convert to force")
+        self.force_btn.setToolTip(
+            "A reconstructed 'Force' channel (pN) is available in the channel list; "
+            "raw data is kept. Toggle off to remove it."
+            if on else
+            "Add a Sader-Jarvis force channel alongside the raw data (reversible - "
+            "toggle off to remove). Needs a Z/distance axis and a frequency-shift channel.")
+
+    def _activate_force(self, params=None):
+        if params is None:
+            params = self._prompt_force_params()
+        if params is None:
+            return False
+        self._last_force_params = params
+        source = self._force_source_channel()
+        if not source:
+            QtWidgets.QMessageBox.information(self, "Force conversion", "No source channel to convert.")
+            return False
+        f0, k, A = params["f0"], params["k"], params["A"]
+        mode = self._force_source_mode()
+        rel_zero = self._relative_zero_shift()  # for display-coordinate fitting
+        label = self._FORCE_LABEL
+        modified_items = []
+        bad_unit = 0
+        no_fit = 0
+        # PyQt returns a *copy* of the spec stored on each list item, so add the
+        # force channel to that copy and write it back with setData; the plot/
+        # gather/copy read the item data, and the shared viewer spec dicts are
+        # never mutated.
+        root = self.spec_list.invisibleRootItem()
+        self.spec_list.blockSignals(True)
+        for i in range(root.childCount()):
+            item = root.child(i)
             spec = item.data(0, QtCore.Qt.UserRole)
             if not spec:
                 continue
-            axis_vals, axis_label, axis_unit = self._axis_for_spec(spec)
-            axis_m, axis_nm = self._axis_to_meters(axis_vals, axis_unit)
-            if axis_m is None or axis_nm is None:
-                failed += 1
-                continue
             channels = spec.get("channels") or {}
-            if channel not in channels:
-                failed += 1
+            if source not in channels:
                 continue
-            y_vals = np.asarray(channels.get(channel), dtype=float)
-            bg = self._background_for(spec)
-            y_vals = self._subtract_background(axis_vals, y_vals, bg)
-            force_curve = self._force_from_freq_shift(axis_m, y_vals, f0=f0, k=k, amp_m=A)
-            if force_curve is None:
-                failed += 1
+            # The conversion depends on the z-axis *displacement* unit, so the
+            # axis is taken in metres from its own unit (m/nm/pm/um/A).
+            axis_vals, _axis_label, axis_unit = self._axis_for_spec(spec)
+            axis_m, _axis_nm = self._axis_to_meters(axis_vals, axis_unit)
+            if axis_m is None:
+                bad_unit += 1
                 continue
-            force_label = f"Force_{channel}"
-            new_spec = dict(spec)
-            new_spec["channels"] = {force_label: force_curve}
-            new_spec["unit_map"] = {force_label: "N"}
-            new_spec["AxisLabel"] = "Z"
-            new_spec["AxisUnit"] = "nm"
-            new_spec["V"] = axis_nm
-            new_spec["AxisChoices"] = [{"key": "primary", "label": "Z", "unit": "nm", "values": axis_nm}]
-            new_spec["ForceMethod"] = method
-            new_spec["ForceParams"] = {"f0": f0, "A": A, "Q": Q, "k": k}
-            new_specs.append(new_spec)
-        if not new_specs:
-            QtWidgets.QMessageBox.information(self, "Force conversion", "Could not convert the selected spectra (check that the axis is Z/distance and parameters are valid).")
+            spec_id = item.data(0, QtCore.Qt.UserRole + 1)
+            # Δf that feeds the inversion: background-subtracted and filtered, so
+            # the displayed smoothing actually tames the inversion.
+            y_raw = np.asarray(channels.get(source), dtype=float)
+            y_base = self._subtract_background(axis_vals, y_raw, self._background_for(spec))
+            y_unit_raw = self._channel_unit_for_spec(spec, source)
+            df_used, _yu = self._apply_data_filters(axis_vals, y_base, y_unit_raw, axis_unit)
+            df_used = np.asarray(df_used, dtype=float)
+            if mode == "fit":
+                # Replace the noisy Δf with the smooth fitted model. Fit, window
+                # and evaluate in *display* coordinates (so the range window,
+                # read off the visible axis, lines up even with Relative Z on),
+                # but invert against absolute z in metres. Evaluate/invert only
+                # over the fit's valid span [x_min, x_max]; outside it the model
+                # may be an unphysical extrapolation (LJ is NaN left of its
+                # pinned singularity), so those samples stay undefined.
+                disp_x = self._display_x_for_spec(spec, axis_vals, axis_unit, rel_zero)
+                res = self._potential_fit_for_curve(spec_id, disp_x, df_used)
+                if not res:
+                    no_fit += 1
+                    continue
+                xmin, xmax = res.get("x_min"), res.get("x_max")
+                mask = np.isfinite(disp_x) & (disp_x >= xmin) & (disp_x <= xmax)
+                if int(mask.sum()) < 5:
+                    no_fit += 1
+                    continue
+                try:
+                    df_sub = np.asarray(res["func"](disp_x[mask]), dtype=float)
+                except Exception:
+                    no_fit += 1
+                    continue
+                force_sub = self._force_from_freq_shift(axis_m[mask], df_sub, f0=f0, k=k,
+                                                        amp_m=A, method=params.get("method"))
+                if force_sub is None:
+                    continue
+                # Full-length channel, NaN where the fit is not defined so the
+                # plot simply leaves those z blank.
+                force_curve = np.full(axis_vals.shape, np.nan, dtype=float)
+                force_curve[mask] = force_sub
+            else:
+                force_curve = self._force_from_freq_shift(axis_m, df_used, f0=f0, k=k, amp_m=A,
+                                                          method=params.get("method"))
+                if force_curve is None:
+                    continue
+            channels[label] = np.asarray(force_curve, dtype=float) * self._FORCE_SCALE
+            spec["channels"] = channels
+            unit_map = spec.get("unit_map") or {}
+            unit_map[label] = self._FORCE_UNIT
+            spec["unit_map"] = unit_map
+            spec["ForceMethod"] = params["method"]
+            spec["ForceParams"] = {"f0": f0, "A": A, "Q": params["Q"], "k": k,
+                                   "source": source, "input": mode}
+            item.setData(0, QtCore.Qt.UserRole, spec)
+            modified_items.append(item)
+        self.spec_list.blockSignals(False)
+        if not modified_items:
+            if no_fit and mode == "fit":
+                msg = ("Could not convert from the fit: no usable potential fit for the "
+                       "displayed spectra. Check 'Show potential fit' produces a fit "
+                       "(and, if set, that the fit range keeps enough points), or switch "
+                       "'Force from' to Raw Δf.")
+            elif bad_unit:
+                msg = ("Could not convert: the Z axis must be a distance (m/nm/pm/µm/Å). "
+                       "Select a Z/distance axis (not bias) and a frequency-shift channel.")
+            else:
+                msg = ("Could not convert the selected channel to force. Check the parameters "
+                       "and that the channel is a frequency shift (Δf).")
+            QtWidgets.QMessageBox.information(self, "Force conversion", msg)
+            return False
+        self._force_source = source
+        self._force_modified_items = modified_items
+        # The 'Force' channel's *contents* just changed (e.g. raw -> fitted),
+        # but the plot's per-curve cache keys on the channel *name*, which is
+        # unchanged. Drop the stale Force entries so the plot re-reads the new
+        # values instead of redrawing the previous force curve.
+        self._invalidate_force_curve_cache()
+        # Expose the parallel channel and select it, without a full repopulate
+        # (which would reset the channel to 'df').
+        if self.channel_combo.findText(label) < 0:
+            self.channel_combo.addItem(label)
+        self.channel_combo.setCurrentText(label)
+        self._update_plot()
+        return True
+
+    def _invalidate_force_curve_cache(self):
+        """Purge cached plot curves for the reconstructed Force channel (its
+        name is stable but its data is rebuilt on every conversion)."""
+        label = self._FORCE_LABEL
+        cache = getattr(self, "_curve_data_cache", None)
+        if not cache:
             return
-        # Open a twin dialog with converted data
-        twin = SpectroscopyCompareDialog(new_specs, parent=self.parent(), palette_name=self._palette_name)
-        twin.setWindowTitle("Spectroscopy comparison (force)")
-        twin.show()
-        self._popup_refs.append(twin)
+        for key in [k for k in cache if isinstance(k, tuple) and len(k) > 1 and k[1] == label]:
+            cache.pop(key, None)
+
+    def _remove_force_from_items(self):
+        label = self._FORCE_LABEL
+        self._invalidate_force_curve_cache()
+        self.spec_list.blockSignals(True)
+        for item in getattr(self, "_force_modified_items", []) or []:
+            try:
+                spec = item.data(0, QtCore.Qt.UserRole)
+                if not spec:
+                    continue
+                (spec.get("channels") or {}).pop(label, None)
+                (spec.get("unit_map") or {}).pop(label, None)
+                item.setData(0, QtCore.Qt.UserRole, spec)
+            except Exception:
+                continue
+        self.spec_list.blockSignals(False)
+        self._force_modified_items = []
+
+    def _deactivate_force(self):
+        label = self._FORCE_LABEL
+        self._remove_force_from_items()
+        source = getattr(self, "_force_source", None)
+        if source and self.channel_combo.findText(source) >= 0:
+            self.channel_combo.setCurrentText(source)
+        idx = self.channel_combo.findText(label)
+        if idx >= 0:
+            self.channel_combo.removeItem(idx)
+        self._update_plot()
+
+    def _cleanup_force_on_close(self):
+        """Drop the force channel from the list items if the window is closed
+        while the toggle is still on (original specs are never touched)."""
+        self._remove_force_from_items()
 
     def _channel_unit_for_spec(self, spec, channel_label):
         unit_map = spec.get('unit_map') or {}
@@ -5563,6 +8460,8 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
     def _update_plot(self):
         if self._can_incremental_plot_update() and self._update_plot_incremental():
             return
+        # We are now committed to a full, clearing redraw; consume the flag.
+        self._force_full_replot = False
         channel = self.channel_combo.currentText()
         self.ax.clear()
         self._empty_plot_text = None
@@ -5585,7 +8484,6 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         relative_nm = bool(self._relative_zero_enabled)
 
         selected_ids = {item.data(0, QtCore.Qt.UserRole + 1) for item in self._selected_items()}
-        colors = self._iter_color_cycle()
         plot_items = self._visible_plot_items()
         visible_count = max(1, len(plot_items))
         plotted = 0
@@ -5595,18 +8493,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         filter_sig = self._filter_signature()
 
         # Precompute relative zero if needed
-        rel_zero = 0.0
-        if relative_nm:
-            mins = []
-            for item in self._selected_items() or self._checked_items():
-                spec = item.data(0, QtCore.Qt.UserRole)
-                if not spec:
-                    continue
-                axis_vals, _, unit = self._axis_for_spec(spec)
-                if axis_vals.size and unit == "nm":
-                    mins.append(np.nanmin(axis_vals))
-            if mins:
-                rel_zero = min(mins)
+        rel_zero = self._relative_zero_shift()
 
         # Plot both checked items AND selected items (even if unchecked) for quick preview
         y_units_after_filters = []
@@ -5625,9 +8512,10 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
             # Apply waterfall offset
             y_data = y_filtered + (plotted * offset_val) if waterfall else y_filtered
             x_plot = x_vals - rel_zero if (relative_nm and axis_unit == "nm") else x_vals
+            x_disp_full = x_plot  # pre-decimation display x, used for fitting
             x_plot, y_plot = self._decimate_curve_for_display(x_plot, y_data, visible_count)
             y_units_after_filters.append(y_unit_final or y_unit_raw)
-            color = next(colors)
+            color = self._auto_color_for_spec(spec_id)
             highlight = spec_id in selected_ids or not selected_ids
             label_txt = self._display_name(spec)
             if self._legend_filename_only:
@@ -5668,6 +8556,14 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
             plotted += 1
             if spec_id in self._fit_results:
                 self._draw_fit_for_spec(spec_id, color, offset=(plotted - 1) * offset_val if waterfall else 0.0)
+            # The potential fit models Δf, so its overlay only makes sense on the
+            # Δf (or similar) channel - never on the reconstructed Force channel,
+            # where fitting a Morse/LJ shape to force data is meaningless.
+            if self._potential_fit_overlay and channel != self._FORCE_LABEL:
+                self._draw_potential_fit_for_curve(
+                    spec_id, x_disp_full, y_filtered, color,
+                    offset=(plotted - 1) * offset_val if waterfall else 0.0,
+                )
         if plotted == 0:
             self._set_empty_plot_text()
         elif self._plot_legend_enabled:
@@ -5717,6 +8613,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self.ax.set_yscale("log" if self._plot_y_log else "linear")
         self._apply_grid_and_ticks()
         self._update_position_inset_compare()
+        _style_plot_chrome(self, self.fig)
         self._apply_font_scale()
         # canvas.draw_idle() is called in _apply_font_scale
         self._plotted_spec_ids = plotted_spec_ids
@@ -5725,71 +8622,30 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
     def _load_thumbnail_array_for_inset(self, file_key):
         viewer = getattr(self, "viewer", None)
         if not viewer or not file_key:
-            return None
+            return None, None
+        width = int(getattr(viewer, "thumb_size_px", 160))
+        height = max(48, int(round(width * 0.75)))
         cache_key = None
         try:
-            width = int(getattr(viewer, "thumb_size_px", 160))
-            height = max(48, int(round(width * 0.75)))
-            cmap = viewer.thumb_cmap_combo.currentText() if hasattr(viewer, "thumb_cmap_combo") else None
-            cmap = cmap or getattr(viewer, "thumb_cmap", "viridis")
-            channel_idx = viewer.channel_dropdown.currentIndex() if hasattr(viewer, "channel_dropdown") else 0
+            channel_idx, cmap = _preview_channel_cmap_for_file(viewer, file_key)
             cache_key = (str(file_key), width, height, str(cmap), int(channel_idx))
             cached = self._compare_inset_image_cache.get(cache_key)
             if cached is not None:
                 self._compare_inset_image_cache.move_to_end(cache_key)
-                return np.array(cached, copy=True)
+                tinted_cached, crop_info_cached = cached
+                return np.array(tinted_cached, copy=True), crop_info_cached
         except Exception:
             cache_key = None
-        thumb = None
-        label = getattr(viewer, "_thumb_labels", {}).get(file_key) if hasattr(viewer, "_thumb_labels") else None
-        if label is not None and label.pixmap():
-            thumb = label.pixmap()
-        if thumb is None:
-            try:
-                thumb = viewer._thumbnail_pixmap_for_file(file_key, channel_idx, width, height, cmap)
-            except Exception:
-                return None
-        if thumb is None:
-            return None
-        qimg = thumb.toImage().convertToFormat(QtGui.QImage.Format_RGBA8888)
-        ptr = qimg.bits()
-        ptr.setsize(qimg.byteCount())
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((qimg.height(), qimg.width(), 4))
-        arr = arr[..., :3] / 255.0
-        gray = np.clip(arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114, 0.0, 1.0)
-        tinted = np.stack([gray, gray, gray], axis=-1)
+        rgb, crop_info = _render_inset_background(viewer, file_key, width, height)
+        if rgb is None:
+            return None, None
         if cache_key is not None:
-            self._compare_inset_image_cache[cache_key] = np.array(tinted, copy=True)
+            self._compare_inset_image_cache[cache_key] = (np.array(rgb, copy=True), crop_info)
             while len(self._compare_inset_image_cache) > 6:
                 self._compare_inset_image_cache.popitem(last=False)
-        return tinted
+        return rgb, crop_info
 
-    def _spec_thumbnail_coords_for_compare(self, spec=None, file_key=None, dims=None):
-        viewer = getattr(self, "viewer", None)
-        spec = spec or None
-        if spec is None:
-            items = self._checked_items() or self._selected_items()
-            if items:
-                spec = items[0].data(0, QtCore.Qt.UserRole)
-        file_key = file_key or (str(spec.get("image_key") or "") if spec else "")
-        if not viewer or not file_key or spec is None:
-            return None
-        header, _ = viewer.headers.get(file_key, (None, None))
-        if header is None:
-            return None
-        if dims and len(dims) == 2:
-            width = max(2, int(dims[0]))
-            height = max(2, int(dims[1]))
-        else:
-            width = int(getattr(viewer, "thumb_size_px", 160))
-            height = max(48, int(round(width * 0.75)))
-        try:
-            coords = viewer._map_spec_to_pixels(spec, header, width, height, file_key=file_key)
-        except Exception:
-            coords = None
-        return coords
-
-    def _collect_inset_markers_compare(self, base_key, image_dims=None):
+    def _collect_inset_markers_compare(self, base_key, image_dims=None, crop_info=None, current_spec_id=None):
         viewer = getattr(self, "viewer", None)
         if not viewer or not base_key:
             return []
@@ -5813,16 +8669,15 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
                 header, _ = viewer.headers.get(key, (None, None))
             except Exception:
                 header = None
-            try:
-                coords = viewer._map_spec_to_pixels(spec, header, width, height, file_key=key)
-            except Exception:
-                coords = None
+            coords = _spec_display_coords(viewer, spec, header, key, width, height, crop_info=crop_info)
             if coords is None:
                 continue
             spec_id = self._spec_id(spec)
             line = self._line_map.get(spec_id)
             color = line.get_color() if line else "#d65f5f"
-            markers.append({"color": color, "coords": coords, "spec": spec})
+            markers.append({"color": color, "coords": coords, "spec": spec, "is_current": spec_id == current_spec_id})
+        if not self._inset_show_other_points and any(m["is_current"] for m in markers):
+            markers = [m for m in markers if m["is_current"]]
         return markers
 
     def _update_position_inset_compare(self):
@@ -5840,14 +8695,15 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
             return
         base_spec = items[0].data(0, QtCore.Qt.UserRole)
         base_key = str(base_spec.get("image_key") or "") if base_spec else ""
-        image = self._load_thumbnail_array_for_inset(base_key)
+        current_spec_id = self._spec_id(base_spec) if base_spec else None
+        image, crop_info = self._load_thumbnail_array_for_inset(base_key)
         image_dims = None
         if image is not None:
             try:
                 image_dims = (int(image.shape[1]), int(image.shape[0]))
             except Exception:
                 image_dims = None
-        markers = self._collect_inset_markers_compare(base_key, image_dims=image_dims)
+        markers = self._collect_inset_markers_compare(base_key, image_dims=image_dims, crop_info=crop_info, current_spec_id=current_spec_id)
         if image is None or not markers:
             return
         if self._inset_bbox is None:
@@ -5858,23 +8714,29 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._position_inset_ax.set_xticks([])
         self._position_inset_ax.set_yticks([])
         self._position_inset_ax.set_title("Position", fontsize=7.5 * getattr(self, "_font_scale", 1.0))
+        marker_shape = _INSET_MPL_MARKER_BY_SYMBOL.get(self._inset_marker_symbol, "o")
         raw_coords = []
         for marker in markers:
             color = marker.get("color")
             coords = marker.get("coords")
             spec = marker.get("spec")
+            is_current = bool(marker.get("is_current"))
             try:
                 raw_coords.append((spec, float(coords[0]), float(coords[1])))
                 self._position_inset_ax.scatter(
                     coords[0],
                     coords[1],
-                    s=50,
+                    s=self._inset_marker_size,
+                    marker=marker_shape,
                     facecolors="none",
-                    edgecolors=color,
-                    linewidths=1.5,
+                    edgecolors=self._inset_marker_color_override or color,
+                    linewidths=2.0 if is_current else 1.3,
+                    alpha=1.0 if is_current else 0.55,
+                    zorder=5 if is_current else 3,
                 )
             except Exception:
                 continue
+        _draw_inset_resize_handle(self._position_inset_ax)
         for badge in spectro_overlays._stack_badges_from_coords(raw_coords):
             try:
                 self._position_inset_ax.text(
@@ -5899,14 +8761,41 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         bbox = self._position_inset_ax.bbox
         if bbox is None:
             return
+        if _near_resize_handle(bbox, event.x, event.y):
+            self._inset_resizing = True
+            self._inset_resize_start = (
+                event.x - bbox.x1,
+                event.y - bbox.y0,
+                list(self._inset_bbox or [0.04, 0.04, 0.26, 0.26]),
+            )
+            return
         if bbox.contains(event.x, event.y):
             self._inset_dragging = True
             self._inset_drag_offset = (event.x - bbox.x0, event.y - bbox.y0)
 
     def _on_inset_motion(self, event):
-        if not self._inset_dragging or self._position_inset_ax is None:
+        if self._position_inset_ax is None:
             return
         if event.x is None or event.y is None:
+            return
+        if self._inset_resizing:
+            new_bbox = _resize_inset_bbox(self.ax, self._inset_resize_start, event.x, event.y)
+            if new_bbox is None:
+                return
+            self._inset_bbox = new_bbox
+            try:
+                self._position_inset_ax.set_axes_locator(InsetPosition(self.ax, self._inset_bbox))
+            except Exception:
+                pass
+            self.canvas.draw_idle()
+            return
+        if not self._inset_dragging:
+            bbox = self._position_inset_ax.bbox
+            if bbox is not None:
+                if _near_resize_handle(bbox, event.x, event.y):
+                    self._set_canvas_cursor(QtCore.Qt.SizeFDiagCursor)
+                elif bbox.contains(event.x, event.y):
+                    self._set_canvas_cursor(QtCore.Qt.SizeAllCursor)
             return
         bbox = self._position_inset_ax.bbox
         if bbox is None:
@@ -5935,6 +8824,8 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         if event is None or event.button != MouseButton.LEFT:
             return
         self._inset_dragging = False
+        self._inset_resizing = False
+        self._inset_resize_start = None
 
     def _validate_log_axes(self):
         if not getattr(self, "_plot_x_log", False) and not getattr(self, "_plot_y_log", False):
@@ -6007,11 +8898,22 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._plot_line_width = float(min(4.5, max(0.4, self._plot_line_width + delta)))
         self._request_plot_update(delay_ms=20)
 
-    def _iter_color_cycle(self):
-        palette = self._color_cycle or get_color_cycle(DEFAULT_COLOR_CYCLE)
+    def _auto_color_for_spec(self, spec_id):
+        """Return this spectrum's cached auto color, assigning the next
+        unused one (by a persistent cycle position, not by this render
+        pass's item order) the first time it's seen - so a spectrum's color
+        stays stable across reorders/filtering, and a newly-appended curve
+        doesn't collide with a color already assigned to an existing one."""
+        color = self._auto_color_by_id.get(spec_id)
+        if color is not None:
+            return color
+        palette = self._color_cycle or get_color_cycle(DEFAULT_COLOR_CYCLE) or []
         if not palette:
-            palette = get_color_cycle(DEFAULT_COLOR_CYCLE)
-        return itertools.cycle(palette)
+            return "#1f77b4"
+        color = palette[self._auto_color_next_idx % len(palette)]
+        self._auto_color_next_idx += 1
+        self._auto_color_by_id[spec_id] = color
+        return color
 
     def _update_color_swatches(self):
         container = getattr(self, "palette_swatches", None)
@@ -6083,6 +8985,8 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._color_cycle = get_color_cycle(self._palette_name)
         if not self._color_cycle:
             self._color_cycle = get_color_cycle(DEFAULT_COLOR_CYCLE)
+        self._auto_color_by_id.clear()
+        self._auto_color_next_idx = 0
         parent = self.parent()
         if parent and hasattr(parent, "set_spectro_color_cycle"):
             parent.set_spectro_color_cycle(self._palette_name)
@@ -6128,11 +9032,151 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
                 "display_name": self._display_name(spec),
             }
 
-    def _spec_id_by_name(self, name):
-        for spec in self.specs:
-            if self._display_name(spec) == name:
-                return self._spec_id(spec)
-        return None
+    # ------------------------------------------------------------------
+    # Analytic potential fits (Lennard-Jones / Morse)
+    # ------------------------------------------------------------------
+    def _refresh_fit_consumers(self):
+        """Re-run whatever currently depends on the potential fit after its
+        configuration (model/range) changed: the dashed overlay and/or the
+        fitted-Δf force channel. The fit cache is dropped first so both refit."""
+        self._potential_fit_cache.clear()
+        if self._potential_fit_overlay:
+            self._force_full_replot = True
+            self._update_plot()
+        if self._force_source_mode() == "fit":
+            self._refresh_force_if_active()
+
+    def _on_potential_model_changed(self, name):
+        self._potential_model = name or potential_fits.MODELS[0]
+        self._record_user_action(f"Potential model → {self._potential_model}")
+        self._refresh_fit_consumers()
+
+    def _on_potential_overlay_toggled(self, checked):
+        self._potential_fit_overlay = bool(checked)
+        self._record_user_action(f"Potential fit overlay → {'on' if checked else 'off'}")
+        # Turning the overlay off must clear the dashed fits already on the
+        # canvas; the incremental path would leave them, so force a full redraw.
+        self._force_full_replot = True
+        self._update_plot()
+
+    def _set_potential_range_enabled(self):
+        """Enable the min/max/view widgets only when 'Limit fit range' is on
+        (and fitting is available). The range is independent of the overlay so
+        it can shape the fitted-Δf force without drawing the overlay."""
+        cb = getattr(self, "potential_range_cb", None)
+        active = bool(cb and cb.isEnabled() and cb.isChecked())
+        for w in (self.potential_zmin_spin, self.potential_zmax_spin, self.potential_range_view_btn):
+            w.setEnabled(active)
+
+    def _current_potential_range(self):
+        """The active [zmin, zmax] window, or None when range-limiting is off or
+        the bounds are not a valid (min < max) interval."""
+        if not getattr(self, "potential_range_cb", None) or not self.potential_range_cb.isChecked():
+            return None
+        lo = float(self.potential_zmin_spin.value())
+        hi = float(self.potential_zmax_spin.value())
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return None
+        return (lo, hi)
+
+    def _on_potential_range_toggled(self, checked):
+        self._set_potential_range_enabled()
+        # A blank [0, 0] window is useless; seed it from the current view the
+        # first time the user turns range-limiting on.
+        if checked and self.potential_zmax_spin.value() <= self.potential_zmin_spin.value():
+            self._on_potential_range_from_view()
+        self._potential_fit_range = self._current_potential_range()
+        self._record_user_action(f"Potential fit range → {'on' if checked else 'off'}")
+        self._refresh_fit_consumers()
+
+    def _on_potential_range_edited(self, _value=None):
+        self._potential_fit_range = self._current_potential_range()
+        if self.potential_range_cb.isChecked():
+            self._potential_fit_cache.clear()
+            if self._potential_fit_overlay:
+                self._force_full_replot = True
+                self._request_plot_update(delay_ms=200)
+            if self._force_source_mode() == "fit":
+                self._refresh_force_if_active()
+
+    def _on_potential_range_from_view(self):
+        try:
+            lo, hi = self.ax.get_xlim()
+        except Exception:
+            return
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return
+        if hi < lo:
+            lo, hi = hi, lo
+        set_silent(self.potential_zmin_spin, value=float(lo))
+        set_silent(self.potential_zmax_spin, value=float(hi))
+        self._on_potential_range_edited()
+
+    def _potential_fit_for_curve(self, spec_id, x, y):
+        """Return a cached (or freshly computed) potential fit for the displayed
+        (x, y) of one curve. The signature keys on the actual displayed samples
+        so any change to channel/axis/filter/relative-Z transparently refits."""
+        try:
+            x_arr = np.asarray(x, dtype=float)
+            y_arr = np.asarray(y, dtype=float)
+        except Exception:
+            return None
+        # Restrict to the fit window, if one is active. Keep the raw arrays for
+        # the cache signature so toggling the range off refits on the full curve.
+        fit_range = getattr(self, "_potential_fit_range", None)
+        if fit_range is not None:
+            lo, hi = fit_range
+            in_window = np.isfinite(x_arr) & (x_arr >= lo) & (x_arr <= hi)
+            xf = x_arr[in_window]
+            yf = y_arr[in_window]
+        else:
+            xf, yf = x_arr, y_arr
+        if xf.size < 5:
+            return None
+        sig = (
+            spec_id,
+            self._potential_model,
+            fit_range,
+            int(xf.size),
+            round(float(xf[0]), 9),
+            round(float(xf[-1]), 9),
+            round(float(np.nansum(yf)), 9),
+            round(float(np.nansum(np.abs(yf))), 9),
+        )
+        if sig in self._potential_fit_cache:
+            return self._potential_fit_cache[sig]
+        res = potential_fits.fit_potential(xf, yf, self._potential_model)
+        if len(self._potential_fit_cache) > 512:
+            self._potential_fit_cache.clear()
+        self._potential_fit_cache[sig] = res
+        if res is not None:
+            try:
+                self._log(f"{self._potential_model} fit {self._display_name(self._spec_by_id(spec_id) or {})}: "
+                          f"{potential_fits.params_summary(res)}")
+            except Exception:
+                pass
+        return res
+
+    def _draw_potential_fit_for_curve(self, spec_id, x, y, color, offset=0.0):
+        """Overlay the fitted potential (and optionally its force) on one curve."""
+        res = self._potential_fit_for_curve(spec_id, x, y)
+        if not res:
+            return
+        x_min, x_max = res["x_min"], res["x_max"]
+        if not (np.isfinite(x_min) and np.isfinite(x_max)) or x_max <= x_min:
+            return
+        x_dense = np.linspace(x_min, x_max, 400)
+        try:
+            y_fit = np.asarray(res["func"](x_dense), dtype=float)
+        except Exception:
+            return
+        finite = np.isfinite(y_fit)
+        if not finite.any():
+            return
+        self.ax.plot(
+            x_dense[finite], y_fit[finite] + offset,
+            linestyle=(0, (5, 2)), color=color, lw=1.3, alpha=0.95,
+        )
 
     def _on_legend_pick(self, event):
         spec_id = self._legend_map.get(event.artist)
@@ -6180,14 +9224,59 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         item = self.spec_list.itemAt(pos)
         if not item:
             return
+        spec = item.data(0, QtCore.Qt.UserRole)
         menu = QtWidgets.QMenu(self)
         act = menu.addAction("Open popup")
+        show_image_act = None
+        if hasattr(self.viewer, "reveal_spectroscopy_source"):
+            show_image_act = menu.addAction("Show on image")
         copy_act = menu.addAction("Copy selected to clipboard")
+        menu.addSeparator()
+        this_id = item.data(0, QtCore.Qt.UserRole + 1)
+        is_bg = bool(self._background_spec_id) and this_id == self._background_spec_id
+        set_bg_act = menu.addAction("Background: this spectrum is the background" if is_bg
+                                    else "Set as background")
+        set_bg_act.setEnabled(not is_bg)
+        clear_bg_act = menu.addAction("Clear background")
+        clear_bg_act.setEnabled(bool(self._background_spec_id))
+        source_path = spec.get("path") if isinstance(spec, dict) else None
+        if source_path:
+            menu.addSeparator()
+            add_source_file_menu(menu, source_path, self)
         chosen = menu.exec_(self.spec_list.mapToGlobal(pos))
         if chosen == act:
-            self._show_popup_for_spec(item.data(0, QtCore.Qt.UserRole))
+            self._show_popup_for_spec(spec)
+        elif show_image_act is not None and chosen == show_image_act:
+            self._on_show_on_image(spec)
         elif chosen == copy_act:
             self._copy_selected_to_clipboard()
+        elif chosen == set_bg_act:
+            self._set_background_spec(spec)
+        elif chosen == clear_bg_act:
+            self._on_clear_background()
+
+    def _on_show_on_image(self, spec=None):
+        viewer = self.viewer
+        if viewer is None or not hasattr(viewer, "reveal_spectroscopy_source"):
+            return
+        if not isinstance(spec, dict) or not spec:
+            spec = None
+            try:
+                item = self.spec_list.currentItem()
+                if item is not None:
+                    data = item.data(0, QtCore.Qt.UserRole)
+                    if isinstance(data, dict):
+                        spec = data
+            except Exception:
+                spec = None
+            if spec is None and self.specs:
+                spec = self.specs[0]
+        if not spec:
+            return
+        try:
+            viewer.reveal_spectroscopy_source(spec)
+        except Exception:
+            pass
 
     def _on_table_context_menu(self, pos):
         row = self.results_table.indexAt(pos).row()
@@ -6395,110 +9484,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
 
     def _apply_data_filters(self, x_vals, y_vals, y_unit, x_unit):
         """Apply any enabled data filters/derivatives."""
-        data = np.asarray(y_vals, dtype=float)
-        x_arr = np.asarray(x_vals, dtype=float) if np.size(x_vals) == data.size else np.linspace(0, data.size - 1, data.size)
-        if data.size == 0:
-            return data, y_unit
-        cfg = getattr(self, "_filter_cfg", {})
-        result = data.copy()
-        dx = float(np.nanmean(np.diff(x_arr))) if x_arr.size > 1 else 1.0
-        if not math.isfinite(dx) or dx == 0:
-            dx = 1.0
-
-        def _odd(value, minimum):
-            v = max(minimum, int(value) or minimum)
-            return v + 1 if v % 2 == 0 else v
-
-        # Gaussian smoothing
-        gauss = cfg.get("gaussian", {})
-        if gauss.get("enabled"):
-            sigma = max(0.1, float(gauss.get("sigma", 1.0)))
-            if _scipy_ndimage is not None:
-                result = _scipy_ndimage.gaussian_filter1d(result, sigma=max(0.05, sigma), mode="nearest")
-            else:
-                radius = max(1, int(3 * sigma))
-                xs = np.arange(-radius, radius + 1)
-                kernel = np.exp(-(xs ** 2) / (2.0 * sigma ** 2))
-                kernel /= kernel.sum() or 1.0
-                result = np.convolve(result, kernel, mode="same")
-
-        # Median filtering
-        median = cfg.get("median", {})
-        if median.get("enabled"):
-            size = _odd(median.get("size", 3), 3)
-            if _scipy_ndimage is not None:
-                result = _scipy_ndimage.median_filter(result, size=size, mode="nearest")
-            else:
-                pad = size // 2
-                padded = np.pad(result, pad, mode="edge")
-                out = np.empty_like(result)
-                for i in range(result.size):
-                    window = padded[i:i + size]
-                    out[i] = np.median(window)
-                result = out
-
-        # Savitzky-Golay smoothing
-        sav_cfg = cfg.get("savgol", {})
-        if sav_cfg.get("enabled"):
-            window = _odd(sav_cfg.get("window", 11), 5)
-            window = min(window, result.size - 1 if result.size % 2 == 0 else result.size)
-            window = max(5, window if window % 2 == 1 else window - 1)
-            poly = max(2, min(int(sav_cfg.get("poly", 3)), window - 1))
-            if window >= 3 and window <= result.size:
-                if _scipy_signal is not None:
-                    result = _scipy_signal.savgol_filter(result, window, poly, mode="interp")
-                else:
-                    kernel = np.ones(window) / float(window)
-                    result = np.convolve(result, kernel, mode="same")
-
-        # FFT low-pass
-        fft_cfg = cfg.get("fft", {})
-        if fft_cfg.get("enabled") and result.size >= 8:
-            cutoff = float(fft_cfg.get("cutoff", 0.15))
-            cutoff = min(max(cutoff, 0.0), 0.5)
-            if cutoff > 0.0:
-                centered = result - np.nanmean(result)
-                freq = np.fft.rfftfreq(result.size, d=dx)
-                spectrum = np.fft.rfft(centered)
-                nyquist = 0.5 / dx
-                thresh = cutoff * nyquist
-                mask = np.abs(freq) <= thresh
-                spectrum *= mask
-                recovered = np.fft.irfft(spectrum, n=result.size)
-                result = recovered + np.nanmean(result)
-
-        # Notch filter
-        notch = cfg.get("notch", {})
-        if notch.get("enabled") and result.size >= 8:
-            freq = abs(float(notch.get("freq", 50.0)))
-            width = max(0.0001, abs(float(notch.get("width", 5.0))))
-            if freq > 0.0:
-                centered = result - np.nanmean(result)
-                spectrum = np.fft.rfft(centered)
-                freqs = np.fft.rfftfreq(result.size, d=dx)
-                mask = np.ones_like(freqs, dtype=bool)
-                notch_region = np.abs(freqs - freq) < width
-                mask[notch_region] = False
-                spectrum *= mask
-                recovered = np.fft.irfft(spectrum, n=result.size)
-                result = recovered + np.nanmean(result)
-
-        # Derivative (dY/dX)
-        deriv = cfg.get("derive", {})
-        unit = y_unit
-        if deriv.get("enabled"):
-            window = _odd(deriv.get("window", 11), 5)
-            window = min(window, result.size - 1 if result.size % 2 == 0 else result.size)
-            window = max(5, window if window % 2 == 1 else window - 1)
-            poly = max(2, min(int(deriv.get("poly", 3)), window - 1))
-            if _scipy_signal is not None and window >= 5 and window <= result.size:
-                result = _scipy_signal.savgol_filter(result, window, poly, deriv=1, delta=dx, mode="interp")
-            else:
-                result = np.gradient(result, x_arr)
-            denom = x_unit or "x"
-            unit = f"d({unit or 'arb'})/d({denom})"
-
-        return result, unit
+        return _apply_signal_filter_chain(x_vals, y_vals, y_unit, x_unit, getattr(self, "_filter_cfg", {}))
 
     def _register_filter_control(self, section, key, widget):
         self._filter_controls.setdefault(section, {})[key] = widget
@@ -6756,24 +9742,18 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
                 block(False)
         self._show_position_inset = checked
         self._update_position_inset_compare()
-    def _gather_plotted_traces(self):
+    def _gather_plotted_traces(self, for_export=False):
         traces = []
         channel = self.channel_combo.currentText()
-        relative_nm = self.relative_cb.isChecked()
-        waterfall = self.waterfall_cb.isChecked()
+        # "Relative Z (zero at min)" (a single global offset) and waterfall
+        # stacking are *display* transforms only. A data export must carry the
+        # true measured axis and un-offset Y, so exports gather with these
+        # disabled; background subtraction and data filters are analysis
+        # choices the user configured, so those are kept in both paths.
+        relative_nm = self.relative_cb.isChecked() and not for_export
+        waterfall = self.waterfall_cb.isChecked() and not for_export
         offset_val = self.offset_spin.value()
-        rel_zero = 0.0
-        if relative_nm:
-            mins = []
-            for item in self._selected_items() or self._checked_items():
-                spec = item.data(0, QtCore.Qt.UserRole)
-                if not spec:
-                    continue
-                axis_vals, _, unit = self._axis_for_spec(spec)
-                if axis_vals.size and unit == "nm":
-                    mins.append(np.nanmin(axis_vals))
-            if mins:
-                rel_zero = min(mins)
+        rel_zero = self._relative_zero_shift()
         plotted = 0
         root = self.spec_list.invisibleRootItem()
         for i in range(root.childCount()):
@@ -6823,7 +9803,10 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         return traces
 
     def _copy_all_traces_to_clipboard(self):
-        traces = self._gather_plotted_traces()
+        # Export true measured data, not the display view: absolute Z axis
+        # (no arbitrary global "zero at min" shift) and un-offset Y (no
+        # waterfall stacking). See _gather_plotted_traces(for_export=...).
+        traces = self._gather_plotted_traces(for_export=True)
         if not traces:
             QtWidgets.QMessageBox.information(self, "Copy spectra", "No spectra to copy.")
             return
@@ -7544,6 +10527,78 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._record_user_action(f"Waterfall offset → {value:.3g}")
         self._request_plot_update(delay_ms=20)
 
+    def _populate_inset_settings_menu(self, menu=None):
+        menu = menu or getattr(self, "inset_settings_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        show_others_act = QtWidgets.QAction("Show other points", menu, checkable=True, checked=self._inset_show_other_points)
+        show_others_act.setToolTip("Show markers for the other checked/selected spectra, not just the primary one")
+        show_others_act.toggled.connect(self._set_inset_show_other_points)
+        menu.addAction(show_others_act)
+        menu.addSeparator()
+        symbol_widget = QtWidgets.QWidget()
+        symbol_h = QtWidgets.QHBoxLayout(symbol_widget)
+        symbol_h.setContentsMargins(6, 2, 6, 2)
+        symbol_combo = QtWidgets.QComboBox()
+        for sym in _INSET_MARKER_SYMBOLS:
+            symbol_combo.addItem(sym.capitalize(), sym)
+        idx = symbol_combo.findData(self._inset_marker_symbol)
+        symbol_combo.setCurrentIndex(max(0, idx))
+        symbol_h.addWidget(QtWidgets.QLabel("Marker"))
+        symbol_h.addWidget(symbol_combo, 1)
+        symbol_act = QtWidgets.QWidgetAction(menu)
+        symbol_act.setDefaultWidget(symbol_widget)
+        menu.addAction(symbol_act)
+        symbol_combo.currentIndexChanged.connect(lambda i: self._set_inset_marker_symbol(symbol_combo.itemData(i)))
+        size_widget = QtWidgets.QWidget()
+        size_h = QtWidgets.QHBoxLayout(size_widget)
+        size_h.setContentsMargins(6, 2, 6, 2)
+        size_spin = QtWidgets.QSpinBox()
+        size_spin.setRange(15, 200)
+        size_spin.setValue(int(self._inset_marker_size))
+        size_h.addWidget(QtWidgets.QLabel("Size"))
+        size_h.addWidget(size_spin)
+        size_act = QtWidgets.QWidgetAction(menu)
+        size_act.setDefaultWidget(size_widget)
+        menu.addAction(size_act)
+        size_spin.valueChanged.connect(self._set_inset_marker_size)
+        color_act = QtWidgets.QAction("Marker color...", menu)
+        color_act.triggered.connect(self._pick_inset_marker_color)
+        menu.addAction(color_act)
+        reset_color_act = QtWidgets.QAction("Use trace color", menu, checkable=True, checked=self._inset_marker_color_override is None)
+        reset_color_act.setToolTip("Color each marker with its own trace color instead of a fixed override")
+        reset_color_act.triggered.connect(lambda: self._set_inset_marker_color(None))
+        menu.addAction(reset_color_act)
+
+    def _set_inset_show_other_points(self, enabled):
+        self._inset_show_other_points = bool(enabled)
+        self._update_position_inset_compare()
+        self.canvas.draw_idle()
+
+    def _set_inset_marker_symbol(self, symbol):
+        if not symbol:
+            return
+        self._inset_marker_symbol = str(symbol)
+        self._update_position_inset_compare()
+        self.canvas.draw_idle()
+
+    def _set_inset_marker_size(self, size):
+        self._inset_marker_size = float(size)
+        self._update_position_inset_compare()
+        self.canvas.draw_idle()
+
+    def _set_inset_marker_color(self, color):
+        self._inset_marker_color_override = color
+        self._update_position_inset_compare()
+        self.canvas.draw_idle()
+
+    def _pick_inset_marker_color(self):
+        initial = QtGui.QColor(self._inset_marker_color_override or "#d65f5f")
+        col = QtWidgets.QColorDialog.getColor(initial, self, "Select Position Marker Color")
+        if col.isValid():
+            self._set_inset_marker_color(col.name())
+
     def _undo_last_action(self):
         if not self._undo_stack:
             return
@@ -7678,6 +10733,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         self._clear_curve_data_cache()
         self._update_fit_trend_state()
         self.ax.clear()
+        _style_plot_chrome(self, self.fig)
         self.canvas.draw_idle()
         self.results_table.setRowCount(0)
         self._update_status(0)
@@ -7726,7 +10782,7 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         channel = self.channel_combo.currentText()
         self._set_busy(True, f"Fitting {len(specs)} spectra...")
         axis_key = self.axis_combo.currentData()
-        self._fit_worker = _SpectroFitWorker(specs, channel, axis_key)
+        self._fit_worker = _SpectroFitWorker(specs, channel, axis_key, filter_cfg=getattr(self, "_filter_cfg", {}))
         self._fit_thread = QtCore.QThread(self)
         self._fit_worker.moveToThread(self._fit_thread)
         self._fit_thread.started.connect(self._fit_worker.run)
@@ -7863,8 +10919,20 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
         </ul>
         <h4>Forces/Background</h4>
         <ul>
-        <li><b>Set/Clear Background:</b> Subtract background spectrum</li>
-        <li><b>Convert to Force:</b> Experimental force curve conversion</li>
+        <li><b>Set/Clear Background:</b> Subtract background spectrum (also on the
+        right-click menu of any spectrum in the list).</li>
+        <li><b>Convert to Force:</b> Sader-Jarvis / Matrix inversion to a reversible
+        "Force" channel (plotted in pN). <b>Force from</b> picks the input: <i>Raw Δf (filtered)</i>
+        inverts the displayed background-subtracted, filtered curve; <i>Fitted Δf</i>
+        inverts the smooth potential fit instead - no noise or repulsive-edge spike,
+        and only over the fit range. If the raw inversion blows up, either smooth it
+        (filters) or switch to Fitted Δf.</li>
+        <li><b>Potential fit:</b> Fit a Lennard-Jones or Morse potential to each
+        displayed curve and overlay it (dashed). Only the currently plotted/selected
+        spectra are fitted. "Limit fit range (x)" restricts the fit to samples within
+        a chosen x (Z) window - use it to exclude the far repulsive wall or a
+        CO-bending artefact; raw data is never altered. For a force curve, use
+        "Convert to force" (Sader-Jarvis / Matrix inversion of the raw data).</li>
         </ul>
         
         <h3>Actions</h3>
@@ -7918,14 +10986,35 @@ class SpectroscopyCompareDialog(QtWidgets.QDialog):
 
     def _apply_font_scale(self):
         scale = getattr(self, '_font_scale', 1.0)
-        self.ax.tick_params(labelsize=8 * scale)
+        style = _style_kwargs(self._font_style_state())
         self.ax.xaxis.label.set_fontsize(10 * scale)
         self.ax.yaxis.label.set_fontsize(10 * scale)
-        style = _style_kwargs(self._font_style_state())
         apply_text_style(self.ax.xaxis.label, family=self._plot_font_family, **style)
         apply_text_style(self.ax.yaxis.label, family=self._plot_font_family, **style)
-        for text in list(self.ax.get_xticklabels()) + list(self.ax.get_yticklabels()):
-            apply_text_style(text, family=self._plot_font_family, **style)
+        if style["bold"] or style["italic"] or style["underline"]:
+            # Rare path (user has bold/italic/underline enabled): tick_params
+            # only supports family, not weight/style/underline, so fall back
+            # to the original per-label loop, which is the only way to reach
+            # every property apply_text_style can set.
+            self.ax.tick_params(labelsize=8 * scale)
+            for text in list(self.ax.get_xticklabels()) + list(self.ax.get_yticklabels()):
+                apply_text_style(text, family=self._plot_font_family, **style)
+        else:
+            # Common path (no bold/italic/underline - _plot_font_bold/italic/
+            # underline default to False): tick_params(labelfontfamily=...)
+            # sets the family for every tick label - including ones not yet
+            # materialized - without needing get_xticklabels()/
+            # get_yticklabels(), which force a full tick materialization pass
+            # internally. Confirmed 234ms of a real dialog's ~727ms open cost,
+            # and this runs on every _update_plot (channel switch, waterfall
+            # toggle), not just at open - ax.clear() precedes it there, so
+            # the tick labels are genuinely freshly-created defaults each
+            # time and do need restyling; this just does it the cheap way.
+            family = normalize_font_family(self._plot_font_family) if self._plot_font_family else None
+            if family:
+                self.ax.tick_params(labelsize=8 * scale, labelfontfamily=family)
+            else:
+                self.ax.tick_params(labelsize=8 * scale)
         if self.ax.get_title():
             apply_text_style(self.ax.title, family=self._plot_font_family, **style)
         if self.ax.get_legend():

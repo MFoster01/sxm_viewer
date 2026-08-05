@@ -8,6 +8,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from ..._shared import QtWidgets, QtCore
+from .. import theme as ui_theme
 
 
 def open_histogram_dialog(owner, canvas):
@@ -41,6 +42,14 @@ def open_histogram_dialog(owner, canvas):
     canvas_hist = FigureCanvas(fig)
     ax = fig.add_subplot(111)
     layout.addWidget(canvas_hist)
+    # Follow the app theme for the figure chrome (light mode stays stock white).
+    _chrome_mode = ui_theme.plot_chrome_mode(owner)
+
+    def _restyle_chrome():
+        if _chrome_mode != ui_theme.THEME_LIGHT:
+            ui_theme.style_figure_chrome(fig, _chrome_mode)
+
+    _restyle_chrome()
 
     spins_layout = QtWidgets.QHBoxLayout()
     spins_layout.addWidget(QtWidgets.QLabel("Min:"))
@@ -70,7 +79,13 @@ def open_histogram_dialog(owner, canvas):
     btn_row.addWidget(apply_btn)
     layout.addLayout(btn_row)
 
-    state = {"view_idx": 0, "lines": (None, None), "finite": None, "dragging": None, "undo_pushed": False}
+    default_idx = 0
+    try:
+        if hasattr(canvas, "active_view_index"):
+            default_idx = max(0, int(canvas.active_view_index()))
+    except Exception:
+        default_idx = 0
+    state = {"view_idx": default_idx, "lines": (None, None), "finite": None, "dragging": None, "undo_pushed": False}
 
     def load_view(idx: int):
         idx = max(0, min(idx, len(views) - 1))
@@ -81,6 +96,7 @@ def open_histogram_dialog(owner, canvas):
         ax.clear()
         if finite is None:
             ax.set_title("No finite data")
+            _restyle_chrome()
             canvas_hist.draw_idle()
             return
         hist, edges = np.histogram(finite, bins=256)
@@ -102,6 +118,7 @@ def open_histogram_dialog(owner, canvas):
         l1 = ax.axvline(hi, color="#d81b60", linestyle="--")
         state["lines"] = (l0, l1)
         ax.set_title(view.get("title") or Path(str(view.get("path", ""))).name)
+        _restyle_chrome()
         canvas_hist.draw_idle()
 
     def update_lines():
@@ -141,11 +158,25 @@ def open_histogram_dialog(owner, canvas):
             dlg.accept()
 
     def on_auto():
-        finite = state.get("finite")
-        if finite is None:
-            return
+        view = views[state.get("view_idx", 0)]
+        suggested = None
         try:
-            lo, hi = np.percentile(finite, [1, 99])
+            suggested = owner._recommended_view_clim(view, pct_low=1.0, pct_high=99.0)
+        except Exception:
+            suggested = None
+        if suggested is None:
+            finite = state.get("finite")
+            if finite is None:
+                return
+            try:
+                lo, hi = np.percentile(finite, [1, 99])
+            except Exception:
+                return
+        else:
+            lo, hi = suggested
+        try:
+            lo = float(lo)
+            hi = float(hi)
         except Exception:
             return
         _set_spin_values(float(lo), float(hi), block=True)
@@ -154,7 +185,10 @@ def open_histogram_dialog(owner, canvas):
 
     def on_reset():
         view = views[state.get("view_idx", 0)]
-        vmin, vmax, _ = owner._view_finite_values(view)
+        try:
+            vmin, vmax, _finite = owner._view_finite_values(view)
+        except Exception:
+            vmin = vmax = None
         if vmin is None:
             return
         _set_spin_values(vmin, vmax, block=True)
@@ -211,6 +245,10 @@ def open_histogram_dialog(owner, canvas):
     reset_btn.clicked.connect(on_reset)
     if selector:
         selector.currentIndexChanged.connect(load_view)
+        try:
+            selector.setCurrentIndex(default_idx)
+        except Exception:
+            pass
 
     try:
         cid_press = canvas_hist.mpl_connect("button_press_event", _on_press)
@@ -219,6 +257,8 @@ def open_histogram_dialog(owner, canvas):
         fig.canvas.setProperty("hist_cids", (cid_press, cid_motion, cid_release))
     except Exception:
         pass
+
+    load_view(default_idx)
 
     profile_was_enabled = bool(getattr(canvas, "profile_enabled", False))
     profile_user_flag = bool(getattr(canvas, "_profile_user_enabled", profile_was_enabled))

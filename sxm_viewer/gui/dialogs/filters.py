@@ -53,7 +53,6 @@ from ...config import (
     CH_SAMPLE_POINTS,
     CHANNEL_DATA_CACHE_LIMIT,
     FILTERED_CACHE_LIMIT,
-    THUMB_DISK_CACHE_DIR,
     load_config,
     save_config,
     load_header_cache,
@@ -295,6 +294,25 @@ class SingleFilterDialog(QtWidgets.QDialog):
         self.tile_size_label = QtWidgets.QLabel("CLAHE tile size")
         form.addRow(self.tile_size_label, self.tile_size_combo)
 
+        self.ratio_spin = QtWidgets.QDoubleSpinBox()
+        self.ratio_spin.setDecimals(1)
+        self.ratio_spin.setRange(3.0, 200.0)
+        self.ratio_spin.setSingleStep(1.0)
+        ratio_default = FILTER_DEFINITIONS.get(self.filter_key, {}).get("default_ratio", 25.0)
+        self.ratio_spin.setValue(float(self._initial_params.get("ratio", ratio_default)))
+        self.ratio_label = QtWidgets.QLabel("Sensitivity (lower = more aggressive)")
+        form.addRow(self.ratio_label, self.ratio_spin)
+
+        self.spike_window_combo = QtWidgets.QComboBox()
+        self.spike_window_combo.addItem("3", 3)
+        self.spike_window_combo.addItem("5", 5)
+        self.spike_window_combo.addItem("7", 7)
+        window_default = int(self._initial_params.get("window", FILTER_DEFINITIONS.get("spike_removal", {}).get("default_window", 3)))
+        window_choices = [3, 5, 7]
+        self.spike_window_combo.setCurrentIndex(window_choices.index(window_default) if window_default in window_choices else 0)
+        self.spike_window_label = QtWidgets.QLabel("Spike window size (px)")
+        form.addRow(self.spike_window_label, self.spike_window_combo)
+
         body.addWidget(controls, 1)
 
         if self._show_dialog_preview:
@@ -336,6 +354,8 @@ class SingleFilterDialog(QtWidgets.QDialog):
         self.clip_limit_spin.valueChanged.connect(self._schedule_preview_update)
         self.tile_size_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.method_combo.currentIndexChanged.connect(self._schedule_preview_update)
+        self.ratio_spin.valueChanged.connect(self._schedule_preview_update)
+        self.spike_window_combo.currentIndexChanged.connect(self._schedule_preview_update)
 
         self._on_filter_selection_changed()
         self._schedule_preview_update()
@@ -358,6 +378,9 @@ class SingleFilterDialog(QtWidgets.QDialog):
         self._set_param_row_visible(self.tile_size_label, self.tile_size_combo, show_clahe)
         show_line_flatten = key == "line_flatten"
         self._set_param_row_visible(self.method_label, self.method_combo, show_line_flatten)
+        show_ratio = key in ("line_repair", "spike_removal")
+        self._set_param_row_visible(self.ratio_label, self.ratio_spin, show_ratio)
+        self._set_param_row_visible(self.spike_window_label, self.spike_window_combo, key == "spike_removal")
 
     def _schedule_preview_update(self, *_args):
         self._preview_timer.start()
@@ -384,6 +407,11 @@ class SingleFilterDialog(QtWidgets.QDialog):
         elif self.filter_key == "line_flatten":
             params["axis"] = self.axis_combo.currentText()
             params["method"] = self.method_combo.currentText()
+        elif self.filter_key == "line_repair":
+            params["ratio"] = float(self.ratio_spin.value())
+        elif self.filter_key == "spike_removal":
+            params["ratio"] = float(self.ratio_spin.value())
+            params["window"] = int(self.spike_window_combo.currentData() or 3)
         return {"key": self.filter_key, "params": params}
 
     def current_step_label(self):
@@ -452,6 +480,8 @@ class CustomFilterDialog(QtWidgets.QDialog):
         preview_cmap_name="viridis",
         preview_clim=None,
         show_preview_thumbnail=True,
+        initial_pipeline=None,
+        initial_name=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Custom filter pipeline")
@@ -464,6 +494,7 @@ class CustomFilterDialog(QtWidgets.QDialog):
         self._preview_cmap_name = str(preview_cmap_name or "viridis")
         self._preview_clim = _normalize_filter_preview_clim(preview_clim)
         self._pipeline = []
+        self._draft_preview_enabled = False
         self.preview_label = None
         self._preview_timer = QtCore.QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -493,6 +524,12 @@ class CustomFilterDialog(QtWidgets.QDialog):
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
         self.filter_combo = QtWidgets.QComboBox()
         for key, info in FILTER_DEFINITIONS.items():
+            if info.get('requires_dialog'):
+                # Needs its own review dialog (which peaks to remove requires
+                # looking at the actual spectrum) - this generic combo has no
+                # way to expose that, so it's added via its own dedicated menu
+                # entry instead (see filter_controller.py).
+                continue
             self.filter_combo.addItem(info['label'], key)
         form.addRow("Filter", self.filter_combo)
         self.axis_combo = QtWidgets.QComboBox()
@@ -530,7 +567,8 @@ class CustomFilterDialog(QtWidgets.QDialog):
         left_layout.addWidget(self.pipeline_list, 1)
         name_row = QtWidgets.QHBoxLayout()
         name_row.addWidget(QtWidgets.QLabel("Name prefix:"))
-        self.name_edit = QtWidgets.QLineEdit("Custom")
+        default_name = str(initial_name or "Custom").strip() or "Custom"
+        self.name_edit = QtWidgets.QLineEdit(default_name)
         name_row.addWidget(self.name_edit)
         left_layout.addLayout(name_row)
         body.addWidget(left_panel, 1)
@@ -573,8 +611,19 @@ class CustomFilterDialog(QtWidgets.QDialog):
         self.lap_sigma_spin.valueChanged.connect(self._schedule_preview_update)
         self.lap_neighbors_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.lap_abs_cb.toggled.connect(self._schedule_preview_update)
+        for step in list(initial_pipeline or []):
+            if not isinstance(step, dict):
+                continue
+            key = str(step.get("key") or "").strip()
+            if not key:
+                continue
+            normalized = {"key": key, "params": dict(step.get("params") or {})}
+            self._pipeline.append(normalized)
+            label = FILTER_DEFINITIONS.get(key, {}).get("label", key)
+            self.pipeline_list.addItem(f"{len(self._pipeline)}. {label}")
         self._on_filter_selection_changed()
-        self._schedule_preview_update()
+        self._draft_preview_enabled = False
+        self._queue_preview_update()
 
     def _set_param_row_visible(self, label_widget, field_widget, visible):
         label_widget.setVisible(bool(visible))
@@ -590,12 +639,16 @@ class CustomFilterDialog(QtWidgets.QDialog):
         self._set_param_row_visible(self.lap_abs_label, self.lap_abs_cb, show_lap)
         self._schedule_preview_update()
 
-    def _schedule_preview_update(self, *_args):
+    def _queue_preview_update(self):
         self._preview_timer.start()
+
+    def _schedule_preview_update(self, *_args):
+        self._draft_preview_enabled = True
+        self._queue_preview_update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._schedule_preview_update()
+        self._queue_preview_update()
 
     def _current_step(self):
         key = self.filter_combo.currentData()
@@ -615,7 +668,8 @@ class CustomFilterDialog(QtWidgets.QDialog):
         label = FILTER_DEFINITIONS.get(step['key'], {}).get('label', step['key'])
         self._pipeline.append(step)
         self.pipeline_list.addItem(f"{len(self._pipeline)}. {label}")
-        self._schedule_preview_update()
+        self._draft_preview_enabled = False
+        self._queue_preview_update()
 
     def _on_remove_step(self):
         row = self.pipeline_list.currentRow()
@@ -626,11 +680,16 @@ class CustomFilterDialog(QtWidgets.QDialog):
             for idx, step in enumerate(self._pipeline, 1):
                 label = FILTER_DEFINITIONS.get(step['key'], {}).get('label', step['key'])
                 self.pipeline_list.addItem(f"{idx}. {label}")
-            self._schedule_preview_update()
+            self._draft_preview_enabled = False
+            self._queue_preview_update()
 
     def _preview_steps(self):
         if self._pipeline:
-            return list(self._pipeline)
+            steps = list(self._pipeline)
+            current = self._current_step()
+            if self._draft_preview_enabled and current:
+                steps.append(current)
+            return steps
         current = self._current_step()
         return [current] if current else []
 
